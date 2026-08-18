@@ -1,0 +1,19 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:pr-proof-release-0.1.0",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "name": "pr-proof",
+      "version": "0.1.0"
+    }
+  },
+  "components": [
+    { "type": "library", "name": "typescript", "version": "5.9.3", "scope": "required" },
+    { "type": "library", "name": "yaml", "version": "2.9.0", "scope": "required" },
+    { "type": "library", "name": "@types/node", "version": "22.20.1", "scope": "optional" },
+    { "type": "library", "name": "vitest", "version": "3.2.7", "scope": "optional" }
+  ]
+}

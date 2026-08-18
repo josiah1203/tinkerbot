@@ -1,0 +1,11 @@
+[
+  { "name": "removed-assertion", "rule": "assertion.removed", "severity": "high" },
+  { "name": "weakened-matcher", "rule": "matcher.weakened", "severity": "high" },
+  { "name": "widened-tolerance", "rule": "tolerance.widened", "severity": "warning" },
+  { "name": "deleted-case", "rule": "test.deleted", "severity": "high" },
+  { "name": "skip-added", "rule": "test.disabled", "severity": "high" },
+  { "name": "only-added", "rule": "test.disabled", "severity": "critical" },
+  { "name": "broad-mock", "rule": "mock.broad-replacement", "severity": "warning" },
+  { "name": "error-assertion-removed", "rule": "error-assertion.removed", "severity": "high" },
+  { "name": "safe-refactor", "rule": null, "severity": null }
+]

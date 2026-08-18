@@ -1,0 +1,8 @@
+{
+  "name": "@tinkerbot/assurance",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "../../dist/packages/assurance/src/index.js",
+  "types": "../../dist/packages/assurance/src/index.d.ts"
+}

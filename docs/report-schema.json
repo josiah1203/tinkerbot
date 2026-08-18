@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pr-proof.dev/schemas/report/v1",
+  "title": "PR Proof report v1",
+  "type": "object",
+  "required": ["schemaVersion", "schemaId", "toolVersion", "repository", "base", "head", "verdict", "summary", "findings", "limitations"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "schemaId": { "const": "https://pr-proof.dev/schemas/report/v1" },
+    "toolVersion": { "type": "string" },
+    "repository": { "type": "string" },
+    "base": { "type": "string" },
+    "head": { "type": "string" },
+    "verdict": { "enum": ["PASS", "NEEDS_REVIEW", "UNKNOWN", "FAIL"] },
+    "summary": { "type": "object", "additionalProperties": true },
+    "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+    "limitations": { "type": "array", "items": { "type": "string" } },
+    "baseline": { "type": "object" },
+    "policy": { "type": "object" },
+    "provenance": { "type": "array" },
+    "artifacts": { "type": "array" },
+    "selection": { "type": "object" },
+    "contracts": { "type": "object" },
+    "fixtures": { "type": "object" },
+    "evidence": { "$ref": "./evidence-schema.json" },
+    "languages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["language", "files", "capabilities", "unknowns"],
+        "properties": {
+          "language": { "type": "string" },
+          "files": { "type": "integer", "minimum": 0 },
+          "capabilities": { "type": "object" },
+          "unknowns": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "required": ["id", "ruleId", "category", "severity", "file", "startLine", "endLine", "title", "message", "explanation", "evidence", "suggestedAction", "confidence", "fingerprint", "module", "resolution", "toolVersion", "baseSha", "headSha"],
+      "properties": {
+        "id": { "type": "string" },
+        "ruleId": { "type": "string" },
+        "category": { "type": "string" },
+        "severity": { "enum": ["info", "warning", "high", "critical"] },
+        "file": { "type": "string" },
+        "startLine": { "type": "integer", "minimum": 1 },
+        "endLine": { "type": "integer", "minimum": 1 },
+        "message": { "type": "string" },
+        "explanation": { "type": "string" },
+        "evidence": {
+          "type": "object",
+          "properties": {
+            "before": { "type": "string" },
+            "after": { "type": "string" },
+            "detail": { "type": "string" }
+          },
+          "minProperties": 1
+        },
+        "suggestedAction": { "type": "string" },
+        "confidence": { "enum": ["low", "medium", "high"] },
+        "title": { "type": "string" },
+        "fingerprint": { "type": "string" },
+        "module": { "type": "string" },
+        "baselineState": { "enum": ["new", "existing", "resolved", "unknown", "waived", "expired"] },
+        "evidenceRefs": { "type": "array", "items": { "type": "string" } },
+        "resolution": { "enum": ["open", "unknown", "informational", "not_applicable"] },
+        "toolVersion": { "type": "string" },
+        "baseSha": { "type": "string" },
+        "headSha": { "type": "string" }
+      }
+    }
+  }
+}

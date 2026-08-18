@@ -1,0 +1,41 @@
+name: Tinkerbot Verify
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+jobs:
+  tinkerbot-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - uses: ./
+        with:
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+      - if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: tinkerbot-verify-evidence
+          if-no-files-found: ignore
+          path: |
+            .pr-proof/report.md
+            .pr-proof/report.sarif
+            .pr-proof/receipt.json
+            .pr-proof/review-context.json
+            .pr-proof/evidence-contract.json

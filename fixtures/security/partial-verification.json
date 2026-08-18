@@ -1,0 +1,6 @@
+{
+  "verdict": "UNKNOWN",
+  "unknownStates": ["dynamic import unresolved", "coverage artifact missing"],
+  "staleStates": [],
+  "expected": "never-pass"
+}

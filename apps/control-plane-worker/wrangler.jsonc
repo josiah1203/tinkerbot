@@ -1,0 +1,89 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "tinkerbot-control-plane",
+  "account_id": "ee09ba373380c725a23c69d5236e570d",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-18",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "ENVIRONMENT": "development",
+    "WORKER_NAME": "tinkerbot-control-plane",
+    "CLOUDFLARE_ACCOUNT_ID": "ee09ba373380c725a23c69d5236e570d",
+    "STRIPE_PLANS_JSON": "[]",
+    "WORKOS_EVENTS_SYNC_ENABLED": "false"
+  },
+  "triggers": {
+    "crons": ["*/15 * * * *"]
+  },
+  "secrets": {
+      "required": [
+        "WORKOS_CLIENT_ID",
+        "WORKOS_API_KEY",
+        "WORKOS_WEBHOOK_SECRET",
+        "STRIPE_SECRET_KEY",
+        "STRIPE_WEBHOOK_SECRET",
+        "SESSION_ENCRYPTION_KEY"
+    ]
+  },
+  "env": {
+    "staging": {
+      "name": "tinkerbot-control-plane-staging",
+      "vars": {
+        "ENVIRONMENT": "staging",
+        "WORKER_NAME": "tinkerbot-control-plane-staging",
+        "CLOUDFLARE_ACCOUNT_ID": "ee09ba373380c725a23c69d5236e570d",
+        "STRIPE_PLANS_JSON": "[]",
+        "WORKOS_EVENTS_SYNC_ENABLED": "false",
+        "WORKOS_EVENTS_RANGE_START": "2026-08-11T00:00:00.000Z"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "tinkerbot-control-plane",
+          "database_id": "fb3f060e-c613-495d-80ed-7da581e029cd",
+          "migrations_dir": "./migrations"
+        }
+      ],
+      "triggers": {
+        "crons": ["*/15 * * * *"]
+      },
+      "secrets": {
+        "required": [
+          "WORKOS_CLIENT_ID",
+          "WORKOS_API_KEY",
+          "WORKOS_WEBHOOK_SECRET",
+          "STRIPE_SECRET_KEY",
+          "STRIPE_WEBHOOK_SECRET",
+          "SESSION_ENCRYPTION_KEY"
+        ]
+      }
+    },
+    "production": {
+      "name": "tinkerbot-control-plane-production",
+      "vars": {
+        "ENVIRONMENT": "production",
+        "WORKER_NAME": "tinkerbot-control-plane-production",
+        "CLOUDFLARE_ACCOUNT_ID": "ee09ba373380c725a23c69d5236e570d",
+        "STRIPE_PLANS_JSON": "[]",
+        "WORKOS_EVENTS_SYNC_ENABLED": "false"
+      },
+      "triggers": {
+        "crons": ["*/15 * * * *"]
+      },
+      "secrets": {
+        "required": [
+          "WORKOS_CLIENT_ID",
+          "WORKOS_API_KEY",
+          "WORKOS_WEBHOOK_SECRET",
+          "STRIPE_SECRET_KEY",
+          "STRIPE_WEBHOOK_SECRET",
+          "SESSION_ENCRYPTION_KEY"
+        ]
+      }
+    }
+  }
+}

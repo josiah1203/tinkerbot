@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tinkerbot.dev/schemas/evidence/v1",
+  "title": "Tinkerbot evidence contract v1",
+  "type": "object",
+  "required": ["schemaVersion", "schemaId", "repositoryIdentity", "commitIdentity", "changeIdentity", "runId", "receiptId", "tool", "policy", "configurationHash", "environment", "verdict", "findings", "unknownStates", "staleStates", "provenance", "evidenceHashes", "affectedFiles", "affectedSymbols", "baselineRefs", "waiverRefs", "generatedAt", "observedAt", "sourceUpload", "diffUpload", "integrity"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "schemaId": { "const": "https://tinkerbot.dev/schemas/evidence/v1" },
+    "repositoryIdentity": { "type": "object", "required": ["name", "identityHash"], "properties": { "name": { "type": "string" }, "identityHash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" } }, "additionalProperties": false },
+    "commitIdentity": { "type": "object", "required": ["baseSha", "headSha", "treeSha"], "properties": { "baseSha": { "type": "string" }, "headSha": { "type": "string" }, "treeSha": { "type": "string" } }, "additionalProperties": false },
+    "changeIdentity": { "type": "object", "properties": { "changeId": { "type": "string" }, "pullRequestNumber": { "type": "integer", "minimum": 1 }, "branch": { "type": "string" } }, "additionalProperties": false },
+    "runId": { "type": "string" },
+    "receiptId": { "type": "string" },
+    "tool": { "type": "object", "required": ["name", "version"], "properties": { "name": { "type": "string" }, "version": { "type": "string" } }, "additionalProperties": false },
+    "policy": { "type": "object", "required": ["version", "result"], "properties": { "version": { "type": "string" }, "result": { "$ref": "#/$defs/resultState" } }, "additionalProperties": false },
+    "configurationHash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "environment": { "type": "object", "required": ["runtime", "platform", "arch", "ci", "networkRequired", "secretsRequired"], "properties": { "runtime": { "type": "string" }, "platform": { "type": "string" }, "arch": { "type": "string" }, "ci": { "type": "boolean" }, "runner": { "type": "string" }, "networkRequired": { "const": false }, "secretsRequired": { "const": false } }, "additionalProperties": false },
+    "verdict": { "$ref": "#/$defs/resultState" },
+    "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+    "unknownStates": { "type": "array", "items": { "type": "string" } },
+    "staleStates": { "type": "array", "items": { "type": "string" } },
+    "provenance": { "type": "array", "items": { "type": "object" } },
+    "evidenceHashes": { "type": "array", "items": { "type": "string" } },
+    "affectedFiles": { "type": "array", "items": { "type": "string" } },
+    "affectedSymbols": { "type": "array", "items": { "type": "string" } },
+    "baselineRefs": { "type": "array", "items": { "type": "string" } },
+    "waiverRefs": { "type": "array", "items": { "type": "string" } },
+    "generatedAt": { "type": "string", "format": "date-time" },
+    "observedAt": { "type": "string", "format": "date-time" },
+    "sourceUpload": { "const": "not_uploaded" },
+    "diffUpload": { "const": "not_uploaded" },
+    "optionalExplanation": { "type": "object", "required": ["text", "authority"], "properties": { "text": { "type": "string", "maxLength": 8192 }, "authority": { "const": "advisory" } }, "additionalProperties": false },
+    "integrity": { "type": "object", "required": ["algorithm", "digest"], "properties": { "algorithm": { "const": "sha256" }, "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" } }, "additionalProperties": false }
+  },
+  "$defs": {
+    "resultState": { "enum": ["PASS", "FAIL", "UNKNOWN", "STALE", "SKIPPED", "NOT_APPLICABLE"] },
+    "finding": {
+      "type": "object",
+      "required": ["id", "fingerprint", "ruleId", "severity", "state", "evidenceRefs"],
+      "properties": {
+        "id": { "type": "string" },
+        "fingerprint": { "type": "string" },
+        "ruleId": { "type": "string" },
+        "severity": { "type": "string" },
+        "state": { "$ref": "#/$defs/resultState" },
+        "file": { "type": "string" },
+        "startLine": { "type": "integer", "minimum": 1 },
+        "endLine": { "type": "integer", "minimum": 1 },
+        "module": { "type": "string" },
+        "evidenceRefs": { "type": "array", "items": { "type": "string" } },
+        "baselineRef": { "type": "string" },
+        "waiverRef": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "schemaId": "https://tinkerbot.dev/schemas/evidence/v1",
+  "repositoryIdentity": {
+    "name": "fixture/example",
+    "identityHash": "sha256:05a36302e3d887e024ce471a3be1e3a18ab72be4f59d2191f03112001df6459c"
+  },
+  "commitIdentity": {
+    "baseSha": "base",
+    "headSha": "head",
+    "treeSha": "tree"
+  },
+  "changeIdentity": {
+    "changeId": "fixture-change",
+    "pullRequestNumber": 7,
+    "branch": "fixture"
+  },
+  "runId": "run-fixture-7",
+  "receiptId": "tb-rcpt-fixture-7",
+  "tool": {
+    "name": "tinkerbot",
+    "version": "0.15.2"
+  },
+  "policy": {
+    "version": "default",
+    "result": "UNKNOWN"
+  },
+  "configurationHash": "sha256:c4609ad09e6db12cba1dd845ede62aac79baac08fe3672c32ff66d155695ae24",
+  "environment": {
+    "runtime": "v24.15.0",
+    "platform": "darwin",
+    "arch": "x64",
+    "ci": false,
+    "runner": "fixture",
+    "networkRequired": false,
+    "secretsRequired": false
+  },
+  "verdict": "UNKNOWN",
+  "findings": [],
+  "unknownStates": [
+    "coverage unavailable",
+    "tests not collected"
+  ],
+  "staleStates": [],
+  "provenance": [
+    {
+      "source": "tinkerbot",
+      "authority": "deterministic",
+      "capturedAt": "2026-01-01T00:00:00.000Z"
+    }
+  ],
+  "evidenceHashes": [
+    "sha256:420392610e888cf040790bc6f3915310528b4ab3e36bb5e6cd6f4ccb62eab100"
+  ],
+  "affectedFiles": [
+    "src/value.ts"
+  ],
+  "affectedSymbols": [
+    "src/value.ts#run"
+  ],
+  "baselineRefs": [],
+  "waiverRefs": [],
+  "generatedAt": "2026-01-01T00:00:00.000Z",
+  "observedAt": "2026-01-01T00:00:00.000Z",
+  "sourceUpload": "not_uploaded",
+  "diffUpload": "not_uploaded",
+  "integrity": {
+    "algorithm": "sha256",
+    "digest": "sha256:8ffac83faec4584b5dd27a884fe8a3988a2c2eba814d1d8cf545f20d0d617f1e"
+  }
+}

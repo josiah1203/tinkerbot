@@ -1,0 +1,11 @@
+# Tinkerbot Verify GitHub Action
+
+The Action runs in the customer’s runner and uses the local `tb`/`tinkerbot` engine. It emits a local report, Markdown summary, SARIF when enabled, a verification receipt, a versioned `evidence-contract.json`, workflow annotations, a step summary, and best-effort native `Tinkerbot Verify` Check Run/sticky comment output. The example workflow uploads only source-minimized assurance artifacts by default; the full local report remains available in the workspace.
+
+Inputs include `base`, `head`, `config`, `mode`, `fail-on`, `mutation-enabled`, `mutation-max`, `policy`, `timeout`, `max-files`, `max-findings`, `comment`, `check-run`, and `sarif`. Outputs expose the local report, SARIF, receipt, review context, and evidence-contract paths. The published Action reference is intentionally a placeholder until the actual repository owner/name is selected.
+
+Use `pull_request` with least-privilege permissions and `persist-credentials: false` on checkout. Do not change the example to `pull_request_target`: that event can expose privileged secrets while executing contributor-controlled code. Fork PRs are explicitly write-disabled; they retain local artifacts, deterministic workflow annotations, and the step summary while safely degrading when Check Run/comment permissions are unavailable.
+
+The canonical Check Run name is `Tinkerbot Verify`. Existing `PR Proof` Check Runs are discovered for compatibility and updated in place when possible. The sticky comment uses `<!-- tinkerbot:verify -->`; the legacy `<!-- pr-proof:sticky -->` marker is also recognized, so repeated pushes update one comment instead of creating duplicate reports. Inline annotations are deterministic, path-normalized, line-bound, sorted by stable finding identity, and capped at 50.
+
+GitHub App installations use [`github-app/manifest.json`](../github-app/manifest.json) as a template. App webhooks must verify signatures and delivery IDs; the App is never an execution environment for untrusted pull-request code. The customer runner remains the only verification execution boundary.

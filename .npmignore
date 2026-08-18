@@ -1,0 +1,4 @@
+# Historical visual-audit material is not part of the Tinkerbot package.
+docs/synara-audit/
+docs/synara-ui-audit.md
+**/*.map

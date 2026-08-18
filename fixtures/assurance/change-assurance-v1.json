@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "schemaId": "https://tinkerbot.dev/schemas/assurance/v1",
+  "receipts": [],
+  "graphs": [],
+  "lifecycleEvents": [],
+  "agentReceipts": [],
+  "changeSets": [],
+  "releaseManifests": [],
+  "releaseAssessments": [],
+  "outcomes": [],
+  "decisions": [],
+  "bindings": [],
+  "calibrationEvents": [],
+  "unknowns": ["This conformance fixture intentionally contains no evidence objects."]
+}

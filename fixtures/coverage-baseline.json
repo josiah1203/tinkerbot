@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "generatedFrom": "pnpm test:coverage",
+  "tolerancePercentagePoints": 0.25,
+  "packages": {
+    "core": { "statements": 98.3, "branches": 88.86, "functions": 100, "lines": 98.3 },
+    "git": { "statements": 99.14, "branches": 85, "functions": 100, "lines": 99.14 },
+    "cli": { "statements": 95.94, "branches": 85.03, "functions": 98.24, "lines": 95.94 },
+    "reporters": { "statements": 100, "branches": 90.32, "functions": 100, "lines": 100 },
+    "parser": { "statements": 93.84, "branches": 80.67, "functions": 100, "lines": 93.84 },
+    "test-integrity": { "statements": 100, "branches": 93.89, "functions": 100, "lines": 100 },
+    "coverage": { "statements": 100, "branches": 90.94, "functions": 100, "lines": 100 },
+    "mutation": { "statements": 95.48, "branches": 85.4, "functions": 100, "lines": 95.48 },
+    "impact-analysis": { "statements": 97.44, "branches": 82.01, "functions": 100, "lines": 97.44 },
+    "baseline": { "statements": 99.36, "branches": 82.41, "functions": 100, "lines": 99.36 },
+    "policy": { "statements": 100, "branches": 87.5, "functions": 100, "lines": 100 },
+    "artifacts": { "statements": 98.7, "branches": 85.02, "functions": 93.75, "lines": 98.7 },
+    "provenance": { "statements": 100, "branches": 91.22, "functions": 100, "lines": 100 },
+    "selection": { "statements": 100, "branches": 92.15, "functions": 100, "lines": 100 },
+    "history": { "statements": 97.1, "branches": 89.58, "functions": 100, "lines": 97.1 },
+    "contracts": { "statements": 94.95, "branches": 80.2, "functions": 100, "lines": 94.95 },
+    "fixtures": { "statements": 100, "branches": 97.22, "functions": 100, "lines": 100 },
+    "control-plane": { "statements": 91.28, "branches": 85.96, "functions": 86.36, "lines": 91.28 },
+    "assurance": { "statements": 98.59, "branches": 83.75, "functions": 100, "lines": 98.59 }
+  }
+}

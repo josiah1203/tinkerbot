@@ -1,0 +1,79 @@
+{
+  "name": "@tinkerbot/cli",
+  "version": "0.1.0",
+  "description": "Authenticated Tinkerbot terminal client and GitHub verification adapter.",
+  "private": false,
+  "type": "commonjs",
+  "main": "dist/packages/cli/src/index.js",
+  "types": "dist/packages/cli/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/packages/cli/src/index.d.ts",
+      "require": "./dist/packages/cli/src/index.js"
+    },
+    "./report-schema": {
+      "types": "./dist/packages/core/src/report-schema.d.ts",
+      "require": "./dist/packages/core/src/report-schema.js"
+    },
+    "./assurance": {
+      "types": "./dist/packages/assurance/src/index.d.ts",
+      "require": "./dist/packages/assurance/src/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "packageManager": "pnpm@9.15.9",
+  "bin": {
+    "pr-proof": "dist/packages/cli/src/index.js",
+    "tb": "dist/packages/cli/src/index.js",
+    "tinkerbot": "dist/packages/cli/src/index.js"
+  },
+  "files": [
+    "dist/packages",
+    "dist/tui",
+    "dist/action",
+    "action.yml",
+    "action/index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm build && vitest run",
+    "test:coverage": "pnpm build && vitest run --coverage && node scripts/verify-coverage.mjs",
+    "coverage:check": "node scripts/verify-coverage.mjs",
+    "test:watch": "vitest",
+    "validate:providers": "node scripts/validate-live-providers.mjs",
+    "prepare": "npm run build",
+    "tb": "node dist/packages/cli/src/index.js",
+    "tui:build": "bun --cwd packages/tui scripts/build.ts",
+    "tui:compile": "bun --cwd packages/tui scripts/compile.ts",
+    "tui:test": "bun --cwd packages/tui test --preload @opentui/solid/preload src",
+    "release:dry-run": "pnpm build && pnpm tui:build && pnpm pack --pack-destination /tmp/tinkerbot-pack-release && NPM_CONFIG_CACHE=/tmp/tinkerbot-npm-cache npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "typescript": "5.9.3",
+    "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "@vitest/coverage-v8": "3.2.7",
+    "vitest": "3.2.7"
+  },
+  "optionalDependencies": {
+    "@opentui/core-darwin-arm64": "0.4.5",
+    "@opentui/core-darwin-x64": "0.4.5",
+    "@opentui/core-linux-arm64": "0.4.5",
+    "@opentui/core-linux-x64": "0.4.5",
+    "@opentui/core-linux-arm64-musl": "0.4.5",
+    "@opentui/core-linux-x64-musl": "0.4.5",
+    "@opentui/core-win32-arm64": "0.4.5",
+    "@opentui/core-win32-x64": "0.4.5"
+  }
+}

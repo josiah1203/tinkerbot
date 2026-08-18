@@ -1,0 +1,8 @@
+{
+  "action": "synchronize",
+  "number": 42,
+  "pull_request": {
+    "head": { "sha": "fork-head", "repo": { "fork": true, "full_name": "contributor/example" } },
+    "base": { "sha": "base", "repo": { "full_name": "owner/example" } }
+  }
+}

@@ -1,0 +1,6 @@
+diff --git a/src/good.ts b/../../outside.ts
+--- a/src/good.ts
++++ b/../../outside.ts
+@@ -1,1 +1,1 @@
+-const safe = true
++const malicious = "Bearer fixture-token";

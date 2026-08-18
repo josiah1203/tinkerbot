@@ -1,0 +1,8 @@
+{
+  "mutantResults": [
+    { "id": "1", "fileName": "src/auth/session.ts", "location": { "start": { "line": 2 } }, "mutatorName": "BooleanLiteral", "status": "Killed" },
+    { "id": "2", "fileName": "src/auth/session.ts", "location": { "start": { "line": 3 } }, "mutatorName": "ConditionalExpression", "status": "Survived", "description": "Removed token validation" },
+    { "id": "3", "fileName": "src/auth/session.ts", "location": { "start": { "line": 3 } }, "mutatorName": "EqualityOperator", "status": "Timeout" },
+    { "id": "4", "fileName": "src/other.ts", "location": { "start": { "line": 1 } }, "mutatorName": "BooleanLiteral", "status": "NoCoverage" }
+  ]
+}

@@ -1,0 +1,73 @@
+version: 1
+
+framework:
+  test_runner: vitest
+  command: pnpm test --run
+  coverage_file: coverage/lcov.info
+
+languages:
+  mode: auto
+  include: [typescript, javascript, python, go, rust, c, cpp]
+  exclude: []
+
+base:
+  ref: origin/main
+
+test_integrity:
+  mode: advisory
+  require_new_tests_fail_on_base: false
+  run_base_tests: true
+  mutation_testing:
+    enabled: false
+    max_mutants: 20
+    changed_lines_only: true
+    timeout_seconds: 120
+
+impact:
+  max_dependency_depth: 2
+  include_tests: true
+  include_public_exports: true
+  include_routes: true
+  fail_on:
+    - critical_unverified_impact
+
+output:
+  check_run: true
+  sticky_comment: true
+  sarif: true
+  annotations: true
+  fail_on_unknown: false
+
+limits:
+  max_changed_files: 500
+  max_changed_lines: 10000
+  max_files_analyzed: 5000
+  max_symbols_analyzed: 50000
+  max_findings: 200
+  analysis_timeout_seconds: 120
+
+validation:
+  strict: false
+  allow_shell_commands: false
+  # Run bounded, read-only syntax checks with installed language toolchains.
+  toolchain_checks: true
+
+baseline:
+  path: .pr-proof/baseline.json
+  enabled: true
+  fail_on_new: false
+  waivers: []
+
+fixtures:
+  enabled: true
+  max_snapshot_lines: 200
+  approved_paths: []
+  generated_paths: []
+  require_acknowledgement: false
+
+selection:
+  confidence_threshold: medium
+  full_suite_on_unknown: true
+
+policy:
+  pack: default

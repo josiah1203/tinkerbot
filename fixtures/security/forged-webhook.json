@@ -1,0 +1,6 @@
+{
+  "payload": "{\"action\":\"opened\"}",
+  "signature": "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+  "secret": "fixture-secret",
+  "expected": false
+}

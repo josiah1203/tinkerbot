@@ -1,0 +1,7 @@
+{
+  "checks": "read",
+  "issues": "none",
+  "pull_requests": "read",
+  "metadata": "read",
+  "expected": "degraded"
+}

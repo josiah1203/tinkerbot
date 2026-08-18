@@ -1,0 +1,87 @@
+name: Tinkerbot Verify
+description: Run deterministic, source-minimized Tinkerbot verification in the customer-controlled GitHub runner.
+author: Tinkerbot
+branding:
+  color: blue
+  icon: shield
+inputs:
+  base:
+    description: Base commit SHA or ref.
+    required: false
+    default: origin/main
+  head:
+    description: Head commit SHA or ref.
+    required: false
+    default: HEAD
+  config:
+    description: Repository-relative Tinkerbot configuration path; legacy pr-proof.yml remains supported.
+    required: false
+    default: pr-proof.yml
+  mode:
+    description: Advisory or blocking verdict mode.
+    required: false
+    default: advisory
+  fail-on:
+    description: Comma-separated impact rules that may block when mode is blocking.
+    required: false
+    default: critical_unverified_impact
+  mutation-enabled:
+    description: Enable targeted mutation testing.
+    required: false
+    default: "false"
+  mutation-max:
+    description: Maximum number of mutants.
+    required: false
+    default: "20"
+  policy:
+    description: Policy pack to apply (default, strict, public-api, security-sensitive, database-change, agent-authored-change, or monorepo).
+    required: false
+    default: default
+  timeout:
+    description: Maximum analysis time in seconds.
+    required: false
+    default: "120"
+  max-files:
+    description: Maximum files to analyze.
+    required: false
+    default: "5000"
+  max-findings:
+    description: Maximum findings to emit.
+    required: false
+    default: "200"
+  sarif:
+    description: Write a local SARIF report.
+    required: false
+    default: "true"
+  comment:
+    description: Update one sticky pull-request comment when permitted.
+    required: false
+    default: "true"
+  check-run:
+    description: Create or update a native GitHub Check Run when permissions allow.
+    required: false
+    default: "true"
+  sticky_comment:
+    description: Update one marker-based PR comment when permissions allow.
+    required: false
+    default: "true"
+  token:
+    description: Optional token for best-effort Check Run/comment publication; fork workflows remain write-disabled.
+    required: false
+    default: ""
+outputs:
+  report:
+    description: Path to the local JSON report.
+  sarif:
+    description: Path to the local SARIF report.
+  usage:
+    description: Path to the local usage summary.
+  receipt:
+    description: Path to the local integrity-checkable verification receipt.
+  review-context:
+    description: Path to the source-minimized external review context.
+  evidence-contract:
+    description: Path to the versioned, source-minimized canonical evidence contract.
+runs:
+  using: node20
+  main: action/index.js

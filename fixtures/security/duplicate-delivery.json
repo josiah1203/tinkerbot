@@ -1,0 +1,5 @@
+{
+  "delivery": "delivery-123",
+  "event": "pull_request",
+  "expectedKey": "github:pull_request:delivery-123"
+}

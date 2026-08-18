@@ -1,0 +1,7 @@
+{
+  "receiptId": "tb-rcpt-stale",
+  "headSha": "old-head",
+  "currentHeadSha": "new-head",
+  "state": "STALE",
+  "expected": "rerun"
+}

@@ -1,0 +1,5 @@
+diff --git a/tests/example.test.ts b/tests/example.test.ts
+--- a/tests/example.test.ts
++++ b/tests/example.test.ts
+@@ -1,0 +1,1 @@
++test.only("revoked session", () => { expect(revoke()).toThrow(); });
