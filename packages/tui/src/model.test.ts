@@ -1,5 +1,5 @@
-import { buildWorkItems, evidenceTrace, filterWorkItems, groupWorkItems, reportStatusLabel, summaryMetrics, type RepositoryContext, type TuiReport } from "./model";
-import { HostedControlPlaneAdapter } from "./adapter";
+import { STATUS_GLYPHS, buildWorkItems, evidenceTrace, filterWorkItems, groupWorkItems, reportStatusLabel, severityRank, statusForVerdict, summaryMetrics, type RepositoryContext, type TuiReport } from "./model";
+import { HostedControlPlaneAdapter, workItemByIndex } from "./adapter";
 
 const repository: RepositoryContext = { root: "/tmp/example", name: "payments-api", branch: "main", commit: "abcdef123456", dirty: false, local: true };
 const report: TuiReport = {
@@ -47,4 +47,47 @@ test("hosted adapter never falls back to local state when its authenticated conn
   const snapshot = await new HostedControlPlaneAdapter({ controlPlaneUrl: "", sessionToken: "", repository: "acme/service" }).loadSnapshot();
   expect(snapshot.state).toBe("permission-denied");
   expect(snapshot.warnings[0]).toContain("TINKERBOT_CONTROL_PLANE_URL");
+});
+
+test("model helpers cover every verdict, status, filtering, and empty-report state", () => {
+  expect(statusForVerdict("FAIL")).toBe("fail");
+  expect(statusForVerdict("NEEDS_REVIEW")).toBe("warning");
+  expect(statusForVerdict("UNKNOWN")).toBe("unknown");
+  expect(statusForVerdict("PASS")).toBe("pass");
+  expect(STATUS_GLYPHS.info).toBe("•");
+  expect(severityRank("critical")).toBeLessThan(severityRank("low"));
+  expect(severityRank("unclassified")).toBe(5);
+
+  const noReport = buildWorkItems(undefined, repository, ["src/a.ts"]);
+  expect(noReport[0]).toMatchObject({ group: "IN PROGRESS", status: "running", title: "src/a.ts" });
+  expect(buildWorkItems(undefined, repository, [])).toEqual([expect.objectContaining({ id: "empty:verification", status: "info" })]);
+  expect(filterWorkItems(noReport, "  ")).toBe(noReport);
+  expect(filterWorkItems(noReport, "payments")).toHaveLength(1);
+  expect(workItemByIndex({ state: "empty", history: [], diff: "", changedFiles: [], workItems: noReport, warnings: [], loadedAt: "now" }, 3)).toBeUndefined();
+  expect(reportStatusLabel(undefined, "loading")).toBe("LOADING");
+  expect(reportStatusLabel(undefined, "permission-denied")).toBe("PERMISSION DENIED");
+  expect(reportStatusLabel(undefined, "error")).toBe("ERROR");
+  expect(reportStatusLabel(undefined, "empty")).toBe("NO REPORT");
+  expect(reportStatusLabel(undefined, "unknown")).toBe("UNKNOWN");
+  expect(evidenceTrace(undefined, undefined)).toContain("    No report receipt is available.");
+});
+
+test("hosted adapter maps authenticated control-plane responses without using local state", async () => {
+  const originalFetch = globalThis.fetch;
+  const token = "abcdefghijklmnopqrstuvwxyz123456";
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({ organizationId: "org_1", assurance: { ...report, verdict: "PASS", findings: [], limitations: [] } }), { status: 200, headers: { "content-type": "application/json" } });
+    const adapter = new HostedControlPlaneAdapter({ controlPlaneUrl: "https://control.example", sessionToken: token, repository: "acme/service" });
+    const loaded = await adapter.loadSnapshot();
+    expect(loaded).toMatchObject({ state: "ready", repository: { name: "acme/service", branch: "hosted" }, config: { organizationId: "org_1", source: "control-plane" } });
+    expect(adapter.openGitHub()).toBe("https://github.com/acme/service");
+
+    globalThis.fetch = async () => new Response(JSON.stringify({ error: "forbidden" }), { status: 403, headers: { "content-type": "application/json" } });
+    expect((await adapter.loadSnapshot()).state).toBe("permission-denied");
+
+    globalThis.fetch = async () => { throw new Error("offline"); };
+    expect((await adapter.loadSnapshot()).warnings).toEqual(["The Tinkerbot control plane could not be reached."]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

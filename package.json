@@ -54,6 +54,7 @@
     "tui:compile": "bun --cwd packages/tui scripts/compile.ts",
     "tui:compile:release": "node scripts/build-release-clients.mjs",
     "tui:test": "bun --cwd packages/tui test --preload @opentui/solid/preload src",
+    "tui:test:coverage": "bun --cwd packages/tui test --coverage --preload @opentui/solid/preload src",
     "release:clients": "pnpm build && pnpm tui:compile:release && node scripts/package-release-clients.mjs && node scripts/generate-release-manifest.mjs",
     "release:homebrew": "node scripts/render-homebrew-formula.mjs",
     "release:dry-run": "pnpm build && pnpm tui:build && pnpm pack --pack-destination /tmp/tinkerbot-pack-release && NPM_CONFIG_CACHE=/tmp/tinkerbot-npm-cache npm pack --dry-run"
