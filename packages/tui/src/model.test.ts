@@ -1,4 +1,5 @@
 import { buildWorkItems, evidenceTrace, filterWorkItems, groupWorkItems, reportStatusLabel, summaryMetrics, type RepositoryContext, type TuiReport } from "./model";
+import { HostedControlPlaneAdapter } from "./adapter";
 
 const repository: RepositoryContext = { root: "/tmp/example", name: "payments-api", branch: "main", commit: "abcdef123456", dirty: false, local: true };
 const report: TuiReport = {
@@ -40,4 +41,10 @@ test("evidence trace preserves change, symbol, path, test, finding, and receipt 
 test("summary metrics expose explicit unknown and unavailable values", () => {
   expect(summaryMetrics(report)).toEqual(expect.arrayContaining([["Impact", "3 symbols"], ["Drift", "1 unknown"]]));
   expect(summaryMetrics(undefined)).toEqual([["Score", "—"], ["Tests", "—"], ["Contracts", "—"], ["Impact", "—"], ["Drift", "—"]]);
+});
+
+test("hosted adapter never falls back to local state when its authenticated connection is absent", async () => {
+  const snapshot = await new HostedControlPlaneAdapter({ controlPlaneUrl: "", sessionToken: "", repository: "acme/service" }).loadSnapshot();
+  expect(snapshot.state).toBe("permission-denied");
+  expect(snapshot.warnings[0]).toContain("TINKERBOT_CONTROL_PLANE_URL");
 });

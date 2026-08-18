@@ -71,7 +71,7 @@ export function TuiApp(props: TuiAppProps) {
   const [selected, setSelected] = createSignal(0);
   const [view, setView] = createSignal<DetailView>("overview");
   const [diffMode, setDiffMode] = createSignal<"unified" | "split">("unified");
-  const [status, setStatus] = createSignal("Local-only · no account required");
+  const [status, setStatus] = createSignal("Connecting to the Tinkerbot control plane…");
   const [logs, setLogs] = createSignal<string[]>([]);
   const [running, setRunning] = createSignal(false);
   const [inputRef, setInputRef] = createSignal<any>();
@@ -89,14 +89,14 @@ export function TuiApp(props: TuiAppProps) {
   }
 
   async function refresh(): Promise<void> {
-    setStatus("Refreshing local repository context…");
+    setStatus("Refreshing server-authoritative organization and evidence state…");
     try {
       const next = await props.adapter.loadSnapshot();
       setSnapshot(next);
       setSelected(0);
       if (next.state === "error") setStatus(next.warnings[0] ?? "Repository context unavailable");
       else if (next.state === "stale") setStatus("Evidence is stale · press r to rerun");
-      else setStatus(next.report ? `Loaded ${next.report.verdict} · local evidence only` : "No verification report · press r to run");
+      else setStatus(next.report ? `Loaded ${next.report.verdict} from the control plane` : "No hosted assurance record is available");
     } catch (error) {
       setSnapshot({ state: "error", history: [], diff: "", changedFiles: [], workItems: [], warnings: [error instanceof Error ? error.message : String(error)], loadedAt: new Date().toISOString() });
       setStatus("Recoverable adapter error · press r to retry");

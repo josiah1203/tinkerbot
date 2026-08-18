@@ -11,6 +11,9 @@ export interface TuiAdapterOptions {
   base?: string;
   head?: string;
   config?: string;
+  controlPlaneUrl?: string;
+  sessionToken?: string;
+  repository?: string;
 }
 
 export interface VerificationRunResult {
@@ -349,6 +352,61 @@ export class LocalCliAdapter implements TuiAdapter {
 
 export function createLocalAdapter(options: TuiAdapterOptions = {}): LocalCliAdapter {
   return new LocalCliAdapter(options);
+}
+
+/**
+ * Hosted mode deliberately treats the control plane as the source of truth.
+ * It never falls back to local reports or local storage when credentials are
+ * absent: an unavailable session is an explicit error state.
+ */
+export class HostedControlPlaneAdapter implements TuiAdapter {
+  private readonly base: string;
+  private readonly token: string;
+  private readonly repository: string;
+
+  constructor(options: TuiAdapterOptions = {}) {
+    this.base = (options.controlPlaneUrl ?? process.env.TINKERBOT_CONTROL_PLANE_URL ?? "").replace(/\/$/, "");
+    this.token = options.sessionToken ?? process.env.TINKERBOT_SESSION_TOKEN ?? "";
+    this.repository = options.repository ?? process.env.TINKERBOT_REPOSITORY ?? "";
+  }
+
+  private valid(): string | undefined {
+    if (!/^https:\/\//.test(this.base)) return "Hosted TUI requires an HTTPS TINKERBOT_CONTROL_PLANE_URL.";
+    if (!/^[A-Za-z0-9_-]{20,200}$/.test(this.token)) return "Hosted TUI requires an authenticated TINKERBOT_SESSION_TOKEN.";
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(this.repository)) return "Hosted TUI requires TINKERBOT_REPOSITORY in owner/repository form.";
+    return undefined;
+  }
+
+  async loadSnapshot(): Promise<TuiSnapshot> {
+    const invalid = this.valid();
+    if (invalid) return { state: "permission-denied", history: [], diff: "", changedFiles: [], workItems: [], warnings: [invalid], loadedAt: new Date().toISOString() };
+    try {
+      const response = await fetch(`${this.base}/assurance/summary?repository=${encodeURIComponent(this.repository)}`, { headers: { authorization: `Bearer ${this.token}`, accept: "application/json" } });
+      const body = await response.json() as Record<string, unknown>;
+      if (!response.ok) return { state: response.status === 401 || response.status === 403 ? "permission-denied" : "error", history: [], diff: "", changedFiles: [], workItems: [], warnings: [String(body.error ?? body.code ?? `Control plane returned HTTP ${response.status}.`)], loadedAt: new Date().toISOString() };
+      const assurance = body.assurance;
+      const report = assurance && typeof assurance === "object" && !Array.isArray(assurance) && typeof (assurance as { verdict?: unknown }).verdict === "string" ? assurance as TuiReport : undefined;
+      const repository: RepositoryContext = { root: this.repository, name: this.repository, branch: "hosted", commit: "server", dirty: false, local: true };
+      const workItems = buildWorkItems(report, repository, [], false);
+      return { state: report ? "ready" : "empty", repository, report, history: [], config: { organizationId: body.organizationId, source: "control-plane" }, diff: "", changedFiles: [], workItems, warnings: report ? [] : ["No hosted assurance record is available for this repository."], loadedAt: new Date().toISOString() };
+    } catch {
+      return { state: "error", history: [], diff: "", changedFiles: [], workItems: [], warnings: ["The Tinkerbot control plane could not be reached."], loadedAt: new Date().toISOString() };
+    }
+  }
+
+  startVerification(onLog?: (line: string) => void): VerificationRunHandle {
+    onLog?.("Hosted verification submission is unavailable until tb verify is configured.");
+    return { cancel: () => undefined, promise: Promise.resolve({ status: 12, cancelled: false, stdout: "", stderr: "Hosted verification submission is unavailable." }) };
+  }
+
+  async exportReceipt(): Promise<TuiCommandResult> { return { ok: false, status: 12, stdout: "", stderr: "Receipts are retrieved from the hosted assurance record." }; }
+  async exportEvidence(): Promise<TuiCommandResult> { return { ok: false, status: 12, stdout: "", stderr: "Evidence is controlled by the hosted assurance record." }; }
+  async exportReport(): Promise<TuiCommandResult> { return { ok: false, status: 12, stdout: "", stderr: "Reports are retrieved from the hosted assurance record." }; }
+  openGitHub(): string | undefined { return `https://github.com/${this.repository}`; }
+}
+
+export function createHostedAdapter(options: TuiAdapterOptions = {}): HostedControlPlaneAdapter {
+  return new HostedControlPlaneAdapter(options);
 }
 
 export function workItemByIndex(snapshot: TuiSnapshot | undefined, index: number): WorkItem | undefined {
