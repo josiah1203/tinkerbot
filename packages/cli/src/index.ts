@@ -881,11 +881,19 @@ interface HostedResponse {
   body: Record<string, unknown>;
 }
 
+function hostedConfigurationError(): string | undefined {
+  const base = process.env.TINKERBOT_CONTROL_PLANE_URL?.replace(/\/$/, "");
+  const token = process.env.TINKERBOT_SESSION_TOKEN;
+  if (!base || !/^https:\/\//.test(base)) return "Hosted commands require an HTTPS TINKERBOT_CONTROL_PLANE_URL.";
+  if (!token || !/^[A-Za-z0-9_-]{20,200}$/.test(token)) return "Hosted commands require TINKERBOT_SESSION_TOKEN from an authenticated Tinkerbot session.";
+  return undefined;
+}
+
 async function hostedRequest(pathname: string, method = "GET", payload?: Record<string, unknown>): Promise<HostedResponse> {
   const base = process.env.TINKERBOT_CONTROL_PLANE_URL?.replace(/\/$/, "");
   const token = process.env.TINKERBOT_SESSION_TOKEN;
-  if (!base || !/^https:\/\//.test(base)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "Hosted commands require an HTTPS TINKERBOT_CONTROL_PLANE_URL.");
-  if (!token || !/^[A-Za-z0-9_-]{20,200}$/.test(token)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "Hosted commands require TINKERBOT_SESSION_TOKEN from an authenticated Tinkerbot session.");
+  const configurationError = hostedConfigurationError();
+  if (configurationError) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, configurationError);
   let response: Response;
   try {
     response = await fetch(`${base}${pathname}`, { method, headers: { authorization: `Bearer ${token}`, accept: "application/json", ...(payload ? { "content-type": "application/json" } : {}) }, ...(payload ? { body: JSON.stringify(payload) } : {}) });
@@ -922,6 +930,27 @@ async function runHostedCli(argv: string[]): Promise<number | undefined> {
     }
     process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
     return EXIT_CODES.PASS;
+  }
+  if (command === "verify") {
+    const configurationError = hostedConfigurationError();
+    if (configurationError) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, configurationError);
+    const options = parseArgs(argv);
+    const root = getRepoRoot(process.cwd());
+    const report = options.input
+      ? reportFromInput(root, options.input)
+      : createReport({ cwd: root, command: "check", base: options.base, head: options.head, configPath: options.config, runMutation: options.mutation, runBaseTests: options.baseTests, mode: options.mode, failOn: options.failOn, mutationMax: options.mutationMax, policy: options.policy, timeout: options.timeout, maxFiles: options.maxFiles, maxFindings: options.maxFindings });
+    let context: ReturnType<typeof createGitContext> | undefined;
+    try { context = createGitContext(root, report.base, report.head); } catch { /* The bundle carries explicit UNKNOWN provenance when Git context is unavailable. */ }
+    const assurance = createAssuranceBundle({ repository: report.repository, base: report.base, head: report.head, report, impact: report.impact, root, diffs: context?.diffs, now: report.generatedAt });
+    const repository = options.repository ?? report.repository;
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb verify requires --repository owner/repository or a GitHub origin remote.");
+    const response = await hostedRequest("/assurance/ingest", "POST", { repository, assurance });
+    if (response.status < 200 || response.status >= 300) {
+      process.stderr.write(`Tinkerbot hosted verification was rejected: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
+      return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
+    }
+    process.stdout.write(`${JSON.stringify({ ...response.body, localVerdict: report.verdict, unknowns: assurance.unknowns }, null, 2)}\n`);
+    return assurance.unknowns.length ? EXIT_CODES.UNKNOWN : EXIT_CODES.PASS;
   }
   if (command !== "whoami" && command !== "logout") return undefined;
   const response = await hostedRequest(command === "whoami" ? "/auth/session" : "/auth/signout", command === "whoami" ? "GET" : "POST");

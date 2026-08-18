@@ -24,7 +24,7 @@ test("recognizes unavailable hosted commands without returning successful help",
 });
 
 test("hosted identity commands fail closed without an authenticated control-plane session", () => {
-  for (const args of [["whoami"], ["org", "list"], ["org", "switch", "org_1"]]) {
+  for (const args of [["whoami"], ["org", "list"], ["org", "switch", "org_1"], ["verify"]]) {
     const result = spawnSync(process.execPath, [cli, ...args], { encoding: "utf8", env: { ...process.env, TINKERBOT_CONTROL_PLANE_URL: "", TINKERBOT_SESSION_TOKEN: "" } });
     expect(result.status).toBe(3);
     expect(result.stderr).toContain("TINKERBOT_CONTROL_PLANE_URL");
