@@ -41,10 +41,13 @@ test("safe redirects stay inside the control plane", () => {
   expect(safeReturnTo("/".repeat(2050))).toBe("/app/overview");
 });
 
-test("entitlements block private repositories at the configured limit and on payment failure", () => {
-  expect(PLAN_CATALOG.developer.privateRepositoryLimit).toBe(3);
+test("paid plans are per-active-seat, have no repository caps, and reject payment failure", () => {
+  expect(PLAN_CATALOG.developer).toMatchObject({ price: { amountCents: 1200 }, annualPriceCents: 12000, billingUnit: "active_seat", privateRepositoryLimit: null });
+  expect(PLAN_CATALOG.team).toMatchObject({ price: { amountCents: 1800 }, annualPriceCents: 18000, billingUnit: "active_seat", privateRepositoryLimit: null });
+  expect(PLAN_CATALOG.business).toMatchObject({ price: { amountCents: 2900 }, annualPriceCents: 29000, billingUnit: "active_seat", privateRepositoryLimit: null });
+  expect(PLAN_CATALOG.enterprise.selfHostedAvailable).toBe(false);
   expect(canConnectPrivateRepository({ planId: "developer", billingStatus: "active", activePrivateRepositories: 2, memberCount: 1 })).toBe(true);
-  expect(canConnectPrivateRepository({ planId: "developer", billingStatus: "active", activePrivateRepositories: 3, memberCount: 1 })).toBe(false);
+  expect(canConnectPrivateRepository({ planId: "developer", billingStatus: "active", activePrivateRepositories: 500, memberCount: 1 })).toBe(true);
   expect(canConnectPrivateRepository({ planId: "developer", billingStatus: "past_due", activePrivateRepositories: 0, memberCount: 1 })).toBe(false);
   expect(canConnectPrivateRepository({ planId: "enterprise", billingStatus: "active", activePrivateRepositories: 500, memberCount: 1 })).toBe(true);
   expect(canConnectPrivateRepository({ planId: "invalid" as never, billingStatus: "active", activePrivateRepositories: 0, memberCount: 1 })).toBe(false);
