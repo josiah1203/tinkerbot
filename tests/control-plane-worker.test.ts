@@ -33,6 +33,7 @@ test("Stripe webhooks resolve invoice tenants, fail closed on payment failure, a
       bind: (...args: unknown[]) => ({
         first: async <T>() => {
           if (query.includes("FROM tinkerbot_webhook_events")) return (webhooks.has(`${String(args[1])}:${String(args[0])}`) ? { event_id: args[0] } : null) as T | null;
+          if (query.includes("FROM tinkerbot_metadata")) return (metadata.has(String(args[0])) ? { value: metadata.get(String(args[0])) } : null) as T | null;
           if (query.includes("FROM tinkerbot_billing_accounts")) {
             if (!billing) return null;
             if (query.includes("organization_id =") && billing.organization_id !== args[0]) return null;
@@ -76,6 +77,7 @@ test("Stripe webhooks resolve invoice tenants, fail closed on payment failure, a
       }),
     }),
   };
+  metadata.set("billing:checkout:cs_1", JSON.stringify({ organizationId: "org_1", planId: "team", interval: "month", createdAt: "2030-01-01T00:00:00.000Z" }));
   const env = { STRIPE_SECRET_KEY: "stripe_test_secret", STRIPE_WEBHOOK_SECRET: "whsec_test", STRIPE_PLANS_JSON: JSON.stringify([{ id: "team", monthlyPriceId: "price_team", privateRepositoryLimit: 10, memberLimit: 5, retentionDays: 30, features: { team_invitations: true } }]), DB: database };
   const send = async (event: Record<string, unknown>) => {
     const payload = JSON.stringify(event);
@@ -83,6 +85,10 @@ test("Stripe webhooks resolve invoice tenants, fail closed on payment failure, a
     const signature = createHmac("sha256", "whsec_test").update(`${timestamp}.${payload}`).digest("hex");
     return worker.fetch(new Request("https://control.example/billing/webhook", { method: "POST", headers: { "stripe-signature": `t=${timestamp},v1=${signature}` }, body: payload }), env);
   };
+  expect((await send({ id: "evt_mismatched_checkout", type: "checkout.session.completed", created: 100, data: { object: { id: "cs_1", customer: "cus_1", subscription: "sub_1", client_reference_id: "org_attacker", metadata: { organization_id: "org_attacker" }, items: { data: [{ price: { id: "price_team" } }] } } } })).status).toBe(200);
+  expect(billing).toBeNull();
+  expect((await send({ id: "evt_checkout", type: "checkout.session.completed", created: 150, data: { object: { id: "cs_1", customer: "cus_1", subscription: "sub_1", client_reference_id: "org_1", metadata: { organization_id: "org_1" }, items: { data: [{ price: { id: "price_team" } }] } } } })).status).toBe(200);
+  expect(billing).toMatchObject({ organization_id: "org_1", plan_id: "team", subscription_status: "incomplete" });
   expect((await send({ id: "evt_subscription", type: "customer.subscription.updated", created: 200, data: { object: { id: "sub_1", customer: "cus_1", status: "active", metadata: { organization_id: "org_1" }, items: { data: [{ price: { id: "price_team" } }] } } } })).status).toBe(200);
   expect(billing).toMatchObject({ organization_id: "org_1", plan_id: "team", subscription_status: "active" });
   expect(entitlement).toMatchObject({ plan_id: "team", billing_status: "active" });
@@ -195,6 +201,7 @@ test("Cloudflare Worker completes WorkOS session persistence and server-side Str
     const checkout = await worker.fetch(new Request("https://control.example/billing/checkout", { method: "POST", headers: { cookie: `tinkerbot_session=${encodeURIComponent(sessionId)}`, "content-type": "application/json", "idempotency-key": "checkout_1" }, body: JSON.stringify({ planId: "developer", interval: "month" }) }), env);
     expect(checkout.status).toBe(200);
     expect(await checkout.json()).toEqual({ checkout: { id: "cs_test", url: "https://checkout.stripe.test/session" } });
+    expect(JSON.parse(metadata.get("billing:checkout:cs_test")!)).toMatchObject({ organizationId: "org_1", planId: "developer", interval: "month" });
 
     entitlements.set("org_1", { organization_id: "org_1", plan_id: "developer", billing_status: "active", private_repository_limit: 3, member_limit: 5, retention_days: 30, features_json: JSON.stringify({ assurance_metadata: true }), updated_at: "2030-01-01T00:00:00.000Z" });
     const assurance = { schemaVersion: 1, schemaId: "https://tinkerbot.dev/schemas/assurance/v1", receipts: [], graphs: [], lifecycleEvents: [], agentReceipts: [], changeSets: [], releaseManifests: [], releaseAssessments: [], outcomes: [], decisions: [], bindings: [], calibrationEvents: [], unknowns: ["runtime evidence not connected"] };

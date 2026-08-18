@@ -327,15 +327,20 @@ function stripePriceIds(object: Record<string, unknown>): string[] {
   return ids;
 }
 
-function configuredStripePlan(object: Record<string, unknown>, plans: StripePlan[]): { plan?: StripePlan; interval?: "month" | "year" } {
+interface CheckoutMapping {
+  organizationId: string;
+  planId: string;
+  interval: "month" | "year";
+  createdAt: string;
+}
+
+function configuredStripePlan(object: Record<string, unknown>, plans: StripePlan[], checkoutMapping?: CheckoutMapping | null): { plan?: StripePlan; interval?: "month" | "year" } {
   for (const priceId of stripePriceIds(object)) {
     const plan = plans.find((candidate) => candidate.monthlyPriceId === priceId || candidate.annualPriceId === priceId);
     if (plan) return { plan, interval: plan.annualPriceId === priceId ? "year" : "month" };
   }
-  const metadata = workerRecordValue(object.metadata);
-  const plan = plans.find((candidate) => candidate.id === metadata.plan_id);
-  const interval = metadata.billing_interval === "year" ? "year" : metadata.billing_interval === "month" ? "month" : undefined;
-  return { plan, interval };
+  const plan = checkoutMapping ? plans.find((candidate) => candidate.id === checkoutMapping.planId) : undefined;
+  return plan && checkoutMapping ? { plan, interval: checkoutMapping.interval } : {};
 }
 
 function stripeStatus(event: StripeWebhookEvent, existing?: TenantBillingAccount | null): string {
@@ -359,15 +364,22 @@ async function applyStripeEvent(event: StripeWebhookEvent, metadata: D1JsonMetad
   const subscriptionId = stripeSubscriptionId(event);
   const customerId = stringField(object.customer);
   const mapped = subscriptionId ? await billing.getBySubscription(subscriptionId) : customerId ? await billing.getByCustomer(customerId) : null;
-  const organizationId = stringField(objectMetadata.organization_id) ?? stringField(object.client_reference_id) ?? mapped?.organizationId;
+  const checkoutId = event.type === "checkout.session.completed" ? stringField(object.id) : undefined;
+  const checkoutMapping = checkoutId ? await metadata.get<CheckoutMapping>(`billing:checkout:${checkoutId}`) : null;
+  const organizationId = mapped?.organizationId ?? checkoutMapping?.organizationId;
   if (!organizationId) {
     await metadata.put(`billing:event:${event.id}`, { id: event.id, type: event.type, ignored: true, reason: "organization_unresolved", receivedAt: new Date().toISOString() });
+    return;
+  }
+  const claimedOrganizationId = stringField(objectMetadata.organization_id) ?? stringField(object.client_reference_id);
+  if (claimedOrganizationId && claimedOrganizationId !== organizationId) {
+    await metadata.put(`billing:event:${event.id}`, { id: event.id, type: event.type, ignored: true, reason: "organization_mismatch", receivedAt: new Date().toISOString(), organizationId });
     return;
   }
   const existing = mapped ?? await billing.getByOrganization(organizationId);
   const eventCreated = Number.isSafeInteger(event.created) && (event.created as number) >= 0 ? event.created as number : Math.floor(Date.now() / 1000);
   const updatedAt = new Date(eventCreated * 1000).toISOString();
-  const configured = configuredStripePlan(object, plans);
+  const configured = configuredStripePlan(object, plans, checkoutMapping);
   const plan = configured.plan;
   const periodEnd = typeof object.current_period_end === "number" ? new Date(object.current_period_end * 1000).toISOString() : existing?.currentPeriodEnd;
   const account: TenantBillingAccount = {
@@ -746,6 +758,7 @@ export default {
           if (billingState?.subscriptionId && !["canceled", "cancelled", "incomplete_expired"].includes(billingState.status)) return json({ error: "This organization already has a subscription. Manage it in the billing portal instead.", code: "subscription_already_exists" }, 409);
           const requestKey = request.headers.get("idempotency-key")?.replace(/[^a-zA-Z0-9_.:-]/g, "").slice(0, 120) || crypto.randomUUID();
           const checkout = await provider.createCheckoutSession({ planId, interval, organizationId, successUrl: safeReturnUrl(body?.successUrl, request, env, "/app/settings/billing"), cancelUrl: safeReturnUrl(body?.cancelUrl, request, env, "/app/settings/billing"), customerId: billingState?.customerId, customerEmail: access.current.session.user.email, idempotencyKey: `checkout:${organizationId}:${planId}:${interval}:${requestKey}` });
+          await new D1JsonMetadataStore(database).put(`billing:checkout:${checkout.id}`, { organizationId, planId, interval, createdAt: new Date().toISOString() } satisfies CheckoutMapping);
           return json({ checkout });
         }
         if (url.pathname === "/billing/portal") {
