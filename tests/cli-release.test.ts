@@ -23,6 +23,12 @@ test("recognizes unavailable hosted commands without returning successful help",
   }
 });
 
+test("hosted identity commands fail closed without an authenticated control-plane session", () => {
+  const result = spawnSync(process.execPath, [cli, "whoami"], { encoding: "utf8", env: { ...process.env, TINKERBOT_CONTROL_PLANE_URL: "", TINKERBOT_SESSION_TOKEN: "" } });
+  expect(result.status).toBe(3);
+  expect(result.stderr).toContain("TINKERBOT_CONTROL_PLANE_URL");
+});
+
 test("uses stable configuration error exit code", () => {
   const result = spawnSync(process.execPath, [cli, "check", "--unknown-option"], { encoding: "utf8" });
   expect(result.status).toBe(3);

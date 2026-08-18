@@ -876,4 +876,52 @@ export function main(argv = process.argv.slice(2)): number {
   return runCli(argv);
 }
 
-if (require.main === module) process.exitCode = main();
+interface HostedResponse {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+async function hostedRequest(pathname: string, method = "GET"): Promise<HostedResponse> {
+  const base = process.env.TINKERBOT_CONTROL_PLANE_URL?.replace(/\/$/, "");
+  const token = process.env.TINKERBOT_SESSION_TOKEN;
+  if (!base || !/^https:\/\//.test(base)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "Hosted commands require an HTTPS TINKERBOT_CONTROL_PLANE_URL.");
+  if (!token || !/^[A-Za-z0-9_-]{20,200}$/.test(token)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "Hosted commands require TINKERBOT_SESSION_TOKEN from an authenticated Tinkerbot session.");
+  let response: Response;
+  try {
+    response = await fetch(`${base}${pathname}`, { method, headers: { authorization: `Bearer ${token}`, accept: "application/json" } });
+  } catch {
+    throw new CliFailure(EXIT_CODES.EXECUTION_ERROR, "The Tinkerbot control plane could not be reached.");
+  }
+  let body: Record<string, unknown> = {};
+  try {
+    const parsed = await response.json() as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) body = parsed as Record<string, unknown>;
+  } catch { /* A malformed provider response remains a non-success result. */ }
+  return { status: response.status, body };
+}
+
+async function runHostedCli(argv: string[]): Promise<number | undefined> {
+  const command = argv[0];
+  if (command !== "whoami" && command !== "logout") return undefined;
+  const response = await hostedRequest(command === "whoami" ? "/auth/session" : "/auth/signout", command === "whoami" ? "GET" : "POST");
+  if (response.status < 200 || response.status >= 300) {
+    process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
+    return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
+  }
+  if (command === "whoami") process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
+  else process.stdout.write("Signed out of the Tinkerbot control plane.\n");
+  return EXIT_CODES.PASS;
+}
+
+export async function mainAsync(argv = process.argv.slice(2)): Promise<number> {
+  try {
+    const hosted = await runHostedCli(argv);
+    return hosted ?? runCli(argv);
+  } catch (error) {
+    const failure = classifyError(error);
+    process.stderr.write(`Tinkerbot hosted error: ${failure.message}\n`);
+    return failure.code;
+  }
+}
+
+if (require.main === module) void mainAsync().then((code) => { process.exitCode = code; });
