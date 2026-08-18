@@ -1,5 +1,7 @@
 # Tinkerbot hosted TUI architecture
 
+> Current release contract: the TUI requires hosted session configuration and cannot present local state as hosted authority. See [the documentation index](./README.md).
+
 ## Decision
 
 The product direction in the Tinkerbot brief supersedes older product-direction prose that centered a browser control-plane preview. No executable repository instruction forbidding a terminal UI was found during Phase 0. The existing verification engine, report contract, GitHub Action, and local `tb`/`pr-proof` compatibility remain canonical.

@@ -1,6 +1,8 @@
 # Cloudflare hosted runtime and secrets
 
-The hosted integration boundary is designed for a Cloudflare Worker while local `tb/pr-proof` verification remains independent. The staging Worker is deployed as `tinkerbot-control-plane-staging` on the account workers.dev subdomain, is bound to the provisioned D1 database, and has a 15-minute schedule. Provider secrets remain intentionally unseeded until rotated credentials are available; missing runtime resources return explicit `501` responses instead of fabricated hosted state.
+> Release status: provider configuration here is a deployment contract, not evidence of current account access. The active environment is not authenticated to Wrangler, so deployment, secret mutation, migration application, and provider validation remain external gates. See [release readiness](./release-readiness.md).
+
+The hosted integration boundary is designed for a Cloudflare Worker. Provider secrets remain absent from source; missing runtime resources must return explicit errors instead of fabricated hosted state.
 
 ## Current staging deployment
 
@@ -89,7 +91,7 @@ The Worker currently exposes:
 
 The Worker now performs organization membership and billing-role authorization from D1, provisions organization/user/membership/invitation state from signed WorkOS events, supports bounded current-user and Events API reconciliation, records entitlement snapshots from signed Stripe events, enforces the hosted assurance and invitation feature/seat checks server-side, and exposes a source-minimized assurance metadata boundary. Remaining gaps are the first live WorkOS/Stripe validation, full historical tenant bootstrap beyond the selected replay window, organization switching, repository/GitHub synchronization, verification-run orchestration, binary/artifact evidence ingestion, and R2 persistence. D1 is provisioned and migrated; R2 remains pending because the account must enable R2 in the Cloudflare Dashboard first.
 
-The optional hosted Team and Billing UI reads `meta[name="tinkerbot-api-base"]` (or `window.__TINKERBOT_CONTROL_PLANE_API__`) and calls provider-backed routes only when that API base is explicitly configured. The default local preview remains accountless and does not fake invitations or billing state.
+The browser administrative surface reads `meta[name="tinkerbot-api-base"]` (or `window.__TINKERBOT_CONTROL_PLANE_API__`) only when an approved hosted API base is configured. It must show unavailable state rather than fake invitations, billing, or assurance state.
 
 ## Cloudflare resources still required
 

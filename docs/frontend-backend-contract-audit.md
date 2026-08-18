@@ -1,5 +1,7 @@
 # Frontend → backend contract inventory
 
+> Historical audit — this record describes a transitional browser preview. It is not current release guidance; use [the documentation index](./README.md), [architecture](./architecture.md), and [release readiness](./release-readiness.md).
+
 This is the backend work implied by the current pr-proof control-plane UI. The preview must keep unavailable capabilities visibly unavailable until these contracts exist; it must not imply that a toast or local state change was persisted.
 
 ## Implemented hosted slice

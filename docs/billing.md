@@ -2,16 +2,14 @@
 
 Billing is a first-class page at `/app/settings/billing`. The UI is built around provider-neutral plan and entitlement interfaces so Stripe or another provider can be added without changing the shell.
 
-## Initial configurable plans
+## Current server-owned plan shape
 
-- Free: public repositories and local CLI.
-- Developer: `$19/month`, 3 private repositories.
-- Additional private repositories: `$10–$15/month` each.
-- Team: approximately `$149/month`, 10–15 repositories.
-- Business: approximately `$499/month`, up to 50 repositories.
-- Enterprise: custom annual pricing.
+- Developer: `$12/month` or `$120/year` per active seat.
+- Team: `$18/month` or `$180/year` per active seat.
+- Business: `$29/month` or `$290/year` per active seat.
+- Enterprise: contract-priced; it is not exposed as a self-serve Stripe plan.
 
-Prices, limits, retention, policy features, team features, audit features, support, and self-hosted availability are configuration, not UI constants.
+Private-repository limits are not used as a billing metric for these paid plans. Stripe Price IDs, feature flags, retention, and entitlements remain server-owned configuration; no browser or Action input can select a price ID.
 
 ## Provider state
 
@@ -30,4 +28,4 @@ Required production work:
 
 ## Assurance entitlements
 
-Local verification, receipts, evidence export, and the local viewer do not require billing. Hosted assurance metadata is an entitlement-controlled control-plane capability; the Worker requires an active/trialing billing state and an explicit `assurance_metadata: true` feature before returning or ingesting repository assurance data. The browser cannot activate the feature by changing plan state in local storage. The expansion does not add billing by PR, commit, contributor, seat, run, retry, token, or artifact.
+Hosted assurance metadata is an entitlement-controlled control-plane capability; the Worker requires an active/trialing billing state and an explicit `assurance_metadata: true` feature before returning or ingesting repository assurance data. The browser cannot activate the feature by changing plan state in local storage. Billing is by active seat, not by PR, commit, contributor, run, retry, token, or artifact.

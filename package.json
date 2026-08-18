@@ -2,7 +2,10 @@
   "name": "@tinkerbot/cli",
   "version": "0.1.0",
   "description": "Authenticated Tinkerbot terminal client and GitHub verification adapter.",
-  "private": true,
+  "private": false,
+  "publishConfig": {
+    "access": "restricted"
+  },
   "type": "commonjs",
   "main": "dist/packages/cli/src/index.js",
   "types": "dist/packages/cli/src/index.d.ts",
@@ -49,7 +52,10 @@
     "tb": "node dist/packages/cli/src/index.js",
     "tui:build": "bun --cwd packages/tui scripts/build.ts",
     "tui:compile": "bun --cwd packages/tui scripts/compile.ts",
+    "tui:compile:release": "node scripts/build-release-clients.mjs",
     "tui:test": "bun --cwd packages/tui test --preload @opentui/solid/preload src",
+    "release:clients": "pnpm build && pnpm tui:compile:release && node scripts/package-release-clients.mjs && node scripts/generate-release-manifest.mjs",
+    "release:homebrew": "node scripts/render-homebrew-formula.mjs",
     "release:dry-run": "pnpm build && pnpm tui:build && pnpm pack --pack-destination /tmp/tinkerbot-pack-release && NPM_CONFIG_CACHE=/tmp/tinkerbot-npm-cache npm pack --dry-run"
   },
   "engines": {

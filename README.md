@@ -17,15 +17,15 @@ Tinkerbot is not an open-source, self-hosted, BYOK, or accountless product. GitH
 ## Quick start
 
 ```sh
-tb login
+export TINKERBOT_CONTROL_PLANE_URL="https://<approved-control-plane-host>"
+export TINKERBOT_SESSION_TOKEN="<session-issued-by-the-hosted-sign-in-flow>"
+export TINKERBOT_REPOSITORY="OWNER/REPOSITORY"
 tb whoami
-tb                         # authenticated OpenTUI
-tb verify
-tb evidence
-tb github run
+tb                          # authenticated OpenTUI
+tb verify --repository "$TINKERBOT_REPOSITORY"
 ```
 
-Install signed Tinkerbot client releases from the authenticated download channel. This source checkout is for authorized development; run `pnpm build` and `pnpm tui:build` before local verification.
+Install signed Tinkerbot client releases from the authenticated download channel. This source checkout is for authorized development; run `pnpm build` and `pnpm tui:build` before local verification. The release distribution matrix—including Bun, private npm registry, Homebrew, and checksum-verified curl installation—is in [`docs/distribution.md`](./docs/distribution.md).
 
 Use `pr-proof.yml` to configure the runner, coverage artifact, mutation limits, output, baselines, fixtures, selection, and policy. Safe defaults are advisory. Blocking is opt-in with `test_integrity.mode: blocking`, a stricter policy pack, or `baseline.fail_on_new: true`.
 
