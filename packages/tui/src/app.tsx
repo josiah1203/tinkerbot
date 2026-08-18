@@ -5,8 +5,9 @@ import type { TuiAdapter, VerificationRunHandle } from "./adapter";
 import { filterWorkItems, evidenceTrace, groupWorkItems, reportStatusLabel, summaryMetrics, type TuiSnapshot, type WorkItem } from "./model";
 import { colorForStatus, theme } from "./theme";
 import { executeTuiCommand, parseTuiCommand } from "./commands";
+import { detailTitle, filetypeForPath, itemSummary, safeText, short, type DetailView } from "./presentation";
 
-export type DetailView = "overview" | "diff" | "evidence" | "policy" | "run" | "help" | "repositories" | "runs" | "releases";
+export type { DetailView } from "./presentation";
 
 export interface TuiAppProps {
   adapter: TuiAdapter;
@@ -14,57 +15,6 @@ export interface TuiAppProps {
   /** Optional initial panel for embedders and deterministic startup flows. */
   initialView?: DetailView;
   onQuit: () => void;
-}
-
-function safeText(value: unknown, fallback = "—"): string {
-  if (value === undefined || value === null || value === "") return fallback;
-  return String(value).replace(/[\u0000-\u001f\u007f]/g, " ");
-}
-
-function short(value: string | undefined, size = 12): string {
-  return value ? value.slice(0, size) : "—";
-}
-
-function detailTitle(view: DetailView): string {
-  return ({ overview: "Overview", diff: "Diff", evidence: "Evidence trace", policy: "Policy", run: "Verification run", help: "Help", repositories: "Repositories", runs: "Runs", releases: "Releases" } as Record<DetailView, string>)[view];
-}
-
-function diffColor(line: string): string {
-  if (line.startsWith("+") && !line.startsWith("+++")) return theme.pass;
-  if (line.startsWith("-") && !line.startsWith("---")) return theme.danger;
-  if (line.startsWith("@@")) return theme.accent;
-  return theme.text;
-}
-
-function filetypeForPath(file: string | undefined): string | undefined {
-  const extension = file?.split(".").pop()?.toLowerCase();
-  return ({
-    ts: "typescript",
-    tsx: "tsx",
-    js: "javascript",
-    jsx: "jsx",
-    mjs: "javascript",
-    cjs: "javascript",
-    py: "python",
-    go: "go",
-    rs: "rust",
-    c: "c",
-    h: "c",
-    cc: "cpp",
-    cpp: "cpp",
-    hpp: "cpp",
-    java: "java",
-    rb: "ruby",
-    json: "json",
-    yaml: "yaml",
-    yml: "yaml",
-    md: "markdown",
-  } as Record<string, string | undefined>)[extension ?? ""];
-}
-
-function itemSummary(item: WorkItem | undefined): string {
-  if (!item) return "Select a work item to inspect its local evidence.";
-  return `${item.glyph} ${item.title}${item.file ? ` · ${item.file}${item.line ? `:${item.line}` : ""}` : ""}`;
 }
 
 export function TuiApp(props: TuiAppProps) {
