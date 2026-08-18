@@ -902,7 +902,7 @@ async function hostedRequest(pathname: string, method = "GET"): Promise<HostedRe
 
 async function runHostedCli(argv: string[]): Promise<number | undefined> {
   const command = argv[0];
-  if (!command) {
+  if (!command || command === "tui") {
     const response = await hostedRequest("/auth/session");
     if (response.status < 200 || response.status >= 300) {
       process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
