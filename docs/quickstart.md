@@ -1,11 +1,22 @@
-# Five-minute quickstart
+# Hosted client quickstart
 
 ## Install
 
-From a Node.js repository with Git history:
+Install through an authorized release channel. The URLs and registry/tap names below are release-owner inputs; this repository does not publish a public package or installer.
 
 ```sh
-pnpm add -D pr-proof
+# Private npm registry
+npm install -g @tinkerbot/cli@<version> --registry https://<approved-registry>
+
+# Bun
+bun add -g @tinkerbot/cli@<version> --registry https://<approved-registry>
+
+# Homebrew after the approved tap is published
+brew install <organization>/tinkerbot/tinkerbot
+
+# Checksum-verifying installer hosted by the approved download service
+curl -fsSL https://<approved-download-host>/<version>/install.sh | \
+  TINKERBOT_RELEASE_BASE_URL=https://<approved-download-host>/<version> sh
 ```
 
 For a checkout of this repository:
@@ -17,6 +28,16 @@ pnpm tui:build
 ```
 
 ## Configure
+
+Complete sign-in in the hosted product, then export the resulting terminal session values. `tb login` is reserved but is not implemented in this client build; it must not be used as a release instruction.
+
+```sh
+export TINKERBOT_CONTROL_PLANE_URL="https://<approved-control-plane-host>"
+export TINKERBOT_SESSION_TOKEN="<session-issued-by-the-hosted-sign-in-flow>"
+export TINKERBOT_REPOSITORY="OWNER/REPOSITORY"
+tb whoami
+tb org list
+```
 
 Create `pr-proof.yml`:
 
@@ -37,13 +58,8 @@ Defaults are advisory. Coverage and mutation evidence are optional and missing e
 ## Run locally
 
 ```sh
-tb tui
-tb doctor
-tb check --base origin/main --head HEAD
-tb usage --json
-tb policy list
-tb baseline init
-tb baseline check
+tb
+tb verify --repository "$TINKERBOT_REPOSITORY"
 ```
 
 Inspect exact findings in JSON, Markdown, or SARIF:
@@ -61,4 +77,4 @@ Use the example workflow in [`.github/workflows/pr-proof.example.yml`](../.githu
 
 `PASS` means no actionable finding was produced. `NEEDS_REVIEW` identifies evidence that needs a human review. `UNKNOWN` means an optional or dynamic evidence source was unavailable; it is not a false pass or automatic failure. `FAIL` is reserved for explicitly configured blocking behavior.
 
-Remove the tool by deleting its dependency, configuration, and workflow step. No hosted account is required and no source or full diff is uploaded by default.
+The TUI and hosted `verify` command require a valid hosted session. Local deterministic subcommands remain available for development and CI compatibility, but cannot represent hosted authorization, policy, or accepted assurance state. No source code or full diff is uploaded by the hosted assurance ingestion path.

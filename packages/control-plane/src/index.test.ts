@@ -9,6 +9,7 @@ import {
   getPlan,
   isOrganizationActionAllowed,
   normalizeReportSummary,
+  requiresAuthentication,
   safeReturnTo,
   usageRatio,
 } from ".";
@@ -41,10 +42,13 @@ test("safe redirects stay inside the control plane", () => {
   expect(safeReturnTo("/".repeat(2050))).toBe("/app/overview");
 });
 
-test("entitlements block private repositories at the configured limit and on payment failure", () => {
-  expect(PLAN_CATALOG.developer.privateRepositoryLimit).toBe(3);
+test("paid plans are per-active-seat, have no repository caps, and reject payment failure", () => {
+  expect(PLAN_CATALOG.developer).toMatchObject({ price: { amountCents: 1200 }, annualPriceCents: 12000, billingUnit: "active_seat", privateRepositoryLimit: null });
+  expect(PLAN_CATALOG.team).toMatchObject({ price: { amountCents: 1800 }, annualPriceCents: 18000, billingUnit: "active_seat", privateRepositoryLimit: null });
+  expect(PLAN_CATALOG.business).toMatchObject({ price: { amountCents: 2900 }, annualPriceCents: 29000, billingUnit: "active_seat", privateRepositoryLimit: null });
+  expect(PLAN_CATALOG.enterprise.selfHostedAvailable).toBe(false);
   expect(canConnectPrivateRepository({ planId: "developer", billingStatus: "active", activePrivateRepositories: 2, memberCount: 1 })).toBe(true);
-  expect(canConnectPrivateRepository({ planId: "developer", billingStatus: "active", activePrivateRepositories: 3, memberCount: 1 })).toBe(false);
+  expect(canConnectPrivateRepository({ planId: "developer", billingStatus: "active", activePrivateRepositories: 500, memberCount: 1 })).toBe(true);
   expect(canConnectPrivateRepository({ planId: "developer", billingStatus: "past_due", activePrivateRepositories: 0, memberCount: 1 })).toBe(false);
   expect(canConnectPrivateRepository({ planId: "enterprise", billingStatus: "active", activePrivateRepositories: 500, memberCount: 1 })).toBe(true);
   expect(canConnectPrivateRepository({ planId: "invalid" as never, billingStatus: "active", activePrivateRepositories: 0, memberCount: 1 })).toBe(false);
@@ -64,6 +68,41 @@ test("development auth treats malformed or unavailable local storage as unknown"
   expect(await auth.getSession()).toBeNull();
   expect((await auth.signIn({ email: "alex@example.test", password: "local-only-password" })).error).toContain("unavailable");
   await expect(auth.signOut()).resolves.toBeUndefined();
+});
+
+test("development auth validates signup inputs and clears malformed or expired stored sessions", async () => {
+  const values = new Map<string, string>();
+  const storage = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => void values.set(key, value),
+    removeItem: (key: string) => void values.delete(key),
+  };
+  const auth = createDevelopmentAuthAdapter(storage);
+  expect((await auth.signUp({ name: "", email: "alex@example.test", password: "local-only-password" })).error).toContain("name");
+  expect((await auth.signUp({ name: "Alex", email: "invalid", password: "local-only-password" })).error).toContain("email");
+  expect((await auth.signUp({ name: "Alex", email: "alex@example.test", password: "short" })).error).toContain("8 characters");
+  expect((await auth.signUp({ name: " Alex ", email: "ALEX@EXAMPLE.TEST", password: "local-only-password" })).session).toMatchObject({ name: "Alex", email: "alex@example.test" });
+  values.set("pr-proof.control-plane.session", "not-json");
+  expect(await auth.getSession()).toBeNull();
+  expect(values.has("pr-proof.control-plane.session")).toBe(false);
+  values.set("pr-proof.control-plane.session", JSON.stringify({ userId: "user", email: "a@example.test", name: "A", organizationId: "org", role: "owner", expiresAt: "2000-01-01T00:00:00.000Z" }));
+  expect(await auth.getSession()).toBeNull();
+  expect(values.has("pr-proof.control-plane.session")).toBe(false);
+  expect(await auth.requestPasswordReset("invalid")).toMatchObject({ accepted: false });
+  expect(await auth.requestPasswordReset("alex@example.test")).toMatchObject({ accepted: true });
+});
+
+test("entitlement helpers reject invalid usage and protect only application routes", () => {
+  expect(canConnectPrivateRepository({ planId: "free", billingStatus: "active", activePrivateRepositories: 0, memberCount: 1 })).toBe(false);
+  expect(canConnectPrivateRepository({ planId: "developer", billingStatus: "active", activePrivateRepositories: -1, memberCount: 1 })).toBe(false);
+  expect(canConnectPrivateRepository({ planId: "developer", billingStatus: "expired", activePrivateRepositories: 0, memberCount: 1 })).toBe(false);
+  expect(usageRatio(-2, 3)).toBe(0);
+  expect(usageRatio(4, 0)).toBe(1);
+  expect(usageRatio(0, 0)).toBe(0);
+  expect(requiresAuthentication("/app")).toBe(true);
+  expect(requiresAuthentication("/app/repositories")).toBe(true);
+  expect(requiresAuthentication("/appetite")).toBe(false);
+  expect(requiresAuthentication("/sign-in")).toBe(false);
 });
 
 test("organization actions are role-authorized by the server-side policy", () => {

@@ -876,4 +876,102 @@ export function main(argv = process.argv.slice(2)): number {
   return runCli(argv);
 }
 
-if (require.main === module) process.exitCode = main();
+interface HostedResponse {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+function hostedConfigurationError(): string | undefined {
+  const base = process.env.TINKERBOT_CONTROL_PLANE_URL?.replace(/\/$/, "");
+  const token = process.env.TINKERBOT_SESSION_TOKEN;
+  if (!base || !/^https:\/\//.test(base)) return "Hosted commands require an HTTPS TINKERBOT_CONTROL_PLANE_URL.";
+  if (!token || !/^[A-Za-z0-9_-]{20,200}$/.test(token)) return "Hosted commands require TINKERBOT_SESSION_TOKEN from an authenticated Tinkerbot session.";
+  return undefined;
+}
+
+async function hostedRequest(pathname: string, method = "GET", payload?: Record<string, unknown>): Promise<HostedResponse> {
+  const base = process.env.TINKERBOT_CONTROL_PLANE_URL?.replace(/\/$/, "");
+  const token = process.env.TINKERBOT_SESSION_TOKEN;
+  const configurationError = hostedConfigurationError();
+  if (configurationError) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, configurationError);
+  let response: Response;
+  try {
+    response = await fetch(`${base}${pathname}`, { method, headers: { authorization: `Bearer ${token}`, accept: "application/json", ...(payload ? { "content-type": "application/json" } : {}) }, ...(payload ? { body: JSON.stringify(payload) } : {}) });
+  } catch {
+    throw new CliFailure(EXIT_CODES.EXECUTION_ERROR, "The Tinkerbot control plane could not be reached.");
+  }
+  let body: Record<string, unknown> = {};
+  try {
+    const parsed = await response.json() as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) body = parsed as Record<string, unknown>;
+  } catch { /* A malformed provider response remains a non-success result. */ }
+  return { status: response.status, body };
+}
+
+async function runHostedCli(argv: string[]): Promise<number | undefined> {
+  const command = argv[0];
+  if (!command || command === "tui") {
+    const response = await hostedRequest("/auth/session");
+    if (response.status < 200 || response.status >= 300) {
+      process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
+      return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
+    }
+    return undefined;
+  }
+  if (command === "org") {
+    const subcommand = argv[1] ?? "list";
+    if (subcommand !== "list" && subcommand !== "switch") return undefined;
+    const organizationId = argv[2];
+    if (subcommand === "switch" && !organizationId) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb org switch requires an organization identifier.");
+    const response = await hostedRequest(subcommand === "list" ? "/tenant/organizations" : "/tenant/organizations/switch", subcommand === "list" ? "GET" : "POST", subcommand === "switch" ? { organizationId } : undefined);
+    if (response.status < 200 || response.status >= 300) {
+      process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
+      return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
+    }
+    process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
+    return EXIT_CODES.PASS;
+  }
+  if (command === "verify") {
+    const configurationError = hostedConfigurationError();
+    if (configurationError) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, configurationError);
+    const options = parseArgs(argv);
+    const root = getRepoRoot(process.cwd());
+    const report = options.input
+      ? reportFromInput(root, options.input)
+      : createReport({ cwd: root, command: "check", base: options.base, head: options.head, configPath: options.config, runMutation: options.mutation, runBaseTests: options.baseTests, mode: options.mode, failOn: options.failOn, mutationMax: options.mutationMax, policy: options.policy, timeout: options.timeout, maxFiles: options.maxFiles, maxFindings: options.maxFindings });
+    let context: ReturnType<typeof createGitContext> | undefined;
+    try { context = createGitContext(root, report.base, report.head); } catch { /* The bundle carries explicit UNKNOWN provenance when Git context is unavailable. */ }
+    const assurance = createAssuranceBundle({ repository: report.repository, base: report.base, head: report.head, report, impact: report.impact, root, diffs: context?.diffs, now: report.generatedAt });
+    const repository = options.repository ?? report.repository;
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb verify requires --repository owner/repository or a GitHub origin remote.");
+    const response = await hostedRequest("/assurance/ingest", "POST", { repository, assurance });
+    if (response.status < 200 || response.status >= 300) {
+      process.stderr.write(`Tinkerbot hosted verification was rejected: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
+      return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
+    }
+    process.stdout.write(`${JSON.stringify({ ...response.body, localVerdict: report.verdict, unknowns: assurance.unknowns }, null, 2)}\n`);
+    return assurance.unknowns.length ? EXIT_CODES.UNKNOWN : EXIT_CODES.PASS;
+  }
+  if (command !== "whoami" && command !== "logout") return undefined;
+  const response = await hostedRequest(command === "whoami" ? "/auth/session" : "/auth/signout", command === "whoami" ? "GET" : "POST");
+  if (response.status < 200 || response.status >= 300) {
+    process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
+    return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
+  }
+  if (command === "whoami") process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
+  else process.stdout.write("Signed out of the Tinkerbot control plane.\n");
+  return EXIT_CODES.PASS;
+}
+
+export async function mainAsync(argv = process.argv.slice(2)): Promise<number> {
+  try {
+    const hosted = await runHostedCli(argv);
+    return hosted ?? runCli(argv);
+  } catch (error) {
+    const failure = classifyError(error);
+    process.stderr.write(`Tinkerbot hosted error: ${failure.message}\n`);
+    return failure.code;
+  }
+}
+
+if (require.main === module) void mainAsync().then((code) => { process.exitCode = code; });

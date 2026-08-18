@@ -4,64 +4,17 @@ import { useTerminalDimensions } from "@opentui/solid";
 import type { TuiAdapter, VerificationRunHandle } from "./adapter";
 import { filterWorkItems, evidenceTrace, groupWorkItems, reportStatusLabel, summaryMetrics, type TuiSnapshot, type WorkItem } from "./model";
 import { colorForStatus, theme } from "./theme";
+import { executeTuiCommand, parseTuiCommand } from "./commands";
+import { detailTitle, filetypeForPath, itemSummary, safeText, short, type DetailView } from "./presentation";
+
+export type { DetailView } from "./presentation";
 
 export interface TuiAppProps {
   adapter: TuiAdapter;
   dimensions?: () => { width: number; height: number };
+  /** Optional initial panel for embedders and deterministic startup flows. */
+  initialView?: DetailView;
   onQuit: () => void;
-}
-
-type DetailView = "overview" | "diff" | "evidence" | "policy" | "run" | "help" | "repositories" | "runs" | "releases";
-
-function safeText(value: unknown, fallback = "—"): string {
-  if (value === undefined || value === null || value === "") return fallback;
-  return String(value).replace(/[\u0000-\u001f\u007f]/g, " ");
-}
-
-function short(value: string | undefined, size = 12): string {
-  return value ? value.slice(0, size) : "—";
-}
-
-function detailTitle(view: DetailView): string {
-  return ({ overview: "Overview", diff: "Diff", evidence: "Evidence trace", policy: "Policy", run: "Verification run", help: "Help", repositories: "Repositories", runs: "Runs", releases: "Releases" } as Record<DetailView, string>)[view];
-}
-
-function diffColor(line: string): string {
-  if (line.startsWith("+") && !line.startsWith("+++")) return theme.pass;
-  if (line.startsWith("-") && !line.startsWith("---")) return theme.danger;
-  if (line.startsWith("@@")) return theme.accent;
-  return theme.text;
-}
-
-function filetypeForPath(file: string | undefined): string | undefined {
-  const extension = file?.split(".").pop()?.toLowerCase();
-  return ({
-    ts: "typescript",
-    tsx: "tsx",
-    js: "javascript",
-    jsx: "jsx",
-    mjs: "javascript",
-    cjs: "javascript",
-    py: "python",
-    go: "go",
-    rs: "rust",
-    c: "c",
-    h: "c",
-    cc: "cpp",
-    cpp: "cpp",
-    hpp: "cpp",
-    java: "java",
-    rb: "ruby",
-    json: "json",
-    yaml: "yaml",
-    yml: "yaml",
-    md: "markdown",
-  } as Record<string, string | undefined>)[extension ?? ""];
-}
-
-function itemSummary(item: WorkItem | undefined): string {
-  if (!item) return "Select a work item to inspect its local evidence.";
-  return `${item.glyph} ${item.title}${item.file ? ` · ${item.file}${item.line ? `:${item.line}` : ""}` : ""}`;
 }
 
 export function TuiApp(props: TuiAppProps) {
@@ -69,9 +22,9 @@ export function TuiApp(props: TuiAppProps) {
   const [filter, setFilter] = createSignal("");
   const [commandText, setCommandText] = createSignal("");
   const [selected, setSelected] = createSignal(0);
-  const [view, setView] = createSignal<DetailView>("overview");
+  const [view, setView] = createSignal<DetailView>(props.initialView ?? "overview");
   const [diffMode, setDiffMode] = createSignal<"unified" | "split">("unified");
-  const [status, setStatus] = createSignal("Local-only · no account required");
+  const [status, setStatus] = createSignal("Connecting to the Tinkerbot control plane…");
   const [logs, setLogs] = createSignal<string[]>([]);
   const [running, setRunning] = createSignal(false);
   const [inputRef, setInputRef] = createSignal<any>();
@@ -89,14 +42,14 @@ export function TuiApp(props: TuiAppProps) {
   }
 
   async function refresh(): Promise<void> {
-    setStatus("Refreshing local repository context…");
+    setStatus("Refreshing server-authoritative organization and evidence state…");
     try {
       const next = await props.adapter.loadSnapshot();
       setSnapshot(next);
       setSelected(0);
-      if (next.state === "error") setStatus(next.warnings[0] ?? "Repository context unavailable");
+      if (next.state === "error" || next.state === "permission-denied") setStatus(next.warnings[0] ?? "Hosted session unavailable");
       else if (next.state === "stale") setStatus("Evidence is stale · press r to rerun");
-      else setStatus(next.report ? `Loaded ${next.report.verdict} · local evidence only` : "No verification report · press r to run");
+      else setStatus(next.report ? `Loaded ${next.report.verdict} from the control plane` : "No hosted assurance record is available");
     } catch (error) {
       setSnapshot({ state: "error", history: [], diff: "", changedFiles: [], workItems: [], warnings: [error instanceof Error ? error.message : String(error)], loadedAt: new Date().toISOString() });
       setStatus("Recoverable adapter error · press r to retry");
@@ -149,34 +102,20 @@ export function TuiApp(props: TuiAppProps) {
   }
 
   function submitCommand(value = commandText()): void {
-    const command = value.trim();
+    const command = parseTuiCommand(value);
     setCommandText("");
-    if (!command) return;
-    if (command.startsWith("/")) {
-      setFilter(command.slice(1));
-      setSelected(0);
-      setStatus(command.slice(1) ? `Filtering: ${command.slice(1)}` : "Filter cleared");
-      return;
-    }
-    const normalized = command.startsWith(":") ? command.slice(1).trim().toLowerCase() : command.toLowerCase();
-    if (["r", "rerun", "run", "verify"].includes(normalized)) void runVerification();
-    else if (["d", "diff"].includes(normalized)) setView("diff");
-    else if (["e", "evidence"].includes(normalized)) setView("evidence");
-    else if (["p", "policy", "config"].includes(normalized)) setView("policy");
-    else if (normalized === "export-evidence") void exportEvidence();
-    else if (normalized === "export markdown") void props.adapter.exportReport("markdown").then((result) => setStatus(result.ok ? "Markdown summary exported to .tinkerbot/exports/" : `Markdown export unavailable: ${result.stderr}`));
-    else if (normalized === "export sarif") void props.adapter.exportReport("sarif").then((result) => setStatus(result.ok ? "SARIF exported to .tinkerbot/exports/" : `SARIF export unavailable: ${result.stderr}`));
-    else if (normalized === "export json") void props.adapter.exportReport("json").then((result) => setStatus(result.ok ? "JSON exported to .tinkerbot/exports/" : `JSON export unavailable: ${result.stderr}`));
-    else if (["x", "export", "receipt"].includes(normalized)) void exportReceipt();
-    else if (normalized.startsWith("repo ") || normalized.startsWith("repository ")) {
-      const root = command.replace(/^:?\s*(repo|repository)\s+/i, "").trim();
-      if (root && props.adapter.selectRepository) { props.adapter.selectRepository(root); void refresh(); }
-      else setStatus("Repository selection requires a local path and a repository adapter");
-    }
-    else if (["github", "open", "o"].includes(normalized)) openGitHub();
-    else if (["help", "?"].includes(normalized)) setView("help");
-    else if (normalized === "clear") { setFilter(""); setStatus("Filter cleared"); }
-    else { setFilter(command); setSelected(0); setStatus(`Filtering: ${command}`); }
+    executeTuiCommand(command, {
+      filter: (query) => { setFilter(query); setSelected(0); setStatus(query ? `Filtering: ${query}` : "Filter cleared"); },
+      rerun: () => void runVerification(),
+      detail: setView,
+      exportEvidence: () => void exportEvidence(),
+      exportReport: (format) => void props.adapter.exportReport(format).then((result) => setStatus(result.ok ? `${format === "markdown" ? "Markdown summary" : format.toUpperCase()} exported to .tinkerbot/exports/` : `${format === "markdown" ? "Markdown" : format.toUpperCase()} export unavailable: ${result.stderr}`)),
+      exportReceipt: () => void exportReceipt(),
+      repository: (root) => { if (props.adapter.selectRepository) { props.adapter.selectRepository(root); void refresh(); } else setStatus("Repository selection requires a local path and a repository adapter"); },
+      repositoryUnavailable: () => setStatus("Repository selection requires a local path and a repository adapter"),
+      github: openGitHub,
+      clear: () => { setFilter(""); setStatus("Filter cleared"); },
+    });
   }
 
   function move(delta: number): void {

@@ -26,7 +26,8 @@
         "WORKOS_WEBHOOK_SECRET",
         "STRIPE_SECRET_KEY",
         "STRIPE_WEBHOOK_SECRET",
-        "SESSION_ENCRYPTION_KEY"
+        "SESSION_ENCRYPTION_KEY",
+        "GITHUB_WEBHOOK_SECRET"
     ]
   },
   "env": {
@@ -58,7 +59,8 @@
           "WORKOS_WEBHOOK_SECRET",
           "STRIPE_SECRET_KEY",
           "STRIPE_WEBHOOK_SECRET",
-          "SESSION_ENCRYPTION_KEY"
+          "SESSION_ENCRYPTION_KEY",
+          "GITHUB_WEBHOOK_SECRET"
         ]
       }
     },
@@ -81,7 +83,8 @@
           "WORKOS_WEBHOOK_SECRET",
           "STRIPE_SECRET_KEY",
           "STRIPE_WEBHOOK_SECRET",
-          "SESSION_ENCRYPTION_KEY"
+          "SESSION_ENCRYPTION_KEY",
+          "GITHUB_WEBHOOK_SECRET"
         ]
       }
     }

@@ -4,7 +4,7 @@ import { KeymapProvider } from "@opentui/keymap/solid";
 import { render } from "@opentui/solid";
 import { ErrorBoundary } from "solid-js";
 import { TuiApp } from "./app";
-import { createLocalAdapter, type TuiAdapterOptions } from "./adapter";
+import { createHostedAdapter, type TuiAdapterOptions } from "./adapter";
 
 function parseOptions(argv: string[]): TuiAdapterOptions {
   const options: TuiAdapterOptions = { cwd: process.cwd(), head: "HEAD" };
@@ -15,7 +15,7 @@ function parseOptions(argv: string[]): TuiAdapterOptions {
     else if (token === "--head" && value) { options.head = value; index += 1; }
     else if (token === "--config" && value) { options.config = value; index += 1; }
     else if (token === "--cwd" && value) { options.cwd = value; index += 1; }
-    else if (token === "--repository" && value) { options.cwd = value; index += 1; }
+    else if (token === "--repository" && value) { options.repository = value; index += 1; }
   }
   return options;
 }
@@ -36,7 +36,7 @@ export async function startTui(options: TuiAdapterOptions = {}): Promise<void> {
     await render(() => (
       <KeymapProvider keymap={keymap}>
         <ErrorBoundary fallback={(error) => <box padding={1}><text fg="#ff6b6b">{`Tinkerbot TUI recovered from a render error: ${String(error)}`}</text><text>Press q to exit or r to retry the local adapter.</text></box>}>
-          <TuiApp adapter={createLocalAdapter(options)} onQuit={close} />
+          <TuiApp adapter={createHostedAdapter(options)} onQuit={close} />
         </ErrorBoundary>
       </KeymapProvider>
     ), renderer);

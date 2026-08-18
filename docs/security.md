@@ -1,8 +1,8 @@
 # Security and privacy
 
-Current product boundary: this pass ships the local-first Tinkerbot CLI/TUI and the thin Tinkerbot Verify GitHub Action/App assurance layer. The older hosted control-plane notes below describe retained compatibility material only; no new web dashboard, hosted execution plane, or source-processing control plane is part of this pass.
+Current product boundary: Tinkerbot is a hosted proprietary SaaS. The terminal client and GitHub App/Action use server-authoritative organization, entitlement, repository, policy, and evidence decisions; the web surface is limited to required handoffs.
 
-Tinkerbot runs inside the customer’s runner. Source code, diffs, ASTs, and full reports stay local unless the customer explicitly copies an output elsewhere. There is no telemetry by default; the local TUI never requires an account.
+Tinkerbot may prepare bounded evidence in a customer runner. Source code, diffs, ASTs, and full reports stay local unless an explicit tenant-authorized transfer policy applies; release clients require an account.
 
 The paid control-plane design preserves that boundary. Synchronized data is structured verification metadata, not a source mirror; full diffs are not uploaded by default. Repository names, paths, findings, and rule metadata can still be sensitive and must be covered by organization authorization and configurable retention.
 

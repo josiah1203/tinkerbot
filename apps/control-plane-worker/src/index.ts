@@ -22,6 +22,7 @@ import {
   normalizeWorkOSInvitation,
   providerStatuses,
 } from "../../../packages/hosted-integrations/src";
+import { admitWebhook } from "../../../packages/github/src";
 
 interface Env extends Record<string, unknown> {
   ENVIRONMENT?: string;
@@ -34,6 +35,7 @@ interface Env extends Record<string, unknown> {
   STRIPE_SECRET_KEY?: string;
   STRIPE_WEBHOOK_SECRET?: string;
   STRIPE_PLANS_JSON?: string;
+  GITHUB_WEBHOOK_SECRET?: string;
   SESSION_ENCRYPTION_KEY?: string;
   WORKOS_REDIRECT_URI?: string;
   CONTROL_PLANE_URL?: string;
@@ -99,7 +101,9 @@ function sessionStore(env: Env, config: Awaited<ReturnType<typeof hostedProvider
 }
 
 async function currentSession(request: Request, store: D1AuthSessionStore): Promise<{ id: string; session: HostedSession } | null> {
-  const id = cookieValue(request, "tinkerbot_session");
+  const authorization = request.headers.get("authorization");
+  const bearer = authorization?.match(/^Bearer ([A-Za-z0-9_-]{20,200})$/)?.[1];
+  const id = bearer ?? cookieValue(request, "tinkerbot_session");
   if (!id) return null;
   const session = await store.get(id);
   return session ? { id, session } : null;
@@ -260,6 +264,39 @@ function assuranceMetadataKey(organizationId: string, repository: string): strin
   return `assurance:${encodeURIComponent(organizationId)}:${encodeURIComponent(repository)}`;
 }
 
+function githubNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function githubText(value: unknown, maximum = 300): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= maximum && !/[\u0000-\u001f\u007f]/.test(value) ? value : undefined;
+}
+
+async function persistGitHubRepository(database: D1DatabaseLike, installationId: number, value: unknown, status: "active" | "removed" | "suspended", updatedAt: string): Promise<void> {
+  const repository = workerRecordValue(value);
+  const repositoryId = githubNumber(repository.id);
+  const fullName = githubText(repository.full_name);
+  if (!repositoryId || !fullName) return;
+  await database.prepare("INSERT INTO tinkerbot_github_repositories (repository_id, installation_id, full_name, visibility, status, permissions_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(repository_id) DO UPDATE SET installation_id = excluded.installation_id, full_name = excluded.full_name, visibility = excluded.visibility, status = excluded.status, permissions_json = excluded.permissions_json, updated_at = excluded.updated_at")
+    .bind(repositoryId, installationId, fullName.toLowerCase(), githubText(repository.visibility, 40) ?? null, status, JSON.stringify(workerRecordValue(repository.permissions)), updatedAt).run();
+}
+
+async function persistGitHubWebhook(database: D1DatabaseLike, payload: Record<string, unknown>, eventName: string | undefined): Promise<void> {
+  const installation = workerRecordValue(payload.installation);
+  const installationId = githubNumber(installation.id) ?? githubNumber(payload.installation_id);
+  if (!installationId) return;
+  const action = githubText(payload.action, 80) ?? "";
+  const account = workerRecordValue(payload.account);
+  const status = eventName === "installation" && (action === "deleted" ? "deleted" : action === "suspend" ? "suspended" : "active") as "active" | "suspended" | "deleted";
+  const now = new Date().toISOString();
+  await database.prepare("INSERT INTO tinkerbot_github_installations (installation_id, account_id, account_login, status, installed_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(installation_id) DO UPDATE SET account_id = excluded.account_id, account_login = excluded.account_login, status = excluded.status, updated_at = excluded.updated_at")
+    .bind(installationId, githubNumber(account.id) ?? null, githubText(account.login, 200) ?? null, status, now, now).run();
+  const repositoryStatus = status === "suspended" ? "suspended" : action === "removed" ? "removed" : "active";
+  for (const repository of [payload.repository, ...(Array.isArray(payload.repositories) ? payload.repositories : []), ...(Array.isArray(payload.repositories_added) ? payload.repositories_added : []), ...(Array.isArray(payload.repositories_removed) ? payload.repositories_removed : [])]) {
+    await persistGitHubRepository(database, installationId, repository, repositoryStatus, now);
+  }
+}
+
 function applicationUrl(request: Request, env: Env, path: string): string {
   const configured = typeof env.CONTROL_PLANE_URL === "string" && env.CONTROL_PLANE_URL.startsWith("https://") ? env.CONTROL_PLANE_URL : request.url;
   return new URL(path, configured).toString();
@@ -327,15 +364,20 @@ function stripePriceIds(object: Record<string, unknown>): string[] {
   return ids;
 }
 
-function configuredStripePlan(object: Record<string, unknown>, plans: StripePlan[]): { plan?: StripePlan; interval?: "month" | "year" } {
+interface CheckoutMapping {
+  organizationId: string;
+  planId: string;
+  interval: "month" | "year";
+  createdAt: string;
+}
+
+function configuredStripePlan(object: Record<string, unknown>, plans: StripePlan[], checkoutMapping?: CheckoutMapping | null): { plan?: StripePlan; interval?: "month" | "year" } {
   for (const priceId of stripePriceIds(object)) {
     const plan = plans.find((candidate) => candidate.monthlyPriceId === priceId || candidate.annualPriceId === priceId);
     if (plan) return { plan, interval: plan.annualPriceId === priceId ? "year" : "month" };
   }
-  const metadata = workerRecordValue(object.metadata);
-  const plan = plans.find((candidate) => candidate.id === metadata.plan_id);
-  const interval = metadata.billing_interval === "year" ? "year" : metadata.billing_interval === "month" ? "month" : undefined;
-  return { plan, interval };
+  const plan = checkoutMapping ? plans.find((candidate) => candidate.id === checkoutMapping.planId) : undefined;
+  return plan && checkoutMapping ? { plan, interval: checkoutMapping.interval } : {};
 }
 
 function stripeStatus(event: StripeWebhookEvent, existing?: TenantBillingAccount | null): string {
@@ -359,15 +401,22 @@ async function applyStripeEvent(event: StripeWebhookEvent, metadata: D1JsonMetad
   const subscriptionId = stripeSubscriptionId(event);
   const customerId = stringField(object.customer);
   const mapped = subscriptionId ? await billing.getBySubscription(subscriptionId) : customerId ? await billing.getByCustomer(customerId) : null;
-  const organizationId = stringField(objectMetadata.organization_id) ?? stringField(object.client_reference_id) ?? mapped?.organizationId;
+  const checkoutId = event.type === "checkout.session.completed" ? stringField(object.id) : undefined;
+  const checkoutMapping = checkoutId ? await metadata.get<CheckoutMapping>(`billing:checkout:${checkoutId}`) : null;
+  const organizationId = mapped?.organizationId ?? checkoutMapping?.organizationId;
   if (!organizationId) {
     await metadata.put(`billing:event:${event.id}`, { id: event.id, type: event.type, ignored: true, reason: "organization_unresolved", receivedAt: new Date().toISOString() });
+    return;
+  }
+  const claimedOrganizationId = stringField(objectMetadata.organization_id) ?? stringField(object.client_reference_id);
+  if (claimedOrganizationId && claimedOrganizationId !== organizationId) {
+    await metadata.put(`billing:event:${event.id}`, { id: event.id, type: event.type, ignored: true, reason: "organization_mismatch", receivedAt: new Date().toISOString(), organizationId });
     return;
   }
   const existing = mapped ?? await billing.getByOrganization(organizationId);
   const eventCreated = Number.isSafeInteger(event.created) && (event.created as number) >= 0 ? event.created as number : Math.floor(Date.now() / 1000);
   const updatedAt = new Date(eventCreated * 1000).toISOString();
-  const configured = configuredStripePlan(object, plans);
+  const configured = configuredStripePlan(object, plans, checkoutMapping);
   const plan = configured.plan;
   const periodEnd = typeof object.current_period_end === "number" ? new Date(object.current_period_end * 1000).toISOString() : existing?.currentPeriodEnd;
   const account: TenantBillingAccount = {
@@ -573,6 +622,30 @@ export default {
         if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
         return json(publicAccess(access));
       }
+      if (url.pathname === "/tenant/organizations" && request.method === "GET") {
+        const store = sessionStore(env, config);
+        if (!store || !env.DB) return json({ error: "Organization selection requires the D1 session and tenant stores.", code: "tenant_store_not_configured" }, 501);
+        const current = await currentSession(request, store);
+        if (!current) return json({ error: "Authentication is required.", code: "not_authenticated" }, 401);
+        const memberships = await new D1TenantStore(env.DB).listActiveMemberships(current.session.user.id);
+        return json({ authenticated: true, currentOrganizationId: current.session.organizationId, organizations: memberships.map((membership) => ({ organizationId: membership.organizationId, role: membership.role, updatedAt: membership.updatedAt })) });
+      }
+      if (url.pathname === "/tenant/organizations/switch" && request.method === "POST") {
+        if (!originAllowed(request, env)) return json({ error: "Cross-origin organization mutation rejected.", code: "csrf_origin_rejected" }, 403);
+        const store = sessionStore(env, config);
+        if (!store || !env.DB) return json({ error: "Organization selection requires the D1 session and tenant stores.", code: "tenant_store_not_configured" }, 501);
+        const current = await currentSession(request, store);
+        if (!current) return json({ error: "Authentication is required.", code: "not_authenticated" }, 401);
+        const body = await jsonBody(request);
+        const organizationId = typeof body?.organizationId === "string" && /^[A-Za-z0-9._:-]{1,200}$/.test(body.organizationId) ? body.organizationId : undefined;
+        if (!organizationId) return json({ error: "A valid organizationId is required.", code: "invalid_organization" }, 400);
+        const tenants = new D1TenantStore(env.DB);
+        const membership = await tenants.getMembership(current.session.user.id, organizationId);
+        if (!membership || membership.status !== "active") return json({ error: "The authenticated user is not an active member of that organization.", code: "not_a_member" }, 403);
+        await store.put(current.id, { ...current.session, organizationId });
+        const access = await authorizeTenantSession({ id: current.id, session: { ...current.session, organizationId } }, tenants);
+        return json({ switched: true, ...(access.ok ? publicAccess(access) : { authorized: false }) });
+      }
       if (url.pathname === "/assurance/summary" && request.method === "GET") {
         const store = sessionStore(env, config);
         const database = env.DB;
@@ -694,9 +767,41 @@ export default {
       if (url.pathname === "/auth/signout" && request.method === "POST") {
         if (!originAllowed(request, env)) return json({ error: "Cross-origin session mutation rejected.", code: "csrf_origin_rejected" }, 403);
         const store = sessionStore(env, config);
-        const sessionId = cookieValue(request, "tinkerbot_session");
+        const authorization = request.headers.get("authorization");
+        const sessionId = authorization?.match(/^Bearer ([A-Za-z0-9_-]{20,200})$/)?.[1] ?? cookieValue(request, "tinkerbot_session");
         if (store && sessionId) await store.delete(sessionId);
         return jsonWithCookies({ signedOut: true }, 200, [clearCookie("tinkerbot_session"), clearCookie("tinkerbot_oauth_state")]);
+      }
+      if (url.pathname === "/integrations/github/install/callback" && request.method === "GET") {
+        const store = sessionStore(env, config);
+        if (!store || !env.DB) return json({ error: "GitHub installation binding requires the D1 session and tenant stores.", code: "github_installation_store_not_configured" }, 501);
+        const access = await authorizeTenantSession(await currentSession(request, store), new D1TenantStore(env.DB), "tenant:read");
+        if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
+        const installationId = Number(url.searchParams.get("installation_id"));
+        if (!Number.isSafeInteger(installationId) || installationId <= 0) return json({ error: "A valid GitHub installation_id is required.", code: "invalid_github_installation" }, 400);
+        const now = new Date().toISOString();
+        await env.DB.prepare("INSERT INTO tinkerbot_github_installations (installation_id, organization_id, status, installed_at, updated_at) VALUES (?1, ?2, 'active', ?3, ?3) ON CONFLICT(installation_id) DO UPDATE SET organization_id = excluded.organization_id, updated_at = excluded.updated_at")
+          .bind(installationId, access.membership.organizationId, now).run();
+        return json({ connected: true, authorized: true, organizationId: access.membership.organizationId, installationId });
+      }
+      if (url.pathname === "/integrations/github/webhook" && request.method === "POST") {
+        if (!env.DB) return json({ error: "GitHub webhook persistence requires the D1 store.", code: "github_webhook_store_not_configured" }, 501);
+        const payload = await boundedRequestText(request, 1_500_000);
+        const eventName = request.headers.get("x-github-event") ?? undefined;
+        const deliveryId = request.headers.get("x-github-delivery") ?? undefined;
+        const admission = admitWebhook({ payload, signature: request.headers.get("x-hub-signature-256") ?? undefined, secret: env.GITHUB_WEBHOOK_SECRET, eventName, deliveryId });
+        if (!admission.accepted || !admission.payload || !admission.idempotencyKey) return json({ error: "GitHub webhook was rejected.", code: admission.reason ?? "invalid_github_webhook" }, 401);
+        const ledger = new D1WebhookLedger(env.DB, "github");
+        if (ledger.claim && !await ledger.claim(admission.idempotencyKey)) return json({ received: true, duplicate: true });
+        try {
+          await persistGitHubWebhook(env.DB, admission.payload, eventName);
+          await new D1JsonMetadataStore(env.DB).put(`github:audit:${admission.idempotencyKey}`, admission.audit);
+          await ledger.record(admission.idempotencyKey);
+          return json({ received: true, duplicate: false });
+        } catch (error) {
+          if (ledger.release) await ledger.release(admission.idempotencyKey);
+          throw error;
+        }
       }
       if (url.pathname === "/integrations/workos/webhook" && request.method === "POST") {
         if (!env.DB) return json({ error: "WorkOS webhook verification is wired, but the D1 webhook ledger is not configured yet.", code: "webhook_ledger_not_configured" }, 501);
@@ -746,6 +851,7 @@ export default {
           if (billingState?.subscriptionId && !["canceled", "cancelled", "incomplete_expired"].includes(billingState.status)) return json({ error: "This organization already has a subscription. Manage it in the billing portal instead.", code: "subscription_already_exists" }, 409);
           const requestKey = request.headers.get("idempotency-key")?.replace(/[^a-zA-Z0-9_.:-]/g, "").slice(0, 120) || crypto.randomUUID();
           const checkout = await provider.createCheckoutSession({ planId, interval, organizationId, successUrl: safeReturnUrl(body?.successUrl, request, env, "/app/settings/billing"), cancelUrl: safeReturnUrl(body?.cancelUrl, request, env, "/app/settings/billing"), customerId: billingState?.customerId, customerEmail: access.current.session.user.email, idempotencyKey: `checkout:${organizationId}:${planId}:${interval}:${requestKey}` });
+          await new D1JsonMetadataStore(database).put(`billing:checkout:${checkout.id}`, { organizationId, planId, interval, createdAt: new Date().toISOString() } satisfies CheckoutMapping);
           return json({ checkout });
         }
         if (url.pathname === "/billing/portal") {

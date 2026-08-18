@@ -1,5 +1,7 @@
 # Tinkerbot MVP expansion audit
 
+> Historical audit — preserved for the expansion baseline. It is not release guidance; the hosted control-plane ADRs and release documents govern current behavior.
+
 ## Current state before this expansion
 
 The repository is a standalone TypeScript monorepo. The existing local-first pipeline already includes:

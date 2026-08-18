@@ -16,10 +16,26 @@ test("exposes version, command help, config validation, and effective config", (
 });
 
 test("recognizes unavailable hosted commands without returning successful help", () => {
-  for (const args of [["login"], ["org", "list"], ["github", "run"], ["serve"]]) {
+  for (const args of [["login"], ["github", "run"], ["serve"]]) {
     const result = spawnSync(process.execPath, [cli, ...args], { encoding: "utf8" });
     expect(result.status).toBe(12);
     expect(result.stderr).toContain("recognized but unavailable");
+  }
+});
+
+test("hosted identity commands fail closed without an authenticated control-plane session", () => {
+  for (const args of [["whoami"], ["org", "list"], ["org", "switch", "org_1"], ["verify"]]) {
+    const result = spawnSync(process.execPath, [cli, ...args], { encoding: "utf8", env: { ...process.env, TINKERBOT_CONTROL_PLANE_URL: "", TINKERBOT_SESSION_TOKEN: "" } });
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain("TINKERBOT_CONTROL_PLANE_URL");
+  }
+});
+
+test("the executable does not open the TUI before hosted authentication is configured", () => {
+  for (const args of [[], ["tui"]]) {
+    const result = spawnSync(process.execPath, [cli, ...args], { encoding: "utf8", env: { ...process.env, TINKERBOT_CONTROL_PLANE_URL: "", TINKERBOT_SESSION_TOKEN: "" } });
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain("TINKERBOT_CONTROL_PLANE_URL");
   }
 });
 

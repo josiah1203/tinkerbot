@@ -1,5 +1,7 @@
 # Tinkerbot migration audit
 
+> Historical audit — preserved to show the migration baseline. Its local/accountless preview assumptions are superseded by the current hosted-product contract and ADRs.
+
 Date: 2026-08-18
 
 This audit applies the attached Tinkerbot migration specification to the existing `pr-proof` repository. The direct implementation request for this slice is to prepare WorkOS authentication, Stripe billing, and Cloudflare hosting/secrets boundaries without placing provider credentials in source or claiming production readiness.

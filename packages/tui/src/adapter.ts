@@ -11,6 +11,9 @@ export interface TuiAdapterOptions {
   base?: string;
   head?: string;
   config?: string;
+  controlPlaneUrl?: string;
+  sessionToken?: string;
+  repository?: string;
 }
 
 export interface VerificationRunResult {
@@ -349,6 +352,88 @@ export class LocalCliAdapter implements TuiAdapter {
 
 export function createLocalAdapter(options: TuiAdapterOptions = {}): LocalCliAdapter {
   return new LocalCliAdapter(options);
+}
+
+/**
+ * Hosted mode deliberately treats the control plane as the source of truth.
+ * It never falls back to local reports or local storage when credentials are
+ * absent: an unavailable session is an explicit error state.
+ */
+export class HostedControlPlaneAdapter implements TuiAdapter {
+  private readonly options: TuiAdapterOptions;
+  private readonly base: string;
+  private readonly token: string;
+  private readonly repository: string;
+  private readonly cwd: string;
+
+  constructor(options: TuiAdapterOptions = {}) {
+    this.options = options;
+    this.base = (options.controlPlaneUrl ?? process.env.TINKERBOT_CONTROL_PLANE_URL ?? "").replace(/\/$/, "");
+    this.token = options.sessionToken ?? process.env.TINKERBOT_SESSION_TOKEN ?? "";
+    this.repository = options.repository ?? process.env.TINKERBOT_REPOSITORY ?? "";
+    this.cwd = path.resolve(options.cwd ?? process.cwd());
+  }
+
+  private valid(): string | undefined {
+    if (!/^https:\/\//.test(this.base)) return "Hosted TUI requires an HTTPS TINKERBOT_CONTROL_PLANE_URL.";
+    if (!/^[A-Za-z0-9_-]{20,200}$/.test(this.token)) return "Hosted TUI requires an authenticated TINKERBOT_SESSION_TOKEN.";
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(this.repository)) return "Hosted TUI requires TINKERBOT_REPOSITORY in owner/repository form.";
+    return undefined;
+  }
+
+  async loadSnapshot(): Promise<TuiSnapshot> {
+    const invalid = this.valid();
+    if (invalid) return { state: "permission-denied", history: [], diff: "", changedFiles: [], workItems: [], warnings: [invalid], loadedAt: new Date().toISOString() };
+    try {
+      const response = await fetch(`${this.base}/assurance/summary?repository=${encodeURIComponent(this.repository)}`, { headers: { authorization: `Bearer ${this.token}`, accept: "application/json" } });
+      const body = await response.json() as Record<string, unknown>;
+      if (!response.ok) return { state: response.status === 401 || response.status === 403 ? "permission-denied" : "error", history: [], diff: "", changedFiles: [], workItems: [], warnings: [String(body.error ?? body.code ?? `Control plane returned HTTP ${response.status}.`)], loadedAt: new Date().toISOString() };
+      const assurance = body.assurance;
+      const report = assurance && typeof assurance === "object" && !Array.isArray(assurance) && typeof (assurance as { verdict?: unknown }).verdict === "string" ? assurance as TuiReport : undefined;
+      const repository: RepositoryContext = { root: this.repository, name: this.repository, branch: "hosted", commit: "server", dirty: false, local: true };
+      const workItems = buildWorkItems(report, repository, [], false);
+      return { state: report ? "ready" : "empty", repository, report, history: [], config: { organizationId: body.organizationId, source: "control-plane" }, diff: "", changedFiles: [], workItems, warnings: report ? [] : ["No hosted assurance record is available for this repository."], loadedAt: new Date().toISOString() };
+    } catch {
+      return { state: "error", history: [], diff: "", changedFiles: [], workItems: [], warnings: ["The Tinkerbot control plane could not be reached."], loadedAt: new Date().toISOString() };
+    }
+  }
+
+  startVerification(onLog?: (line: string) => void): VerificationRunHandle {
+    const invalid = this.valid();
+    const root = detectRoot(this.cwd);
+    if (invalid || !root) return { cancel: () => undefined, promise: Promise.resolve({ status: 3, cancelled: false, stdout: "", stderr: invalid ?? "Tinkerbot must run inside a Git repository." }) };
+    let invocation: { runtime: string; prefix: string[] };
+    try { invocation = commandInvocation(root, this.options); }
+    catch (error) { return { cancel: () => undefined, promise: Promise.resolve({ status: 5, cancelled: false, stdout: "", stderr: error instanceof Error ? error.message : String(error) }) }; }
+    const args = [...invocation.prefix, ...commandArgs(this.options, ["verify", "--repository", this.repository])];
+    const child = spawn(invocation.runtime, args, { cwd: root, shell: false, env: { ...safeEnvironment(), TINKERBOT_CONTROL_PLANE_URL: this.base, TINKERBOT_SESSION_TOKEN: this.token }, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let cancelled = false;
+    onLog?.("Preparing deterministic verification and submitting source-minimized assurance evidence…");
+    child.stdout?.on("data", (chunk: Buffer | string) => { const line = redact(String(chunk)).trim(); stdout += String(chunk); if (line) onLog?.(line); });
+    child.stderr?.on("data", (chunk: Buffer | string) => { const line = redact(String(chunk)).trim(); stderr += String(chunk); if (line) onLog?.(line); });
+    return {
+      cancel: () => { if (child.exitCode === null && !child.killed) { cancelled = true; child.kill("SIGTERM"); onLog?.("Cancelling hosted verification…"); } },
+      promise: new Promise<VerificationRunResult>((resolve) => {
+        child.once("error", (error) => resolve({ status: 5, cancelled, stdout: redact(stdout), stderr: redact(`${stderr}\n${error.message}`) }));
+        child.once("close", async (status) => {
+          const result: VerificationRunResult = { status: status ?? 5, cancelled, stdout: redact(stdout), stderr: redact(stderr) };
+          if (!cancelled && (status === 0 || status === 2)) result.snapshot = await this.loadSnapshot();
+          resolve(result);
+        });
+      }),
+    };
+  }
+
+  async exportReceipt(): Promise<TuiCommandResult> { return { ok: false, status: 12, stdout: "", stderr: "Receipts are retrieved from the hosted assurance record." }; }
+  async exportEvidence(): Promise<TuiCommandResult> { return { ok: false, status: 12, stdout: "", stderr: "Evidence is controlled by the hosted assurance record." }; }
+  async exportReport(): Promise<TuiCommandResult> { return { ok: false, status: 12, stdout: "", stderr: "Reports are retrieved from the hosted assurance record." }; }
+  openGitHub(): string | undefined { return `https://github.com/${this.repository}`; }
+}
+
+export function createHostedAdapter(options: TuiAdapterOptions = {}): HostedControlPlaneAdapter {
+  return new HostedControlPlaneAdapter(options);
 }
 
 export function workItemByIndex(snapshot: TuiSnapshot | undefined, index: number): WorkItem | undefined {

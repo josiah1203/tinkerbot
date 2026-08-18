@@ -18,6 +18,8 @@ export interface Plan {
   id: PlanId;
   displayName: string;
   price: { amountCents: number | null; currency: "USD"; interval: "month" | "year" | "custom" };
+  annualPriceCents?: number;
+  billingUnit: "active_seat" | "organization" | "custom";
   privateRepositoryLimit: number | null;
   historyRetention: string;
   policyFeatures: string[];
@@ -32,6 +34,7 @@ export const PLAN_CATALOG: Readonly<Record<PlanId, Plan>> = {
     id: "free",
     displayName: "Free",
     price: { amountCents: 0, currency: "USD", interval: "month" },
+    billingUnit: "organization",
     privateRepositoryLimit: 0,
     historyRetention: "Local only",
     policyFeatures: ["Default advisory policy"],
@@ -43,11 +46,13 @@ export const PLAN_CATALOG: Readonly<Record<PlanId, Plan>> = {
   developer: {
     id: "developer",
     displayName: "Developer",
-    price: { amountCents: 1900, currency: "USD", interval: "month" },
-    privateRepositoryLimit: 3,
+    price: { amountCents: 1200, currency: "USD", interval: "month" },
+    annualPriceCents: 12000,
+    billingUnit: "active_seat",
+    privateRepositoryLimit: null,
     historyRetention: "90 days",
     policyFeatures: ["Repository policies", "Baselines and waivers"],
-    teamFeatures: ["3 members"],
+    teamFeatures: ["Unlimited repositories", "Per active accepted seat"],
     auditFeatures: ["90-day audit log"],
     supportLevel: "standard",
     selfHostedAvailable: false,
@@ -55,11 +60,13 @@ export const PLAN_CATALOG: Readonly<Record<PlanId, Plan>> = {
   team: {
     id: "team",
     displayName: "Team",
-    price: { amountCents: 14900, currency: "USD", interval: "month" },
-    privateRepositoryLimit: 15,
+    price: { amountCents: 1800, currency: "USD", interval: "month" },
+    annualPriceCents: 18000,
+    billingUnit: "active_seat",
+    privateRepositoryLimit: null,
     historyRetention: "1 year",
     policyFeatures: ["Repository policies", "Baselines and waivers", "Required evidence rules"],
-    teamFeatures: ["15 members", "Role-based access"],
+    teamFeatures: ["Unlimited repositories", "Role-based access", "Per active accepted seat"],
     auditFeatures: ["1-year audit log"],
     supportLevel: "priority",
     selfHostedAvailable: false,
@@ -67,11 +74,13 @@ export const PLAN_CATALOG: Readonly<Record<PlanId, Plan>> = {
   business: {
     id: "business",
     displayName: "Business",
-    price: { amountCents: 49900, currency: "USD", interval: "month" },
-    privateRepositoryLimit: 50,
+    price: { amountCents: 2900, currency: "USD", interval: "month" },
+    annualPriceCents: 29000,
+    billingUnit: "active_seat",
+    privateRepositoryLimit: null,
     historyRetention: "2 years",
     policyFeatures: ["Required evidence rules", "Blocking policy controls", "Policy revision history"],
-    teamFeatures: ["50 members", "Advanced repository access"],
+    teamFeatures: ["Unlimited repositories", "Advanced repository access", "Per active accepted seat"],
     auditFeatures: ["2-year audit log", "Exportable audit events"],
     supportLevel: "priority",
     selfHostedAvailable: false,
@@ -80,13 +89,14 @@ export const PLAN_CATALOG: Readonly<Record<PlanId, Plan>> = {
     id: "enterprise",
     displayName: "Enterprise",
     price: { amountCents: null, currency: "USD", interval: "custom" },
+    billingUnit: "custom",
     privateRepositoryLimit: null,
     historyRetention: "Configurable",
     policyFeatures: ["Custom policy controls", "Approval workflows"],
     teamFeatures: ["Custom member limit", "SCIM / SSO configuration"],
     auditFeatures: ["Configurable audit retention"],
     supportLevel: "enterprise",
-    selfHostedAvailable: true,
+    selfHostedAvailable: false,
   },
 };
 

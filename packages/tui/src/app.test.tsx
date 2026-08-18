@@ -95,3 +95,142 @@ test("TUI streams a run state and forwards cancellation to the local child proce
     setup.renderer.destroy();
   }
 });
+
+test("TUI completes a hosted run, refreshes server state, exports evidence, and reports GitHub", async () => {
+  const setup = await createTestRenderer({ width: 120, height: 40, screenMode: "main-screen" });
+  const calls: string[] = [];
+  const completedAdapter = adapter(snapshot());
+  completedAdapter.loadSnapshot = async () => { calls.push("load"); return snapshot(); };
+  completedAdapter.startVerification = () => ({ promise: Promise.resolve({ status: 0, cancelled: false, stdout: "verified", stderr: "", snapshot: snapshot() }), cancel: () => undefined });
+  completedAdapter.exportReceipt = async () => { calls.push("receipt"); return { ok: true, status: 0, stdout: "", stderr: "" }; };
+  completedAdapter.exportEvidence = async () => { calls.push("evidence"); return { ok: true, status: 0, stdout: "", stderr: "" }; };
+  try {
+    const keymap = createDefaultOpenTuiKeymap(setup.renderer);
+    await render(() => <KeymapProvider keymap={keymap}><TuiApp adapter={completedAdapter} onQuit={() => undefined} /></KeymapProvider>, setup.renderer);
+    await setup.waitForVisualIdle();
+    setup.mockInput.pressKey("o");
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("GitHub: https://github.com/example/payments-api/pull/1");
+    setup.mockInput.pressKey("r");
+    await setup.flush();
+    await setup.waitForVisualIdle();
+    expect(calls).toEqual(expect.arrayContaining(["receipt", "evidence"]));
+    expect(calls.filter((value) => value === "load").length).toBeGreaterThanOrEqual(2);
+    expect(setup.captureCharFrame()).toContain("Verification finished; receipt and canonical evidence contract generated.");
+  } finally {
+    setup.renderer.destroy();
+  }
+});
+
+test("TUI renders a recoverable adapter-load failure instead of retaining stale UI state", async () => {
+  const setup = await createTestRenderer({ width: 120, height: 40, screenMode: "main-screen" });
+  const failing = adapter(snapshot());
+  failing.loadSnapshot = async () => { throw new Error("control plane transport failed"); };
+  try {
+    const keymap = createDefaultOpenTuiKeymap(setup.renderer);
+    await render(() => <KeymapProvider keymap={keymap}><TuiApp adapter={failing} onQuit={() => undefined} /></KeymapProvider>, setup.renderer);
+    await setup.waitForVisualIdle();
+    expect(setup.captureCharFrame()).toContain("control plane transport failed");
+    expect(setup.captureCharFrame()).toContain("Recoverable adapter error");
+  } finally {
+    setup.renderer.destroy();
+  }
+});
+
+test("TUI renders command-mode exports, secondary views, and explicit adapter failures", async () => {
+  const setup = await createTestRenderer({ width: 120, height: 40, screenMode: "main-screen" });
+  const calls: string[] = [];
+  const commandAdapter = adapter(snapshot());
+  commandAdapter.exportReceipt = async () => { calls.push("receipt"); return { ok: false, status: 12, stdout: "", stderr: "hosted record only" }; };
+  commandAdapter.exportEvidence = async () => { calls.push("evidence"); return { ok: true, status: 0, stdout: "", stderr: "" }; };
+  commandAdapter.exportReport = async (format) => { calls.push(format); return { ok: format !== "sarif", status: format === "sarif" ? 5 : 0, stdout: "", stderr: "write blocked" }; };
+  commandAdapter.openGitHub = () => undefined;
+  commandAdapter.selectRepository = (root) => calls.push(`repo:${root}`);
+  try {
+    const keymap = createDefaultOpenTuiKeymap(setup.renderer);
+    await render(() => <KeymapProvider keymap={keymap}><TuiApp adapter={commandAdapter} onQuit={() => undefined} /></KeymapProvider>, setup.renderer);
+    await setup.waitForVisualIdle();
+
+    setup.mockInput.pressKey("p");
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("EFFECTIVE POLICY");
+
+    setup.mockInput.pressKey("x");
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("Receipt export unavailable: hosted record only");
+
+    setup.mockInput.pressKey("o");
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("No GitHub remote is configured");
+
+    setup.mockInput.pressKey("escape");
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("NEEDS ATTENTION");
+  } finally {
+    setup.renderer.destroy();
+  }
+});
+
+test("TUI renders empty, unavailable, and narrow hosted states without inventing local evidence", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 28, screenMode: "main-screen" });
+  const unavailable: TuiAdapter = {
+    ...adapter(snapshot()),
+    loadSnapshot: async () => ({ state: "permission-denied", history: [], diff: "", changedFiles: [], workItems: [], warnings: ["Hosted session expired"], loadedAt: "now" }),
+    openGitHub: () => undefined,
+  };
+  try {
+    const keymap = createDefaultOpenTuiKeymap(setup.renderer);
+    await render(() => <KeymapProvider keymap={keymap}><TuiApp adapter={unavailable} dimensions={() => ({ width: 80, height: 28 })} onQuit={() => undefined} /></KeymapProvider>, setup.renderer);
+    await setup.waitForVisualIdle();
+    expect(setup.captureCharFrame()).toContain("Hosted");
+    expect(setup.captureCharFrame()).toContain("PERMISSION DENIED");
+  } finally {
+    setup.renderer.destroy();
+  }
+
+  const emptySetup = await createTestRenderer({ width: 120, height: 40, screenMode: "main-screen" });
+  const empty: TuiAdapter = {
+    ...adapter(snapshot()),
+    loadSnapshot: async () => ({ state: "empty", repository: snapshot().repository, repositories: [], history: [], diff: "", changedFiles: [], workItems: [], warnings: ["No hosted assurance record is available"], loadedAt: "now" }),
+    openGitHub: () => undefined,
+  };
+  try {
+    const keymap = createDefaultOpenTuiKeymap(emptySetup.renderer);
+    await render(() => <KeymapProvider keymap={keymap}><TuiApp adapter={empty} onQuit={() => undefined} /></KeymapProvider>, emptySetup.renderer);
+    await emptySetup.waitForVisualIdle();
+    expect(emptySetup.captureCharFrame()).toContain("No report receipt is available.");
+    expect(emptySetup.captureCharFrame()).toContain("NO REPORT");
+  } finally {
+    emptySetup.renderer.destroy();
+  }
+});
+
+test("TUI renders every supported startup panel with its authoritative state", async () => {
+  const value: TuiSnapshot = {
+    ...snapshot(),
+    repositories: [{ path: "/tmp/payments-api", name: "payments-api", branch: "main", current: true, source: "worktree" }],
+    history: [{ recordedAt: "2026-01-01", verdict: "PASS", head: "abcdef" }],
+  };
+  const panels: Array<[Parameters<typeof TuiApp>[0]["initialView"], string]> = [
+    ["overview", "Overview"],
+    ["diff", "Diff"],
+    ["evidence", "Evidence trace"],
+    ["policy", "Policy"],
+    ["run", "Verification run"],
+    ["help", "Help"],
+    ["repositories", "Repositories"],
+    ["runs", "Runs"],
+    ["releases", "Releases"],
+  ];
+  for (const [initialView, expected] of panels) {
+    const setup = await createTestRenderer({ width: 120, height: 40, screenMode: "main-screen" });
+    try {
+      const keymap = createDefaultOpenTuiKeymap(setup.renderer);
+      await render(() => <KeymapProvider keymap={keymap}><TuiApp adapter={adapter(value)} initialView={initialView} onQuit={() => undefined} /></KeymapProvider>, setup.renderer);
+      await setup.waitForVisualIdle();
+      expect(setup.captureCharFrame()).toContain(expected);
+    } finally {
+      setup.renderer.destroy();
+    }
+  }
+});
