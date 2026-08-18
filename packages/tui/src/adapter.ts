@@ -360,14 +360,18 @@ export function createLocalAdapter(options: TuiAdapterOptions = {}): LocalCliAda
  * absent: an unavailable session is an explicit error state.
  */
 export class HostedControlPlaneAdapter implements TuiAdapter {
+  private readonly options: TuiAdapterOptions;
   private readonly base: string;
   private readonly token: string;
   private readonly repository: string;
+  private readonly cwd: string;
 
   constructor(options: TuiAdapterOptions = {}) {
+    this.options = options;
     this.base = (options.controlPlaneUrl ?? process.env.TINKERBOT_CONTROL_PLANE_URL ?? "").replace(/\/$/, "");
     this.token = options.sessionToken ?? process.env.TINKERBOT_SESSION_TOKEN ?? "";
     this.repository = options.repository ?? process.env.TINKERBOT_REPOSITORY ?? "";
+    this.cwd = path.resolve(options.cwd ?? process.cwd());
   }
 
   private valid(): string | undefined {
@@ -395,8 +399,31 @@ export class HostedControlPlaneAdapter implements TuiAdapter {
   }
 
   startVerification(onLog?: (line: string) => void): VerificationRunHandle {
-    onLog?.("Hosted verification submission is unavailable until tb verify is configured.");
-    return { cancel: () => undefined, promise: Promise.resolve({ status: 12, cancelled: false, stdout: "", stderr: "Hosted verification submission is unavailable." }) };
+    const invalid = this.valid();
+    const root = detectRoot(this.cwd);
+    if (invalid || !root) return { cancel: () => undefined, promise: Promise.resolve({ status: 3, cancelled: false, stdout: "", stderr: invalid ?? "Tinkerbot must run inside a Git repository." }) };
+    let invocation: { runtime: string; prefix: string[] };
+    try { invocation = commandInvocation(root, this.options); }
+    catch (error) { return { cancel: () => undefined, promise: Promise.resolve({ status: 5, cancelled: false, stdout: "", stderr: error instanceof Error ? error.message : String(error) }) }; }
+    const args = [...invocation.prefix, ...commandArgs(this.options, ["verify", "--repository", this.repository])];
+    const child = spawn(invocation.runtime, args, { cwd: root, shell: false, env: { ...safeEnvironment(), TINKERBOT_CONTROL_PLANE_URL: this.base, TINKERBOT_SESSION_TOKEN: this.token }, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let cancelled = false;
+    onLog?.("Preparing deterministic verification and submitting source-minimized assurance evidence…");
+    child.stdout?.on("data", (chunk: Buffer | string) => { const line = redact(String(chunk)).trim(); stdout += String(chunk); if (line) onLog?.(line); });
+    child.stderr?.on("data", (chunk: Buffer | string) => { const line = redact(String(chunk)).trim(); stderr += String(chunk); if (line) onLog?.(line); });
+    return {
+      cancel: () => { if (child.exitCode === null && !child.killed) { cancelled = true; child.kill("SIGTERM"); onLog?.("Cancelling hosted verification…"); } },
+      promise: new Promise<VerificationRunResult>((resolve) => {
+        child.once("error", (error) => resolve({ status: 5, cancelled, stdout: redact(stdout), stderr: redact(`${stderr}\n${error.message}`) }));
+        child.once("close", async (status) => {
+          const result: VerificationRunResult = { status: status ?? 5, cancelled, stdout: redact(stdout), stderr: redact(stderr) };
+          if (!cancelled && (status === 0 || status === 2)) result.snapshot = await this.loadSnapshot();
+          resolve(result);
+        });
+      }),
+    };
   }
 
   async exportReceipt(): Promise<TuiCommandResult> { return { ok: false, status: 12, stdout: "", stderr: "Receipts are retrieved from the hosted assurance record." }; }
