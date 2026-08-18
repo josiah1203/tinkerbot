@@ -1,5 +1,9 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { STATUS_GLYPHS, buildWorkItems, evidenceTrace, filterWorkItems, groupWorkItems, reportStatusLabel, severityRank, statusForVerdict, summaryMetrics, type RepositoryContext, type TuiReport } from "./model";
-import { HostedControlPlaneAdapter, workItemByIndex } from "./adapter";
+import { HostedControlPlaneAdapter, LocalCliAdapter, workItemByIndex } from "./adapter";
 
 const repository: RepositoryContext = { root: "/tmp/example", name: "payments-api", branch: "main", commit: "abcdef123456", dirty: false, local: true };
 const report: TuiReport = {
@@ -89,5 +93,64 @@ test("hosted adapter maps authenticated control-plane responses without using lo
     expect((await adapter.loadSnapshot()).warnings).toEqual(["The Tinkerbot control plane could not be reached."]);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+function git(root: string, args: string[]): string {
+  const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
+  if (result.status !== 0) throw new Error(result.stderr);
+  return result.stdout.trim();
+}
+
+test("local adapter reads a Git worktree, runs the CLI lifecycle, exports, and opens its PR", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tinkerbot-tui-adapter-"));
+  try {
+    git(root, ["init", "-q"]);
+    git(root, ["config", "user.email", "tests@example.test"]);
+    git(root, ["config", "user.name", "Tinkerbot tests"]);
+    fs.mkdirSync(path.join(root, "src"), { recursive: true });
+    fs.writeFileSync(path.join(root, "src", "service.ts"), "export const enabled = true;\n");
+    git(root, ["add", "."]);
+    git(root, ["commit", "-qm", "fixture"]);
+    git(root, ["remote", "add", "origin", "git@github.com:acme/payments-api.git"]);
+    const head = git(root, ["rev-parse", "HEAD"]);
+    fs.writeFileSync(path.join(root, "src", "service.ts"), "export const enabled = false;\n");
+    const stored = { ...report, verdict: "PASS" as const, head, changeIdentity: { pullRequestNumber: 42 }, findings: [], limitations: [] };
+    fs.mkdirSync(path.join(root, ".tinkerbot", "receipts"), { recursive: true });
+    fs.mkdirSync(path.join(root, ".pr-proof"), { recursive: true });
+    fs.writeFileSync(path.join(root, ".pr-proof", "report.json"), JSON.stringify(stored));
+    fs.writeFileSync(path.join(root, ".tinkerbot", "report.json"), JSON.stringify(stored));
+    fs.writeFileSync(path.join(root, ".tinkerbot", "evidence.json"), JSON.stringify({ evidence: { receiptId: "evidence-1" } }));
+    fs.writeFileSync(path.join(root, ".tinkerbot", "receipts", "tb-rcpt-fixture.json"), JSON.stringify({ kind: "verification-receipt", id: "receipt-1" }));
+    fs.writeFileSync(path.join(root, ".tinkerbot", "repositories.json"), JSON.stringify(["."]));
+    const cli = path.join(root, "fake-cli.cjs");
+    fs.writeFileSync(cli, `
+const fs = require("fs");
+const path = require("path");
+const args = process.argv.slice(2);
+if (args[0] === "history") process.stdout.write(JSON.stringify([{ id: "history-1" }]));
+else if (args[0] === "config") process.stdout.write(JSON.stringify({ policy: "strict" }));
+else if (args[0] === "check") { fs.mkdirSync(path.join(process.cwd(), ".pr-proof"), { recursive: true }); fs.writeFileSync(path.join(process.cwd(), ".pr-proof", "report.json"), JSON.stringify(${JSON.stringify(stored)})); process.stdout.write("checked"); }
+else process.stdout.write(JSON.stringify({ ok: true, args }));
+`);
+    const adapter = new LocalCliAdapter({ cwd: root, cliPath: cli, cliRuntime: process.execPath, base: "HEAD" });
+    const loaded = await adapter.loadSnapshot();
+    expect(loaded).toMatchObject({ state: "ready", history: [{ id: "history-1" }], config: { policy: "strict" }, repository: { githubUrl: "https://github.com/acme/payments-api" } });
+    expect(loaded.report?.evidence?.receiptId).toBe("evidence-1");
+    expect(loaded.report?.assurance?.receipts?.[0]).toMatchObject({ id: "receipt-1" });
+    expect(loaded.changedFiles).toEqual(["src/service.ts"]);
+    expect(loaded.repositories?.[0]).toMatchObject({ current: true, source: "worktree" });
+    expect(adapter.openGitHub()).toBe("https://github.com/acme/payments-api/pull/42");
+    expect((await adapter.exportReceipt()).ok).toBe(true);
+    expect((await adapter.exportEvidence()).ok).toBe(true);
+    expect((await adapter.exportReport("markdown")).ok).toBe(true);
+    expect((await adapter.exportReport("json")).stdout).toContain(".tinkerbot/exports/report.json");
+    const logs: string[] = [];
+    const run = adapter.startVerification((line) => logs.push(line));
+    const completed = await run.promise;
+    expect(completed).toMatchObject({ status: 0, cancelled: false, snapshot: { state: "ready" } });
+    expect(logs.join("\n")).toContain("Verification finished: PASS.");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
