@@ -96,6 +96,47 @@ test("TUI streams a run state and forwards cancellation to the local child proce
   }
 });
 
+test("TUI completes a hosted run, refreshes server state, exports evidence, and reports GitHub", async () => {
+  const setup = await createTestRenderer({ width: 120, height: 40, screenMode: "main-screen" });
+  const calls: string[] = [];
+  const completedAdapter = adapter(snapshot());
+  completedAdapter.loadSnapshot = async () => { calls.push("load"); return snapshot(); };
+  completedAdapter.startVerification = () => ({ promise: Promise.resolve({ status: 0, cancelled: false, stdout: "verified", stderr: "", snapshot: snapshot() }), cancel: () => undefined });
+  completedAdapter.exportReceipt = async () => { calls.push("receipt"); return { ok: true, status: 0, stdout: "", stderr: "" }; };
+  completedAdapter.exportEvidence = async () => { calls.push("evidence"); return { ok: true, status: 0, stdout: "", stderr: "" }; };
+  try {
+    const keymap = createDefaultOpenTuiKeymap(setup.renderer);
+    await render(() => <KeymapProvider keymap={keymap}><TuiApp adapter={completedAdapter} onQuit={() => undefined} /></KeymapProvider>, setup.renderer);
+    await setup.waitForVisualIdle();
+    setup.mockInput.pressKey("o");
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("GitHub: https://github.com/example/payments-api/pull/1");
+    setup.mockInput.pressKey("r");
+    await setup.flush();
+    await setup.waitForVisualIdle();
+    expect(calls).toEqual(expect.arrayContaining(["receipt", "evidence"]));
+    expect(calls.filter((value) => value === "load").length).toBeGreaterThanOrEqual(2);
+    expect(setup.captureCharFrame()).toContain("Verification finished; receipt and canonical evidence contract generated.");
+  } finally {
+    setup.renderer.destroy();
+  }
+});
+
+test("TUI renders a recoverable adapter-load failure instead of retaining stale UI state", async () => {
+  const setup = await createTestRenderer({ width: 120, height: 40, screenMode: "main-screen" });
+  const failing = adapter(snapshot());
+  failing.loadSnapshot = async () => { throw new Error("control plane transport failed"); };
+  try {
+    const keymap = createDefaultOpenTuiKeymap(setup.renderer);
+    await render(() => <KeymapProvider keymap={keymap}><TuiApp adapter={failing} onQuit={() => undefined} /></KeymapProvider>, setup.renderer);
+    await setup.waitForVisualIdle();
+    expect(setup.captureCharFrame()).toContain("control plane transport failed");
+    expect(setup.captureCharFrame()).toContain("Recoverable adapter error");
+  } finally {
+    setup.renderer.destroy();
+  }
+});
+
 test("TUI renders command-mode exports, secondary views, and explicit adapter failures", async () => {
   const setup = await createTestRenderer({ width: 120, height: 40, screenMode: "main-screen" });
   const calls: string[] = [];
