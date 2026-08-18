@@ -95,3 +95,37 @@ test("TUI streams a run state and forwards cancellation to the local child proce
     setup.renderer.destroy();
   }
 });
+
+test("TUI renders command-mode exports, secondary views, and explicit adapter failures", async () => {
+  const setup = await createTestRenderer({ width: 120, height: 40, screenMode: "main-screen" });
+  const calls: string[] = [];
+  const commandAdapter = adapter(snapshot());
+  commandAdapter.exportReceipt = async () => { calls.push("receipt"); return { ok: false, status: 12, stdout: "", stderr: "hosted record only" }; };
+  commandAdapter.exportEvidence = async () => { calls.push("evidence"); return { ok: true, status: 0, stdout: "", stderr: "" }; };
+  commandAdapter.exportReport = async (format) => { calls.push(format); return { ok: format !== "sarif", status: format === "sarif" ? 5 : 0, stdout: "", stderr: "write blocked" }; };
+  commandAdapter.openGitHub = () => undefined;
+  commandAdapter.selectRepository = (root) => calls.push(`repo:${root}`);
+  try {
+    const keymap = createDefaultOpenTuiKeymap(setup.renderer);
+    await render(() => <KeymapProvider keymap={keymap}><TuiApp adapter={commandAdapter} onQuit={() => undefined} /></KeymapProvider>, setup.renderer);
+    await setup.waitForVisualIdle();
+
+    setup.mockInput.pressKey("p");
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("EFFECTIVE POLICY");
+
+    setup.mockInput.pressKey("x");
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("Receipt export unavailable: hosted record only");
+
+    setup.mockInput.pressKey("o");
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("No GitHub remote is configured");
+
+    setup.mockInput.pressKey("escape");
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("NEEDS ATTENTION");
+  } finally {
+    setup.renderer.destroy();
+  }
+});
