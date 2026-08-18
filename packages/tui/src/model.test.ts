@@ -76,6 +76,24 @@ test("model helpers cover every verdict, status, filtering, and empty-report sta
   expect(evidenceTrace(undefined, undefined)).toContain("    No report receipt is available.");
 });
 
+test("model renders stale, unknown, verified, and timestamped work items deterministically", () => {
+  const now = Date.now();
+  const dated = (ageMs: number) => new Date(now - ageMs).toISOString();
+  const unknownFinding = { ...report.findings[0]!, resolution: "unknown", severity: "low", title: undefined };
+  const unknownItems = buildWorkItems({ ...report, findings: [unknownFinding], generatedAt: dated(90 * 60_000), limitations: ["one", "one"], impact: { changedSymbols: [], paths: [], unknowns: ["two"] } }, undefined, []);
+  expect(unknownItems).toEqual(expect.arrayContaining([
+    expect.objectContaining({ status: "unknown", title: "A test was weakened", timestamp: "1h ago" }),
+    expect.objectContaining({ id: "unknown:0:one", timestamp: "1h ago" }),
+  ]));
+
+  const fallback = buildWorkItems({ ...report, verdict: "PASS", findings: [], limitations: [], impact: { changedSymbols: [], paths: [], unknowns: [] }, generatedAt: "not-a-date" }, undefined, []);
+  expect(fallback).toEqual([expect.objectContaining({ id: "verified:report", status: "pass", timestamp: "not-a-date" })]);
+  const stale = buildWorkItems({ ...report, findings: [], limitations: [], impact: { changedSymbols: [{ name: "old", file: "src/old.ts", line: 1 }], paths: [], unknowns: [] }, generatedAt: dated(2 * 86_400_000) }, repository, [], true);
+  expect(stale).toEqual([expect.objectContaining({ id: "verified:src/old.ts", status: "stale", timestamp: "2d ago" })]);
+  const minute = buildWorkItems({ ...report, generatedAt: dated(2 * 60_000) }, repository, []);
+  expect(minute[0]?.timestamp).toBe("2m ago");
+});
+
 test("hosted adapter maps authenticated control-plane responses without using local state", async () => {
   const originalFetch = globalThis.fetch;
   const token = "abcdefghijklmnopqrstuvwxyz123456";
