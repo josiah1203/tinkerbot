@@ -99,7 +99,9 @@ function sessionStore(env: Env, config: Awaited<ReturnType<typeof hostedProvider
 }
 
 async function currentSession(request: Request, store: D1AuthSessionStore): Promise<{ id: string; session: HostedSession } | null> {
-  const id = cookieValue(request, "tinkerbot_session");
+  const authorization = request.headers.get("authorization");
+  const bearer = authorization?.match(/^Bearer ([A-Za-z0-9_-]{20,200})$/)?.[1];
+  const id = bearer ?? cookieValue(request, "tinkerbot_session");
   if (!id) return null;
   const session = await store.get(id);
   return session ? { id, session } : null;

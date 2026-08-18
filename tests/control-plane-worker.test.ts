@@ -182,6 +182,9 @@ test("Cloudflare Worker completes WorkOS session persistence and server-side Str
     const session = await worker.fetch(new Request("https://control.example/auth/session", { headers: { cookie: `tinkerbot_session=${encodeURIComponent(sessionId)}` } }), env);
     expect(session.status).toBe(200);
     expect(await session.json()).toMatchObject({ authenticated: true, organizationId: "org_1", user: { id: "user_1" } });
+    const bearerSession = await worker.fetch(new Request("https://control.example/auth/session", { headers: { authorization: `Bearer ${sessionId}` } }), env);
+    expect(bearerSession.status).toBe(200);
+    expect(await bearerSession.json()).toMatchObject({ authenticated: true, organizationId: "org_1", user: { id: "user_1" } });
     const access = await worker.fetch(new Request("https://control.example/tenant/access", { headers: { cookie: `tinkerbot_session=${encodeURIComponent(sessionId)}` } }), env);
     expect(access.status).toBe(200);
     expect(await access.json()).toMatchObject({ authorized: true, organizationId: "org_1", role: "owner" });
