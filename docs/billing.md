@@ -11,6 +11,8 @@ Billing is a first-class page at `/app/settings/billing`. The UI is built around
 
 Private-repository limits are not used as a billing metric for these paid plans. Stripe Price IDs, feature flags, retention, and entitlements remain server-owned configuration; no browser or Action input can select a price ID.
 
+The checked-in [`stripe-plans.production.json.example`](../config/stripe-plans.production.json.example) is the deployable catalog shape. Before deployment, replace each `price_REPLACE_*` value with the matching live Stripe Price ID and confirm its repository and seat limits with the commercial policy; do not deploy the example unchanged.
+
 ## Provider state
 
 The default browser preview remains read-only when no hosted API base is configured. When configured, the billing page reads the server-authorized summary and can start Checkout, open the customer portal, schedule cancellation, or reactivate a pending cancellation. The Worker owns Stripe Price IDs, prevents duplicate nonterminal subscriptions, namespaces idempotency keys, verifies signed webhooks, and persists customer/subscription reverse mappings in D1. It does not collect card details or trust a browser-supplied price ID.
