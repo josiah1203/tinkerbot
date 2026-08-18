@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { STATUS_GLYPHS, buildWorkItems, evidenceTrace, filterWorkItems, groupWorkItems, reportStatusLabel, severityRank, statusForVerdict, summaryMetrics, type RepositoryContext, type TuiReport } from "./model";
-import { HostedControlPlaneAdapter, LocalCliAdapter, workItemByIndex } from "./adapter";
+import { HostedControlPlaneAdapter, LocalCliAdapter, createHostedAdapter, createLocalAdapter, workItemByIndex } from "./adapter";
 
 const repository: RepositoryContext = { root: "/tmp/example", name: "payments-api", branch: "main", commit: "abcdef123456", dirty: false, local: true };
 const report: TuiReport = {
@@ -112,6 +112,45 @@ test("hosted adapter maps authenticated control-plane responses without using lo
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("hosted verification fails closed before spawn and refreshes the server state after submission", async () => {
+  const token = "abcdefghijklmnopqrstuvwxyz123456";
+  const invalid = new HostedControlPlaneAdapter({ controlPlaneUrl: "https://control.example", sessionToken: "bad", repository: "acme/service" });
+  expect(await invalid.startVerification().promise).toMatchObject({ status: 3, stderr: expect.stringContaining("TINKERBOT_SESSION_TOKEN") });
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tinkerbot-hosted-run-"));
+  const originalFetch = globalThis.fetch;
+  try {
+    git(root, ["init", "-q"]);
+    git(root, ["config", "user.email", "tests@example.test"]);
+    git(root, ["config", "user.name", "Tinkerbot tests"]);
+    fs.writeFileSync(path.join(root, "README.md"), "fixture\n");
+    git(root, ["add", "."]);
+    git(root, ["commit", "-qm", "fixture"]);
+    const cli = path.join(root, "verify-cli.cjs");
+    fs.writeFileSync(cli, "process.stdout.write('submitted\\n');");
+    globalThis.fetch = async () => new Response(JSON.stringify({ organizationId: "org_1" }), { status: 200, headers: { "content-type": "application/json" } });
+    const adapter = new HostedControlPlaneAdapter({ cwd: root, cliPath: cli, cliRuntime: process.execPath, controlPlaneUrl: "https://control.example", sessionToken: token, repository: "acme/service" });
+    const logs: string[] = [];
+    const result = await adapter.startVerification((line) => logs.push(line)).promise;
+    expect(result).toMatchObject({ status: 0, cancelled: false, stdout: "submitted\n", snapshot: { state: "empty" } });
+    expect(logs.join("\n")).toContain("Preparing deterministic verification");
+    expect(logs).toContain("submitted");
+  } finally {
+    globalThis.fetch = originalFetch;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapter factories preserve explicit hosted boundaries and local repository selection", async () => {
+  const hosted = createHostedAdapter({ controlPlaneUrl: "https://control.example", sessionToken: "abcdefghijklmnopqrstuvwxyz123456", repository: "acme/service" });
+  expect(await hosted.exportReceipt()).toMatchObject({ ok: false, status: 12 });
+  expect(await hosted.exportEvidence()).toMatchObject({ ok: false, status: 12 });
+  expect(await hosted.exportReport("sarif")).toMatchObject({ ok: false, status: 12 });
+  const local = createLocalAdapter({ cwd: process.cwd() });
+  local.selectRepository(process.cwd());
+  expect(local).toBeInstanceOf(LocalCliAdapter);
 });
 
 function git(root: string, args: string[]): string {
