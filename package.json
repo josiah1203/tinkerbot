@@ -48,6 +48,7 @@
     "test:watch": "vitest",
     "validate:providers": "node scripts/validate-live-providers.mjs",
     "prepare": "npm run build",
+    "prepack": "node scripts/prepare-package.mjs",
     "tb": "node dist/packages/cli/src/index.js",
     "tui:build": "bun --cwd packages/tui scripts/build.ts",
     "tui:compile": "bun --cwd packages/tui scripts/compile.ts",
