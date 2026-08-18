@@ -902,6 +902,14 @@ async function hostedRequest(pathname: string, method = "GET"): Promise<HostedRe
 
 async function runHostedCli(argv: string[]): Promise<number | undefined> {
   const command = argv[0];
+  if (!command) {
+    const response = await hostedRequest("/auth/session");
+    if (response.status < 200 || response.status >= 300) {
+      process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
+      return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
+    }
+    return undefined;
+  }
   if (command !== "whoami" && command !== "logout") return undefined;
   const response = await hostedRequest(command === "whoami" ? "/auth/session" : "/auth/signout", command === "whoami" ? "GET" : "POST");
   if (response.status < 200 || response.status >= 300) {

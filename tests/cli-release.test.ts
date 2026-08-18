@@ -29,6 +29,12 @@ test("hosted identity commands fail closed without an authenticated control-plan
   expect(result.stderr).toContain("TINKERBOT_CONTROL_PLANE_URL");
 });
 
+test("the executable does not open the TUI before hosted authentication is configured", () => {
+  const result = spawnSync(process.execPath, [cli], { encoding: "utf8", env: { ...process.env, TINKERBOT_CONTROL_PLANE_URL: "", TINKERBOT_SESSION_TOKEN: "" } });
+  expect(result.status).toBe(3);
+  expect(result.stderr).toContain("TINKERBOT_CONTROL_PLANE_URL");
+});
+
 test("uses stable configuration error exit code", () => {
   const result = spawnSync(process.execPath, [cli, "check", "--unknown-option"], { encoding: "utf8" });
   expect(result.status).toBe(3);
