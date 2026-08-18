@@ -17,7 +17,7 @@
 
 Java, Ruby, hosted source processing, coding-agent logs, reflection-complete runtime analysis, arbitrary module alias resolution, and full-repository mutation testing remain outside the release. Dynamic imports, generated code, aliases without recognized metadata, Rust/C/C++ macros or conditional compilation, and missing artifacts are surfaced as partial or unknown evidence.
 
-The GitHub Action uses Node 20 and the example workflow uses Node 22 for repository tooling. `tb tui` uses Bun and the pinned OpenTUI packages; `tb` remains accountless and usable without Bun for verification commands.
+The GitHub Action uses Node 20 and the example workflow uses Node 22 for repository tooling. `tb` uses the pinned OpenTUI packages and requires a hosted authenticated session for release use.
 
 ## Upgrades
 

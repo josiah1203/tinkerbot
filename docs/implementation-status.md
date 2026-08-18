@@ -1,6 +1,6 @@
 # Implementation status
 
-> Current product direction: Tinkerbot is the local-first `tb`/`tinkerbot` CLI plus an isolated Bun/OpenTUI cockpit and a thin `Tinkerbot Verify` GitHub assurance layer. This direction supersedes older browser/control-plane prose in the repository. The local TUI is not a web dashboard, chat client, GitHub replacement, or hosted execution plane. Synara code, branding, layouts, settings, business logic, and data models are outside this implementation boundary and were not used.
+> Current product direction: Tinkerbot is a proprietary hosted SaaS whose primary interfaces are the authenticated `tb`/`tinkerbot` OpenTUI client and GitHub App/Action. The web surface is limited to authentication, organization, billing, GitHub connection, and support handoffs.
 
 ## Status
 
@@ -20,7 +20,7 @@ The MVP and language-expansion vertical slices are implemented in the standalone
 | 7 | API Contract Guard and Fixture/Snapshot Integrity | complete |
 | 8 | Extension contracts and deferred tool documentation | complete |
 | 9 | Language registry, Python/Go/Rust/C/C++ graph adapters, native test conventions, coverage adapters, cross-language fixtures, bounded toolchain validation, and workspace-aware import resolution | complete |
-| 10–13 | Historical hosted/provider experiments | intentionally outside the current local-first product boundary; not required by `tb`/TUI/GitHub assurance |
+| 10–13 | Hosted provider integration | in progress; live provider configuration and full lifecycle implementation remain release gates |
 
 | Release hardening | Package metadata, report schema, CLI diagnostics, usage, fixtures, runbook, compatibility, SBOM | complete |
 | Deep stability | Safe subprocesses, root containment, malformed artifact/history handling, deterministic output, control-plane preview, edge-case fixtures | complete |

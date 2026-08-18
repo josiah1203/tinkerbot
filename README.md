@@ -29,9 +29,9 @@ Install signed Tinkerbot client releases from the authenticated download channel
 
 Use `pr-proof.yml` to configure the runner, coverage artifact, mutation limits, output, baselines, fixtures, selection, and policy. Safe defaults are advisory. Blocking is opt-in with `test_integrity.mode: blocking`, a stricter policy pack, or `baseline.fail_on_new: true`.
 
-The local cockpit is `tb tui`: a two-pane grouped Work view with repository/worktree context, local diff, evidence trace, run/cancel/rerun, policy inspection, history, filtering, command mode, and source-minimized exports. The additive change-assurance CLI surfaces remain local-first and source-minimized: `tb proof create|verify|replay`, `tb repo inspect|map`, `tb change contract validate|assess`, `tb change-set assess`, `tb release assess`, `tb outcome record|export`, and `tb evidence --format review-context|change-assurance`. Receipts, graph snapshots, behavioral coverage, lifecycle events, contracts, release manifests, and outcomes are explicit evidence objects; absent or stale evidence remains UNKNOWN. See [`docs/change-assurance.md`](./docs/change-assurance.md), [`docs/tui-architecture.md`](./docs/tui-architecture.md), and [`docs/evidence-schema.json`](./docs/evidence-schema.json).
+The hosted cockpit is `tb`: a compact OpenTUI view of organization, repository, policy, and structured evidence state. It requires an authenticated control-plane session and never silently treats local reports as hosted authority. Receipts, graph snapshots, behavioral coverage, lifecycle events, contracts, release manifests, and outcomes are explicit evidence objects; absent or stale evidence remains UNKNOWN. See [`docs/tui-architecture.md`](./docs/tui-architecture.md) and [`docs/evidence-schema.json`](./docs/evidence-schema.json).
 
-Tinkerbot configuration may also live at `.tinkerbot/config.yml` (preferred), `.tinkerbot/tinkerbot.yml`, or `.pr-proof/config.yml`; legacy root `pr-proof.yml` remains supported. No hosted account or cloud provider is required for local use.
+Tinkerbot configuration belongs at `.tinkerbot/config.yml`. Legacy `pr-proof` configuration is migration-only compatibility and cannot bypass hosted authentication or policy enforcement.
 
 ## Tinkerbot Verify GitHub Action
 

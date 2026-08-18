@@ -4,7 +4,7 @@ The control plane uses a provider-neutral authentication adapter. The adapter bo
 
 ## Current status
 
-The browser preview still ships with a development adapter that stores a non-sensitive local session marker in `localStorage`; it is clearly labelled as development-only and is not a production authorization boundary. The Cloudflare Worker now has a separate WorkOS AuthKit path: OAuth state validation, server-side code exchange, encrypted D1 session persistence, secure HTTP-only cookies, session lookup/refresh, sign-out, D1 membership authorization, signed WorkOS membership-event synchronization, bounded current-user reconciliation, and opt-in cursor-based Events API replay are implemented behind `/auth/workos/*`, `/auth/session`, `/tenant/access`, `/tenant/membership/sync`, `/auth/signout`, `/integrations/workos/webhook`, and the scheduled handler.
+The legacy browser preview development adapter is not a production authorization boundary. The Cloudflare Worker has a WorkOS AuthKit path: OAuth state validation, server-side code exchange, encrypted D1 session persistence, secure HTTP-only cookies, session lookup/refresh, sign-out, D1 membership authorization, signed WorkOS membership-event synchronization, bounded current-user reconciliation, and opt-in cursor-based Events API replay are implemented behind `/auth/workos/*`, `/auth/session`, `/tenant/access`, `/tenant/membership/sync`, `/auth/signout`, `/integrations/workos/webhook`, and the scheduled handler.
 
 Production configuration still required:
 
@@ -22,4 +22,4 @@ The browser never supplies a trusted plan, role, organization, or entitlement. T
 
 ## Assurance authorization
 
-Local `tb` commands and `tb serve` remain accountless. Hosted assurance reads and ingestion require a valid WorkOS-backed session, an active organization membership, repository authorization, and the server-side entitlement for hosted assurance metadata. Mutation routes also enforce origin checks and role requirements; the browser cannot grant itself access. Assurance records are keyed by organization and repository on the server, and missing session, membership, D1 storage, or provider configuration produces an explicit denial or unavailable response.
+Release `tb` commands require a valid hosted session. Hosted assurance reads and ingestion require an active organization membership, repository authorization, and the server-side entitlement for hosted assurance metadata. Mutation routes also enforce origin checks and role requirements; the browser cannot grant itself access. Assurance records are keyed by organization and repository on the server, and missing session, membership, D1 storage, or provider configuration produces an explicit denial or unavailable response.
