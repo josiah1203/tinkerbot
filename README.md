@@ -1,6 +1,6 @@
 # Tinkerbot
 
-Tinkerbot (formerly PR Proof) is a local-first developer cockpit for proving that a change is safe and that its tests meaningfully protect the behavior. The short CLI is `tb`; `tinkerbot` and the legacy `pr-proof` entrypoint remain compatible aliases. Static graph support covers TypeScript, JavaScript, Python, Go, Rust, C, and C++.
+Tinkerbot is a proprietary hosted verification service. Its primary client is the authenticated `tb` terminal UI and CLI; `tinkerbot` is an identical alias. The legacy `pr-proof` entrypoint is retained only as a deprecated compatibility alias.
 
 It combines deliberately bounded verification modules:
 
@@ -10,28 +10,22 @@ It combines deliberately bounded verification modules:
 - **CI evidence and provenance** normalize common coverage/test/mutation/SARIF artifacts and label test-to-change relationships by evidence strength.
 - **Adjacent guards** provide API contract comparison, fixture/snapshot integrity, local verification history, and fail-closed test-selection recommendations.
 
-The tool runs in the customer’s repository, does not upload source code or full diffs by default, and does not require an account, hosted access, or an LLM.
+The client may inspect a checked-out repository to prepare bounded structured evidence. It does not upload source code or full diffs by default. Hosted authorization, organization membership, entitlements, policy, and accepted evidence are server-authoritative.
 
-It is an advisory, MIT-licensed CLI/TUI/Action. The TUI is a thin OpenTUI client over the canonical local engine; GitHub is an additive assurance surface, not a replacement review client. `tb serve` remains only as the existing compatibility/local-report surface; this direction does not introduce a full web dashboard or self-hosted web control plane.
+Tinkerbot is not an open-source, self-hosted, BYOK, or accountless product. GitHub is the primary pull-request surface through the Tinkerbot GitHub App and Action; the browser is limited to authentication, organization, billing, GitHub connection, legal, and support handoffs.
 
 ## Quick start
 
 ```sh
-pnpm install
-pnpm build
-pnpm tui:build
-pnpm tui:compile       # optional host executable; set TINKERBOT_TUI_TARGET for a cross-target
-tb --version                 # `pr-proof` and `tinkerbot` remain supported aliases
-tb tui                      # accountless local OpenTUI cockpit
-tb doctor
-tb check --base origin/main --head HEAD
-tb usage --format json
-tb policy list
-tb select-tests --base origin/main --head HEAD
-tb serve --port 4173
+tb login
+tb whoami
+tb                         # authenticated OpenTUI
+tb verify
+tb evidence
+tb github run
 ```
 
-From npm/pnpm, install the published package as a development dependency with `pnpm add -D pr-proof`. From this source checkout, use the local `pnpm build` first. A five-minute setup is documented in [`docs/quickstart.md`](./docs/quickstart.md).
+Install signed Tinkerbot client releases from the authenticated download channel. This source checkout is for authorized development; run `pnpm build` and `pnpm tui:build` before local verification.
 
 Use `pr-proof.yml` to configure the runner, coverage artifact, mutation limits, output, baselines, fixtures, selection, and policy. Safe defaults are advisory. Blocking is opt-in with `test_integrity.mode: blocking`, a stricter policy pack, or `baseline.fail_on_new: true`.
 

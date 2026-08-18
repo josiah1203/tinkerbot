@@ -2,7 +2,7 @@
   "name": "@tinkerbot/cli",
   "version": "0.1.0",
   "description": "Authenticated Tinkerbot terminal client and GitHub verification adapter.",
-  "private": false,
+  "private": true,
   "type": "commonjs",
   "main": "dist/packages/cli/src/index.js",
   "types": "dist/packages/cli/src/index.d.ts",
@@ -19,9 +19,6 @@
       "types": "./dist/packages/assurance/src/index.d.ts",
       "require": "./dist/packages/assurance/src/index.js"
     }
-  },
-  "publishConfig": {
-    "access": "public"
   },
   "packageManager": "pnpm@9.15.9",
   "bin": {
