@@ -163,3 +163,33 @@ test("TUI renders empty, unavailable, and narrow hosted states without inventing
     emptySetup.renderer.destroy();
   }
 });
+
+test("TUI renders every supported startup panel with its authoritative state", async () => {
+  const value: TuiSnapshot = {
+    ...snapshot(),
+    repositories: [{ path: "/tmp/payments-api", name: "payments-api", branch: "main", current: true, source: "worktree" }],
+    history: [{ recordedAt: "2026-01-01", verdict: "PASS", head: "abcdef" }],
+  };
+  const panels: Array<[Parameters<typeof TuiApp>[0]["initialView"], string]> = [
+    ["overview", "Overview"],
+    ["diff", "Diff"],
+    ["evidence", "Evidence trace"],
+    ["policy", "Policy"],
+    ["run", "Verification run"],
+    ["help", "Help"],
+    ["repositories", "Repositories"],
+    ["runs", "Runs"],
+    ["releases", "Releases"],
+  ];
+  for (const [initialView, expected] of panels) {
+    const setup = await createTestRenderer({ width: 120, height: 40, screenMode: "main-screen" });
+    try {
+      const keymap = createDefaultOpenTuiKeymap(setup.renderer);
+      await render(() => <KeymapProvider keymap={keymap}><TuiApp adapter={adapter(value)} initialView={initialView} onQuit={() => undefined} /></KeymapProvider>, setup.renderer);
+      await setup.waitForVisualIdle();
+      expect(setup.captureCharFrame()).toContain(expected);
+    } finally {
+      setup.renderer.destroy();
+    }
+  }
+});

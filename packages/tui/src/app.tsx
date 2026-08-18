@@ -5,13 +5,15 @@ import type { TuiAdapter, VerificationRunHandle } from "./adapter";
 import { filterWorkItems, evidenceTrace, groupWorkItems, reportStatusLabel, summaryMetrics, type TuiSnapshot, type WorkItem } from "./model";
 import { colorForStatus, theme } from "./theme";
 
+export type DetailView = "overview" | "diff" | "evidence" | "policy" | "run" | "help" | "repositories" | "runs" | "releases";
+
 export interface TuiAppProps {
   adapter: TuiAdapter;
   dimensions?: () => { width: number; height: number };
+  /** Optional initial panel for embedders and deterministic startup flows. */
+  initialView?: DetailView;
   onQuit: () => void;
 }
-
-type DetailView = "overview" | "diff" | "evidence" | "policy" | "run" | "help" | "repositories" | "runs" | "releases";
 
 function safeText(value: unknown, fallback = "—"): string {
   if (value === undefined || value === null || value === "") return fallback;
@@ -69,7 +71,7 @@ export function TuiApp(props: TuiAppProps) {
   const [filter, setFilter] = createSignal("");
   const [commandText, setCommandText] = createSignal("");
   const [selected, setSelected] = createSignal(0);
-  const [view, setView] = createSignal<DetailView>("overview");
+  const [view, setView] = createSignal<DetailView>(props.initialView ?? "overview");
   const [diffMode, setDiffMode] = createSignal<"unified" | "split">("unified");
   const [status, setStatus] = createSignal("Connecting to the Tinkerbot control plane…");
   const [logs, setLogs] = createSignal<string[]>([]);
