@@ -114,6 +114,7 @@ interface ActionRunResult {
   receiptFile: string;
   reviewContextFile: string;
   evidenceContractFile: string;
+  assuranceBundleFile: string;
   stdout: string;
 }
 
@@ -132,6 +133,7 @@ function runCli(): ActionRunResult {
   const receiptFile = path.join(reportDirectory, "receipt.json");
   const reviewContextFile = path.join(reportDirectory, "review-context.json");
   const evidenceContractFile = path.join(reportDirectory, "evidence-contract.json");
+  const assuranceBundleFile = path.join(reportDirectory, "assurance-bundle.json");
   const cli = path.join(actionRoot, "packages", "cli", "src", "index.js");
   if (!fs.existsSync(cli)) throw new Error("Built CLI artifact is missing at dist/packages/cli/src/index.js; run pnpm build before using the Action.");
   const base = input("base", eventPullRequestValue("base") || "origin/main");
@@ -160,6 +162,15 @@ function runCli(): ActionRunResult {
     if (!fs.existsSync(evidenceContractFile)) process.stdout.write(`::notice::Tinkerbot Verify evidence contract export was unavailable (status ${String(evidence.status)}); the deterministic report remains available.\n`);
     const reviewContext = spawnSync(process.execPath, [cli, "evidence", "--input", reportFile, "--format", "review-context", "--output", reviewContextFile], { cwd: workspace, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
     if (!fs.existsSync(reviewContextFile)) process.stdout.write(`::notice::Tinkerbot Verify review-context export was unavailable (status ${String(reviewContext.status)}); the deterministic report remains available.\n`);
+    const assuranceEnvelopeFile = path.join(reportDirectory, "assurance-envelope.json");
+    const assurance = spawnSync(process.execPath, [cli, "evidence", "--input", reportFile, "--format", "change-assurance", "--output", assuranceEnvelopeFile], { cwd: workspace, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+    if (fs.existsSync(assuranceEnvelopeFile)) {
+      try {
+        const envelope = JSON.parse(fs.readFileSync(assuranceEnvelopeFile, "utf8")) as { assurance?: unknown };
+        if (envelope.assurance && typeof envelope.assurance === "object" && !Array.isArray(envelope.assurance)) writePrivate(assuranceBundleFile, `${JSON.stringify(envelope.assurance, null, 2)}\n`);
+      } catch { /* The deterministic report remains usable without hosted submission. */ }
+    }
+    if (!fs.existsSync(assuranceBundleFile)) process.stdout.write(`::notice::Tinkerbot Verify assurance bundle export was unavailable (status ${String(assurance.status)}); hosted submission was skipped.\n`);
     if (input("sarif", "true") === "true") {
       const sarif = spawnSync(process.execPath, [cli, "report", "--input", reportFile, "--format", "sarif"], { cwd: workspace, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
       writePrivate(sarifFile, sarif.stdout || "{}");
@@ -167,7 +178,24 @@ function runCli(): ActionRunResult {
     const contract = fs.existsSync(evidenceContractFile) ? JSON.parse(fs.readFileSync(evidenceContractFile, "utf8")) as ActionReport["evidence"] : undefined;
     fs.writeFileSync(markdownFile, renderActionMarkdown({ ...report, evidence: contract }));
   }
-  return { status: result.status ?? 2, reportFile, markdownFile, sarifFile, receiptFile, reviewContextFile, evidenceContractFile, stdout: redact(result.stdout ?? result.stderr ?? "") };
+  return { status: result.status ?? 2, reportFile, markdownFile, sarifFile, receiptFile, reviewContextFile, evidenceContractFile, assuranceBundleFile, stdout: redact(result.stdout ?? result.stderr ?? "") };
+}
+
+async function submitHostedEvidence(result: ActionRunResult): Promise<void> {
+  const base = input("control-plane-url").replace(/\/$/, "");
+  const credential = input("session-token");
+  if (!base && !credential) return;
+  if (!/^https:\/\//.test(base) || !/^[A-Za-z0-9_-]{20,200}$/.test(credential)) {
+    process.stdout.write("::notice::Tinkerbot hosted evidence submission was skipped because control-plane-url or session-token is invalid.\n");
+    return;
+  }
+  if (!fs.existsSync(result.assuranceBundleFile) || !process.env.GITHUB_REPOSITORY) {
+    process.stdout.write("::notice::Tinkerbot hosted evidence submission was skipped because the assurance bundle or repository identity is unavailable.\n");
+    return;
+  }
+  const assurance = JSON.parse(fs.readFileSync(result.assuranceBundleFile, "utf8")) as unknown;
+  const response = await fetch(`${base}/assurance/ingest`, { method: "POST", headers: { authorization: `Bearer ${credential}`, accept: "application/json", "content-type": "application/json" }, body: JSON.stringify({ repository: process.env.GITHUB_REPOSITORY, assurance }) });
+  if (!response.ok) process.stdout.write(`::notice::Tinkerbot hosted evidence submission was rejected (HTTP ${response.status}).\n`);
 }
 
 function renderActionMarkdown(report: ActionReport): string {
@@ -249,7 +277,9 @@ async function main(): Promise<void> {
     return;
   }
   if (result.stdout) process.stdout.write(result.stdout);
-  if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, "report=.pr-proof/report.json\nsarif=.pr-proof/report.sarif\nusage=.pr-proof/usage.json\nreceipt=.pr-proof/receipt.json\nreview-context=.pr-proof/review-context.json\nevidence-contract=.pr-proof/evidence-contract.json\n");
+  if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, "report=.pr-proof/report.json\nsarif=.pr-proof/report.sarif\nusage=.pr-proof/usage.json\nreceipt=.pr-proof/receipt.json\nreview-context=.pr-proof/review-context.json\nevidence-contract=.pr-proof/evidence-contract.json\nassurance-bundle=.pr-proof/assurance-bundle.json\n");
+  try { await submitHostedEvidence(result); }
+  catch (error) { process.stdout.write(`::notice::Tinkerbot hosted evidence submission was unavailable. ${escapeWorkflowCommand(oneLine(error instanceof Error ? error.message : String(error)))}\n`); }
   try {
     await publish(result.reportFile, result.markdownFile, result.evidenceContractFile);
   } catch (error) {

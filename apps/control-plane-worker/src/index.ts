@@ -22,6 +22,7 @@ import {
   normalizeWorkOSInvitation,
   providerStatuses,
 } from "../../../packages/hosted-integrations/src";
+import { admitWebhook } from "../../../packages/github/src";
 
 interface Env extends Record<string, unknown> {
   ENVIRONMENT?: string;
@@ -34,6 +35,7 @@ interface Env extends Record<string, unknown> {
   STRIPE_SECRET_KEY?: string;
   STRIPE_WEBHOOK_SECRET?: string;
   STRIPE_PLANS_JSON?: string;
+  GITHUB_WEBHOOK_SECRET?: string;
   SESSION_ENCRYPTION_KEY?: string;
   WORKOS_REDIRECT_URI?: string;
   CONTROL_PLANE_URL?: string;
@@ -260,6 +262,39 @@ function validateHostedAssuranceBundle(value: unknown): { ok: true; value: Recor
 
 function assuranceMetadataKey(organizationId: string, repository: string): string {
   return `assurance:${encodeURIComponent(organizationId)}:${encodeURIComponent(repository)}`;
+}
+
+function githubNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function githubText(value: unknown, maximum = 300): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= maximum && !/[\u0000-\u001f\u007f]/.test(value) ? value : undefined;
+}
+
+async function persistGitHubRepository(database: D1DatabaseLike, installationId: number, value: unknown, status: "active" | "removed" | "suspended", updatedAt: string): Promise<void> {
+  const repository = workerRecordValue(value);
+  const repositoryId = githubNumber(repository.id);
+  const fullName = githubText(repository.full_name);
+  if (!repositoryId || !fullName) return;
+  await database.prepare("INSERT INTO tinkerbot_github_repositories (repository_id, installation_id, full_name, visibility, status, permissions_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(repository_id) DO UPDATE SET installation_id = excluded.installation_id, full_name = excluded.full_name, visibility = excluded.visibility, status = excluded.status, permissions_json = excluded.permissions_json, updated_at = excluded.updated_at")
+    .bind(repositoryId, installationId, fullName.toLowerCase(), githubText(repository.visibility, 40) ?? null, status, JSON.stringify(workerRecordValue(repository.permissions)), updatedAt).run();
+}
+
+async function persistGitHubWebhook(database: D1DatabaseLike, payload: Record<string, unknown>, eventName: string | undefined): Promise<void> {
+  const installation = workerRecordValue(payload.installation);
+  const installationId = githubNumber(installation.id) ?? githubNumber(payload.installation_id);
+  if (!installationId) return;
+  const action = githubText(payload.action, 80) ?? "";
+  const account = workerRecordValue(payload.account);
+  const status = eventName === "installation" && (action === "deleted" ? "deleted" : action === "suspend" ? "suspended" : "active") as "active" | "suspended" | "deleted";
+  const now = new Date().toISOString();
+  await database.prepare("INSERT INTO tinkerbot_github_installations (installation_id, account_id, account_login, status, installed_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(installation_id) DO UPDATE SET account_id = excluded.account_id, account_login = excluded.account_login, status = excluded.status, updated_at = excluded.updated_at")
+    .bind(installationId, githubNumber(account.id) ?? null, githubText(account.login, 200) ?? null, status, now, now).run();
+  const repositoryStatus = status === "suspended" ? "suspended" : action === "removed" ? "removed" : "active";
+  for (const repository of [payload.repository, ...(Array.isArray(payload.repositories) ? payload.repositories : []), ...(Array.isArray(payload.repositories_added) ? payload.repositories_added : []), ...(Array.isArray(payload.repositories_removed) ? payload.repositories_removed : [])]) {
+    await persistGitHubRepository(database, installationId, repository, repositoryStatus, now);
+  }
 }
 
 function applicationUrl(request: Request, env: Env, path: string): string {
@@ -712,6 +747,37 @@ export default {
         const sessionId = authorization?.match(/^Bearer ([A-Za-z0-9_-]{20,200})$/)?.[1] ?? cookieValue(request, "tinkerbot_session");
         if (store && sessionId) await store.delete(sessionId);
         return jsonWithCookies({ signedOut: true }, 200, [clearCookie("tinkerbot_session"), clearCookie("tinkerbot_oauth_state")]);
+      }
+      if (url.pathname === "/integrations/github/install/callback" && request.method === "GET") {
+        const store = sessionStore(env, config);
+        if (!store || !env.DB) return json({ error: "GitHub installation binding requires the D1 session and tenant stores.", code: "github_installation_store_not_configured" }, 501);
+        const access = await authorizeTenantSession(await currentSession(request, store), new D1TenantStore(env.DB), "tenant:read");
+        if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
+        const installationId = Number(url.searchParams.get("installation_id"));
+        if (!Number.isSafeInteger(installationId) || installationId <= 0) return json({ error: "A valid GitHub installation_id is required.", code: "invalid_github_installation" }, 400);
+        const now = new Date().toISOString();
+        await env.DB.prepare("INSERT INTO tinkerbot_github_installations (installation_id, organization_id, status, installed_at, updated_at) VALUES (?1, ?2, 'active', ?3, ?3) ON CONFLICT(installation_id) DO UPDATE SET organization_id = excluded.organization_id, updated_at = excluded.updated_at")
+          .bind(installationId, access.membership.organizationId, now).run();
+        return json({ connected: true, authorized: true, organizationId: access.membership.organizationId, installationId });
+      }
+      if (url.pathname === "/integrations/github/webhook" && request.method === "POST") {
+        if (!env.DB) return json({ error: "GitHub webhook persistence requires the D1 store.", code: "github_webhook_store_not_configured" }, 501);
+        const payload = await boundedRequestText(request, 1_500_000);
+        const eventName = request.headers.get("x-github-event") ?? undefined;
+        const deliveryId = request.headers.get("x-github-delivery") ?? undefined;
+        const admission = admitWebhook({ payload, signature: request.headers.get("x-hub-signature-256") ?? undefined, secret: env.GITHUB_WEBHOOK_SECRET, eventName, deliveryId });
+        if (!admission.accepted || !admission.payload || !admission.idempotencyKey) return json({ error: "GitHub webhook was rejected.", code: admission.reason ?? "invalid_github_webhook" }, 401);
+        const ledger = new D1WebhookLedger(env.DB, "github");
+        if (ledger.claim && !await ledger.claim(admission.idempotencyKey)) return json({ received: true, duplicate: true });
+        try {
+          await persistGitHubWebhook(env.DB, admission.payload, eventName);
+          await new D1JsonMetadataStore(env.DB).put(`github:audit:${admission.idempotencyKey}`, admission.audit);
+          await ledger.record(admission.idempotencyKey);
+          return json({ received: true, duplicate: false });
+        } catch (error) {
+          if (ledger.release) await ledger.release(admission.idempotencyKey);
+          throw error;
+        }
       }
       if (url.pathname === "/integrations/workos/webhook" && request.method === "POST") {
         if (!env.DB) return json({ error: "WorkOS webhook verification is wired, but the D1 webhook ledger is not configured yet.", code: "webhook_ledger_not_configured" }, 501);

@@ -23,6 +23,36 @@ test("tenant RBAC capabilities are explicit and least-privilege", () => {
   expect(roleHasCapability("viewer", "billing:read")).toBe(false);
 });
 
+test("Cloudflare Worker accepts only signed GitHub installation webhooks and persists them replay-safely", async () => {
+  const events = new Set<string>();
+  const database = {
+    prepare: (query: string) => ({
+      bind: (...args: unknown[]) => ({
+        first: async <T>() => query.includes("FROM tinkerbot_webhook_events") && events.has(`${String(args[1])}:${String(args[0])}`) ? { event_id: args[0] } as T : null,
+        run: async () => {
+          if (query.startsWith("INSERT OR IGNORE INTO tinkerbot_webhook_events")) {
+            const key = `${String(args[1])}:${String(args[0])}`;
+            if (events.has(key)) return { meta: { changes: 0 } };
+            events.add(key);
+          }
+          return { meta: { changes: 1 } };
+        },
+      }),
+    }),
+  };
+  const payload = JSON.stringify({ action: "created", installation: { id: 7 }, account: { id: 8, login: "acme" }, repositories: [{ id: 11, full_name: "acme/payments", visibility: "private" }] });
+  const signature = createHmac("sha256", "github_webhook_secret").update(payload).digest("hex");
+  const env = { DB: database, GITHUB_WEBHOOK_SECRET: "github_webhook_secret" };
+  const invalid = await worker.fetch(new Request("https://control.example/integrations/github/webhook", { method: "POST", headers: { "x-github-event": "installation", "x-github-delivery": "delivery_1", "x-hub-signature-256": "sha256=invalid" }, body: payload }), env);
+  expect(invalid.status).toBe(401);
+  const first = await worker.fetch(new Request("https://control.example/integrations/github/webhook", { method: "POST", headers: { "x-github-event": "installation", "x-github-delivery": "delivery_1", "x-hub-signature-256": `sha256=${signature}` }, body: payload }), env);
+  expect(first.status).toBe(200);
+  expect(await first.json()).toEqual({ received: true, duplicate: false });
+  const duplicate = await worker.fetch(new Request("https://control.example/integrations/github/webhook", { method: "POST", headers: { "x-github-event": "installation", "x-github-delivery": "delivery_1", "x-hub-signature-256": `sha256=${signature}` }, body: payload }), env);
+  expect(duplicate.status).toBe(200);
+  expect(await duplicate.json()).toEqual({ received: true, duplicate: true });
+});
+
 test("Stripe webhooks resolve invoice tenants, fail closed on payment failure, and ignore stale state", async () => {
   const webhooks = new Map<string, Record<string, unknown>>();
   let billing: Record<string, unknown> | null = null;

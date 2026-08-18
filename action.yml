@@ -69,6 +69,14 @@ inputs:
     description: Optional token for best-effort Check Run/comment publication; fork workflows remain write-disabled.
     required: false
     default: ""
+  control-plane-url:
+    description: Optional HTTPS Tinkerbot control-plane URL for authenticated evidence submission.
+    required: false
+    default: ""
+  session-token:
+    description: Optional short-lived Tinkerbot session or service credential for hosted evidence submission.
+    required: false
+    default: ""
 outputs:
   report:
     description: Path to the local JSON report.
@@ -82,6 +90,8 @@ outputs:
     description: Path to the source-minimized external review context.
   evidence-contract:
     description: Path to the versioned, source-minimized canonical evidence contract.
+  assurance-bundle:
+    description: Path to the source-minimized assurance bundle submitted to the control plane when configured.
 runs:
   using: node20
   main: action/index.js
