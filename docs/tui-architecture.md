@@ -1,4 +1,4 @@
-# Tinkerbot local TUI architecture
+# Tinkerbot hosted TUI architecture
 
 ## Decision
 
@@ -8,16 +8,16 @@ This change does not inspect, import, copy, or migrate Synara code, branding, la
 
 ## Runtime boundary
 
-The verification engine remains the existing TypeScript/Node implementation under `packages/`. The TUI is isolated in `packages/tui` and is implemented with the pinned OpenTUI core, Solid, and keymap packages. OpenTUI-specific renderables never enter `core`, `git`, analyzers, reporters, or the GitHub Action.
+The verification engine remains the existing TypeScript/Node implementation under `packages/`. The TUI is isolated in `packages/tui` and is implemented with the pinned OpenTUI core, Solid, and keymap packages. OpenTUI-specific renderables never enter `core`, `git`, analyzers, reporters, or the GitHub Action. Hosted organization, membership, entitlement, repository binding, policy, and accepted evidence remain authoritative.
 
-The TUI consumes a local JSON subprocess protocol:
+The release TUI consumes an authenticated control-plane protocol:
 
-1. It discovers the current repository/worktree and local-only context.
-2. It invokes the existing built `tb`/`tinkerbot` CLI with machine-readable output for verification, history, policy, evidence, and exports.
-3. It reads only repository-local files and Git metadata for source-preserving diff navigation.
-4. It persists through the existing `.pr-proof/` history/artifact paths and `.tinkerbot/` assurance paths; it does not create a competing database.
+1. It requires an HTTPS control-plane URL, authenticated session token, and canonical `owner/repository` reference.
+2. It loads assurance state through the server-authorized API and presents an explicit permission/error state when that contract is unavailable.
+3. It never silently falls back to repository-local reports, localStorage, or static demo data in hosted mode.
+4. It may prepare source-minimized local inputs only through explicit authenticated client commands; accepted evidence is owned by the hosted service.
 
-The adapter accepts an explicit CLI path for packaged executables and a repository-relative built CLI path for development. A failed subprocess becomes a recoverable TUI error state, not a fabricated PASS.
+The hosted adapter has no local-authority fallback. A missing session, denied membership, entitlement failure, or failed request is a recoverable, visible state—not a fabricated PASS.
 
 ## Packaging matrix
 
@@ -31,7 +31,7 @@ The renderer is owned by a single lifecycle boundary. SIGINT, cancellation, resi
 
 ## GitHub boundary
 
-The Action and future App publish deterministic summaries, checks, receipts, and bounded annotations. GitHub remains authoritative for review, comments, approvals, branch protection, required checks, merge controls, permissions, and audit history. The TUI has no hosted-login requirement and never uploads source or full diffs by default.
+The Action and App publish deterministic summaries, checks, receipts, and bounded annotations through authenticated hosted authorization. GitHub remains authoritative for review, comments, approvals, branch protection, required checks, merge controls, permissions, and audit history. The TUI requires hosted login and never uploads source or full diffs by default.
 
 ## Alternatives rejected
 
