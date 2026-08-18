@@ -708,7 +708,8 @@ export default {
       if (url.pathname === "/auth/signout" && request.method === "POST") {
         if (!originAllowed(request, env)) return json({ error: "Cross-origin session mutation rejected.", code: "csrf_origin_rejected" }, 403);
         const store = sessionStore(env, config);
-        const sessionId = cookieValue(request, "tinkerbot_session");
+        const authorization = request.headers.get("authorization");
+        const sessionId = authorization?.match(/^Bearer ([A-Za-z0-9_-]{20,200})$/)?.[1] ?? cookieValue(request, "tinkerbot_session");
         if (store && sessionId) await store.delete(sessionId);
         return jsonWithCookies({ signedOut: true }, 200, [clearCookie("tinkerbot_session"), clearCookie("tinkerbot_oauth_state")]);
       }

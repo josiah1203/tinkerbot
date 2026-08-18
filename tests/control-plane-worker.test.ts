@@ -221,6 +221,10 @@ test("Cloudflare Worker completes WorkOS session persistence and server-side Str
     entitlements.set("org_1", { organization_id: "org_1", plan_id: "developer", billing_status: "canceled", private_repository_limit: 3, member_limit: 5, retention_days: 30, features_json: "{}", updated_at: "2030-01-01T00:00:00.000Z" });
     const canceled = await worker.fetch(new Request("https://control.example/assurance/summary?repository=github.com%2Facme%2Fservice", { headers: { cookie: `tinkerbot_session=${encodeURIComponent(sessionId)}` } }), env);
     expect(canceled.status).toBe(403);
+    const signout = await worker.fetch(new Request("https://control.example/auth/signout", { method: "POST", headers: { authorization: `Bearer ${sessionId}` } }), env);
+    expect(signout.status).toBe(200);
+    const signedOutSession = await worker.fetch(new Request("https://control.example/auth/session", { headers: { authorization: `Bearer ${sessionId}` } }), env);
+    expect(signedOutSession.status).toBe(401);
   } finally {
     globalThis.fetch = originalFetch;
   }
