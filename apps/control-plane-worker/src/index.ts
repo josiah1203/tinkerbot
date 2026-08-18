@@ -622,6 +622,30 @@ export default {
         if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
         return json(publicAccess(access));
       }
+      if (url.pathname === "/tenant/organizations" && request.method === "GET") {
+        const store = sessionStore(env, config);
+        if (!store || !env.DB) return json({ error: "Organization selection requires the D1 session and tenant stores.", code: "tenant_store_not_configured" }, 501);
+        const current = await currentSession(request, store);
+        if (!current) return json({ error: "Authentication is required.", code: "not_authenticated" }, 401);
+        const memberships = await new D1TenantStore(env.DB).listActiveMemberships(current.session.user.id);
+        return json({ authenticated: true, currentOrganizationId: current.session.organizationId, organizations: memberships.map((membership) => ({ organizationId: membership.organizationId, role: membership.role, updatedAt: membership.updatedAt })) });
+      }
+      if (url.pathname === "/tenant/organizations/switch" && request.method === "POST") {
+        if (!originAllowed(request, env)) return json({ error: "Cross-origin organization mutation rejected.", code: "csrf_origin_rejected" }, 403);
+        const store = sessionStore(env, config);
+        if (!store || !env.DB) return json({ error: "Organization selection requires the D1 session and tenant stores.", code: "tenant_store_not_configured" }, 501);
+        const current = await currentSession(request, store);
+        if (!current) return json({ error: "Authentication is required.", code: "not_authenticated" }, 401);
+        const body = await jsonBody(request);
+        const organizationId = typeof body?.organizationId === "string" && /^[A-Za-z0-9._:-]{1,200}$/.test(body.organizationId) ? body.organizationId : undefined;
+        if (!organizationId) return json({ error: "A valid organizationId is required.", code: "invalid_organization" }, 400);
+        const tenants = new D1TenantStore(env.DB);
+        const membership = await tenants.getMembership(current.session.user.id, organizationId);
+        if (!membership || membership.status !== "active") return json({ error: "The authenticated user is not an active member of that organization.", code: "not_a_member" }, 403);
+        await store.put(current.id, { ...current.session, organizationId });
+        const access = await authorizeTenantSession({ id: current.id, session: { ...current.session, organizationId } }, tenants);
+        return json({ switched: true, ...(access.ok ? publicAccess(access) : { authorized: false }) });
+      }
       if (url.pathname === "/assurance/summary" && request.method === "GET") {
         const store = sessionStore(env, config);
         const database = env.DB;

@@ -802,6 +802,13 @@ export class D1TenantStore implements TenantAccessStore {
     return { organizationId: row.organization_id, userId: row.user_id, role: row.role, status: row.status, ...(typeof row.updated_at === "string" ? { updatedAt: row.updated_at } : {}) };
   }
 
+  async listActiveMemberships(userId: string): Promise<TenantMembership[]> {
+    const statement = this.database.prepare("SELECT m.organization_id, m.user_id, m.role, m.status, m.updated_at FROM tinkerbot_memberships m INNER JOIN tinkerbot_organizations o ON o.organization_id = m.organization_id AND o.status = 'active' WHERE m.user_id = ?1 AND m.status = 'active' ORDER BY m.updated_at DESC").bind(userId);
+    if (typeof statement.all !== "function") return [];
+    const result = await statement.all<D1MembershipRow>();
+    return (result.results ?? []).flatMap((row) => !isTenantRole(row.role) || !isMembershipStatus(row.status) ? [] : [{ organizationId: row.organization_id, userId: row.user_id, role: row.role, status: row.status, ...(typeof row.updated_at === "string" ? { updatedAt: row.updated_at } : {}) }]);
+  }
+
   async getEntitlements(organizationId: string): Promise<TenantEntitlement | null> {
     const row = await this.database.prepare("SELECT organization_id, plan_id, billing_status, private_repository_limit, member_limit, retention_days, features_json, updated_at FROM tinkerbot_entitlements WHERE organization_id = ?1").bind(organizationId).first<D1EntitlementRow>();
     if (!row) return null;
@@ -822,7 +829,7 @@ export class D1TenantStore implements TenantAccessStore {
   }
 
   async countSeatUsage(organizationId: string): Promise<number> {
-    const row = await this.database.prepare("SELECT COUNT(*) AS count FROM tinkerbot_memberships WHERE organization_id = ?1 AND status IN ('active', 'invited')").bind(organizationId).first<{ count?: number | string }>();
+    const row = await this.database.prepare("SELECT COUNT(*) AS count FROM tinkerbot_memberships WHERE organization_id = ?1 AND status = 'active'").bind(organizationId).first<{ count?: number | string }>();
     const count = typeof row?.count === "number" ? row.count : Number(row?.count);
     return Number.isFinite(count) && count >= 0 ? Math.trunc(count) : 0;
   }

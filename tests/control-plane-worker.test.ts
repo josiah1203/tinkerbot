@@ -158,6 +158,10 @@ test("Cloudflare Worker completes WorkOS session persistence and server-side Str
           if (query.includes("FROM tinkerbot_entitlements")) return (entitlements.get(String(args[0])) ?? null) as T | null;
           return null;
         },
+        all: async <T>() => {
+          if (query.includes("FROM tinkerbot_memberships")) return { results: [...memberships.values()].filter((membership) => membership.user_id === String(args[0]) && membership.status === "active") as T[] };
+          return { results: [] as T[] };
+        },
         run: async () => {
           if (query.startsWith("INSERT INTO tinkerbot_sessions")) {
             sessions.set(String(args[0]), { session_id: args[0], user_id: args[1], email: args[2], first_name: args[3], last_name: args[4], email_verified: args[5], organization_id: args[6], expires_at: args[7], authentication_method: args[8], token_ciphertext: args[9] });
@@ -218,6 +222,12 @@ test("Cloudflare Worker completes WorkOS session persistence and server-side Str
     const access = await worker.fetch(new Request("https://control.example/tenant/access", { headers: { cookie: `tinkerbot_session=${encodeURIComponent(sessionId)}` } }), env);
     expect(access.status).toBe(200);
     expect(await access.json()).toMatchObject({ authorized: true, organizationId: "org_1", role: "owner" });
+    const organizations = await worker.fetch(new Request("https://control.example/tenant/organizations", { headers: { authorization: `Bearer ${sessionId}` } }), env);
+    expect(organizations.status).toBe(200);
+    expect(await organizations.json()).toMatchObject({ currentOrganizationId: "org_1", organizations: [{ organizationId: "org_1", role: "owner" }] });
+    const switchOrganization = await worker.fetch(new Request("https://control.example/tenant/organizations/switch", { method: "POST", headers: { authorization: `Bearer ${sessionId}`, "content-type": "application/json" }, body: JSON.stringify({ organizationId: "org_1" }) }), env);
+    expect(switchOrganization.status).toBe(200);
+    expect(await switchOrganization.json()).toMatchObject({ switched: true, organizationId: "org_1" });
     const sync = await worker.fetch(new Request("https://control.example/tenant/membership/sync", { method: "POST", headers: { origin: "https://control.example", cookie: `tinkerbot_session=${encodeURIComponent(sessionId)}` } }), env);
     expect(sync.status).toBe(200);
     expect(await sync.json()).toMatchObject({ synchronized: true, authorized: true, organizationId: "org_1", role: "owner" });
