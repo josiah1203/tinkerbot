@@ -129,3 +129,37 @@ test("TUI renders command-mode exports, secondary views, and explicit adapter fa
     setup.renderer.destroy();
   }
 });
+
+test("TUI renders empty, unavailable, and narrow hosted states without inventing local evidence", async () => {
+  const setup = await createTestRenderer({ width: 80, height: 28, screenMode: "main-screen" });
+  const unavailable: TuiAdapter = {
+    ...adapter(snapshot()),
+    loadSnapshot: async () => ({ state: "permission-denied", history: [], diff: "", changedFiles: [], workItems: [], warnings: ["Hosted session expired"], loadedAt: "now" }),
+    openGitHub: () => undefined,
+  };
+  try {
+    const keymap = createDefaultOpenTuiKeymap(setup.renderer);
+    await render(() => <KeymapProvider keymap={keymap}><TuiApp adapter={unavailable} dimensions={() => ({ width: 80, height: 28 })} onQuit={() => undefined} /></KeymapProvider>, setup.renderer);
+    await setup.waitForVisualIdle();
+    expect(setup.captureCharFrame()).toContain("Hosted");
+    expect(setup.captureCharFrame()).toContain("PERMISSION DENIED");
+  } finally {
+    setup.renderer.destroy();
+  }
+
+  const emptySetup = await createTestRenderer({ width: 120, height: 40, screenMode: "main-screen" });
+  const empty: TuiAdapter = {
+    ...adapter(snapshot()),
+    loadSnapshot: async () => ({ state: "empty", repository: snapshot().repository, repositories: [], history: [], diff: "", changedFiles: [], workItems: [], warnings: ["No hosted assurance record is available"], loadedAt: "now" }),
+    openGitHub: () => undefined,
+  };
+  try {
+    const keymap = createDefaultOpenTuiKeymap(emptySetup.renderer);
+    await render(() => <KeymapProvider keymap={keymap}><TuiApp adapter={empty} onQuit={() => undefined} /></KeymapProvider>, emptySetup.renderer);
+    await emptySetup.waitForVisualIdle();
+    expect(emptySetup.captureCharFrame()).toContain("No report receipt is available.");
+    expect(emptySetup.captureCharFrame()).toContain("NO REPORT");
+  } finally {
+    emptySetup.renderer.destroy();
+  }
+});

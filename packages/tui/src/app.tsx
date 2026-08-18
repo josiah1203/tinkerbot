@@ -94,7 +94,7 @@ export function TuiApp(props: TuiAppProps) {
       const next = await props.adapter.loadSnapshot();
       setSnapshot(next);
       setSelected(0);
-      if (next.state === "error") setStatus(next.warnings[0] ?? "Repository context unavailable");
+      if (next.state === "error" || next.state === "permission-denied") setStatus(next.warnings[0] ?? "Hosted session unavailable");
       else if (next.state === "stale") setStatus("Evidence is stale · press r to rerun");
       else setStatus(next.report ? `Loaded ${next.report.verdict} from the control plane` : "No hosted assurance record is available");
     } catch (error) {
