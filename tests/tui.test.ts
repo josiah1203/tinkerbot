@@ -5,7 +5,7 @@ import { renderSession, stripAnsi } from "../packages/cli/src/tui/render";
 import { applyStageEvent, createSession, handleKey, submitLine } from "../packages/cli/src/tui/session";
 import { dispatchIntentSync, isInteractiveTty, runTui, type TuiDeps } from "../packages/cli/src/tui";
 import type { TestSelectionPlan } from "../packages/core/src/types";
-import { mainAsync, runCli } from "../packages/cli/src";
+import { dispatchTui, mainAsync, runCli } from "../packages/cli/src";
 
 function capture(fn: () => number): { code: number; stdout: string; stderr: string } {
   let stdout = "";
@@ -251,6 +251,10 @@ test("CLI splits tui from dashboard and documents the session", () => {
   expect(capture(() => runCli(["dashboard", "--help"])).stdout).toContain("dashboard");
   expect(capture(() => runCli(["tui"])).code).toBe(2);
   expect(capture(() => runCli(["tui", "merge"])).code).toBe(3);
+  expect(capture(() => runCli(["tui", "--agent", "nope"])).code).toBe(3);
+  expect(capture(() => runCli(["agents"])).stdout).toContain("storesVendorTokens");
+  expect(capture(() => runCli(["agents", "--help"])).stdout).toContain("tb agents");
+  expect(capture(() => runCli(["factory", "--help"])).stdout).toContain("tb factory new");
   expect(capture(() => runCli(["logout"])).code).toBe(12);
   expect(capture(() => runCli(["doctor"])).stdout).toContain("PR Proof doctor");
 });
@@ -283,9 +287,22 @@ test("mainAsync tui work attaches hosted ingest state without rewriting PASS", a
     const attached = await captureAsync(() => mainAsync(["tui", "work", "wo_1"]));
     expect(attached.stdout).toMatch(/not a verdict|UNKNOWN/);
     expect([0, 2]).toContain(attached.code);
+    const failed = await captureAsync(() => mainAsync(["tui", "work", "missing"]));
+    expect([0, 2]).toContain(failed.code);
   } finally {
     globalThis.fetch = originalFetch;
     if (previousUrl === undefined) delete process.env.TINKERBOT_CONTROL_PLANE_URL; else process.env.TINKERBOT_CONTROL_PLANE_URL = previousUrl;
     if (previousToken === undefined) delete process.env.TINKERBOT_SESSION_TOKEN; else process.env.TINKERBOT_SESSION_TOKEN = previousToken;
   }
+});
+
+test("dispatchTui launches the tabbed master when interactive", async () => {
+  const { Readable } = await import("node:stream");
+  const io = deps();
+  io.stdin = Readable.from(["/check\n", "/work wo_1\n", "/exit\n"]) as typeof io.stdin;
+  io.fetchWork = () => ({ workOrder: { workOrderId: "wo_1", verificationVerdict: "UNKNOWN" } });
+  const code = await dispatchTui({ baseTests: true, agent: "shell", subcommand: "work", positional: "wo_1" }, io, true);
+  expect(code).toBe(0);
+  expect(await dispatchTui({ baseTests: true, once: true }, io, false)).toBe(2);
+  expect(await dispatchTui({ baseTests: true, help: true }, io, true)).toBe(0);
 });

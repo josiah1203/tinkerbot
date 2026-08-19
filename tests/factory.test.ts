@@ -267,7 +267,24 @@ describe("factory domain", () => {
       createFactory: async (input) => ({ factoryId: input.name === "payments" ? "fac_new" : "x" }),
     });
     expect(created).toEqual({ ok: true, result: { factoryId: "fac_new" } });
+    const fromFiles = await handleFactoryMcpTool("create_factory", { name: "payments", yaml: "name: payments\n", files: [{ path: ".tinkerbot/factory.yaml", contents: "name: payments\n" }] }, {
+      organizationId: "org_1",
+      actor: "dev",
+      sendTask: async () => ({ workOrderId: "wo_mcp" }),
+      getTask: async () => ({ workOrder: undefined, conversation: [] }),
+      messageForeman: async () => ({ accepted: true as const }),
+      createFactory: async (input) => ({ factoryId: input.files[0]?.path ?? "x" }),
+    });
+    expect(fromFiles).toEqual({ ok: true, result: { factoryId: ".tinkerbot/factory.yaml" } });
+    expect((await handleFactoryMcpTool("create_factory", { name: "x" }, {
+      organizationId: "org_1",
+      actor: "dev",
+      sendTask: async () => ({ workOrderId: "wo_mcp" }),
+      getTask: async () => ({ workOrder: undefined, conversation: [] }),
+      messageForeman: async () => ({ accepted: true as const }),
+    })).ok).toBe(false);
     expect(buildFactoryStarter({ name: "payments", owner: "acme", repository: "pay" }).files.some((file) => file.path === ".tinkerbot/factory.yaml")).toBe(true);
+    expect(buildFactoryStarter({ name: "payments", owner: "acme", repository: "pay", harness: "tinkerbot-sandbox", integrations: ["slack"] }).yaml).toContain("harness: tinkerbot-sandbox");
     expect(scoreConversation({ messages: [] }, "ran tests").passed).toBe(false);
     expect(scoreConversation({ messages: [{ role: "assistant", agentId: "review", content: "tb check PASS", at: "now" }] }, "did the agent run tb check?").upgradesVerdict).toBe(false);
   });

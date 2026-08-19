@@ -193,10 +193,21 @@ test("factory wizard and settings destinations stay honest", async ({ page }) =>
   await page.getByRole("button", { name: "Create factory" }).click();
   await expect(page).toHaveURL(/\/app\/factories\/fac_new/);
   await page.goto("/app/factories/fac_1/agents");
-  await expect(page.getByText("foreman")).toBeVisible();
+  await expect(page.getByText("foreman", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: /save|edit/i })).toHaveCount(0);
   await page.goto("/app/settings/gitlab");
   await expect(page.getByText("never merges a GitLab MR")).toBeVisible();
   await page.goto("/app/settings/export");
   await expect(page.getByText("Export failure does not change")).toBeVisible();
+});
+
+test("command palette opens factory wizard from the inbox", async ({ page }) => {
+  await mockControlPlane(page);
+  await page.goto("/app");
+  await page.keyboard.press("Control+k");
+  await expect(page.getByRole("dialog", { name: "Command menu" })).toBeVisible();
+  await page.getByPlaceholder("Go to inbox").fill("new factory");
+  await page.getByRole("link", { name: "New factory" }).click();
+  await expect(page).toHaveURL(/\/app\/factories\/new/);
+  await expect(page.locator(".breadcrumbs strong")).toHaveText("New factory");
 });

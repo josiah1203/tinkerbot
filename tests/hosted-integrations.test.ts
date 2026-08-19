@@ -178,10 +178,17 @@ test("Cloudflare secret bindings and portable metadata/evidence stores are provi
     replicaPuts.push(String(input));
     return new Response("no", { status: 500 });
   }) as typeof fetch);
+  await expect(replica.put("k", { a: 1 })).rejects.toThrow(/HTTP 500/);
+  expect(await replica.get()).toBeNull();
+  await replica.delete();
+  const okReplica = new HttpEvidenceReplica("https://export.example/", undefined, (async () => new Response("ok", { status: 200 })) as typeof fetch);
+  await okReplica.put("k", { a: 1 });
+  expect(evidenceStoreFromEnv({})).toBeUndefined();
   const fanout = new FanoutEvidenceStore(evidence, replica);
   await fanout.put("run_2", { ok: true });
   expect(await fanout.get("run_2")).toEqual({ ok: true });
-  expect(replicaPuts[0]).toContain("https://export.example/run_2");
+  await fanout.delete("run_2");
+  expect(replicaPuts.some((url) => url.includes("/run_2"))).toBe(true);
   const store = evidenceStoreFromEnv({ bucket, exportEndpoint: "https://export.example" });
   await store?.put("run_3", { primary: true });
   expect(await store?.get("run_3")).toEqual({ primary: true });

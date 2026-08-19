@@ -127,10 +127,12 @@ export function planForemanActions(input: {
   verificationIngested?: boolean;
   verificationVerdict?: string;
   reviewRequestsRevision?: boolean;
+  forceSkipSpec?: boolean;
+  forbidSkip?: boolean;
 }): ForemanDecision {
   const skip: FactoryStageId[] = [];
-  const localized = /\b(typo|nits?|docs?|readme|changelog)\b/i.test(input.untrustedText ?? "") || input.sourceType === "github_pull_request" && (input.untrustedText ?? "").length < 80;
-  if (localized) skip.push("specification");
+  const localized = input.forceSkipSpec === true || /\b(typo|nits?|docs?|readme|changelog)\b/i.test(input.untrustedText ?? "") || input.sourceType === "github_pull_request" && (input.untrustedText ?? "").length < 80;
+  if (localized && input.forbidSkip !== true) skip.push("specification");
   const askHuman = !input.specApproved && !skip.includes("specification");
   const actions: ForemanAction[] = [];
   for (const stage of skip) actions.push({ tool: "skip_stage", stage, reason: "Request is already bounded." });

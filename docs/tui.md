@@ -6,7 +6,7 @@ Launch interactive mode from a real Cursor/IDE TTY: `pnpm tui` or `pnpm tb tui`.
 
 ## Surfaces
 
-- TTY: master tabs (Check, Work, nested agent CLIs, optional Shell). Leader `ctrl-g` leaves a nested PTY.
+- TTY: master tabs (Check, Work, nested agent CLIs, optional Shell). `/check` runs `tb check` into the Check tab. Leader `ctrl-g` then `n`/`p`/`w` leaves a nested PTY.
 - Non-TTY / CI: exit 2, no check. Use `tb tui --once` or `tb check`.
 - `tb tui --once` / `tb tui check`: one Node check transcript, same exit codes as `tb check`.
 - `tb tui work <id>`: Work tab (hosted attach when logged in).

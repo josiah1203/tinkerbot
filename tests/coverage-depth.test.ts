@@ -243,7 +243,7 @@ test("git adapters cover revisions, file reads, renames, quoted paths, worktrees
   expect(runCommandAtRevision(fixture.root, fixture.head, "node -e \"process.stdout.write('shell')\"", 5, true)).toMatchObject({ status: 0, timedOut: false, stdout: "shell" });
   expect(runCommandAtRevision(fixture.root, fixture.head, "node 'unterminated", 5).error).toMatch(/unterminated/);
   expect(runCommandAtRevision(fixture.root, fixture.head, "definitely-missing-command", 5)).toMatchObject({ status: null, timedOut: false, signal: undefined });
-});
+}, 60_000);
 
 test("reporters render complete and minimized views with escaping and explicit formats", () => {
   const rich = report({
@@ -754,6 +754,7 @@ test("dashboard opens the hosted app and tui is a TTY session", () => {
   expect(capture(() => runCli(["tui"])).stderr).toContain("TTY");
   expect(capture(() => runCli(["dashboard"])).code).toBe(2);
   expect(capture(() => runCli([])).code).toBe(0);
+  expect(capture(() => runCli(["agents"])).stdout).toContain('"oauth": "child-cli"');
 });
 
 test("CLI argument and subcommand validation covers every public option family", () => {

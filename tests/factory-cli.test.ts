@@ -248,3 +248,16 @@ test("factory validate, receipt validate, login, and hosted inspect commands are
   expect(fs.existsSync(credentialFile)).toBe(false);
   clearStoredCredentials();
 });
+
+test("tb factory new writes a local starter and refuses to overwrite", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tinkerbot-factory-new-"));
+  git(root, ["init", "-q"]);
+  git(root, ["config", "user.email", "dev@example.test"]);
+  git(root, ["config", "user.name", "Dev"]);
+  process.chdir(root);
+  const created = capture(() => runCli(["factory", "new", "payments"]));
+  expect(created.code).toBe(0);
+  expect(created.stdout).toContain(".tinkerbot/factory.yaml");
+  expect(fs.readFileSync(path.join(root, ".tinkerbot/factory.yaml"), "utf8")).toContain("name: payments");
+  expect(capture(() => runCli(["factory", "new"])).code).toBe(3);
+});

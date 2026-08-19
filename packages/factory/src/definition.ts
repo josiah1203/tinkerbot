@@ -2,6 +2,7 @@ import { parse as parseYaml } from "yaml";
 import { defaultModelForAgent } from "./warp";
 
 export const FACTORY_SCHEMA_V1ALPHA1 = "v1alpha1" as const;
+export const FACTORY_SCHEMA_V1ALPHA2 = "v1alpha2" as const;
 export const FORBIDDEN_HARNESS_TYPES = ["oz", "claude", "claude-code", "codex", "gemini"] as const;
 export const ALLOWED_HARNESSES = ["tinkerbot-sandbox", "github_actions", "none", "default"] as const;
 export const AGENT_TYPES = ["CUSTOM", "FOREMAN", "TRIAGE", "SPEC", "IMPLEMENT", "REVIEW", "VERIFY"] as const;
@@ -14,7 +15,7 @@ export const ACTIVITY_COLUMN_LABELS = {
   done: "Done",
 } as const;
 
-export type FactorySchemaVersion = "v1" | "v1alpha1";
+export type FactorySchemaVersion = "v1" | "v1alpha1" | "v1alpha2";
 export type FactoryAgentType = (typeof AGENT_TYPES)[number];
 export type FactoryCredentialStrategy = "EXECUTOR" | "CREATOR";
 export type FactoryIntegrationType = "slack" | "linear" | "jira";
@@ -162,6 +163,7 @@ export function parseRunnerYaml(name: string, contents: string): FactoryRunnerDe
 }
 
 export function parseFactorySchemaVersion(raw: Record<string, unknown>): FactorySchemaVersion {
+  if (raw.schemaVersion === FACTORY_SCHEMA_V1ALPHA2 || raw.schemaVersion === "v1alpha2") return "v1alpha2";
   if (raw.schemaVersion === FACTORY_SCHEMA_V1ALPHA1 || raw.schemaVersion === "v1alpha1") return "v1alpha1";
   const version = Number(raw.version ?? 1);
   if (version !== 1) throw new Error("Unsupported factory definition version.");

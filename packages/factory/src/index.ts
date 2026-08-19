@@ -46,6 +46,14 @@ import {
 export * from "./warp";
 export * from "./os";
 export * from "./starter";
+export * from "./runtime";
+export * from "./planner";
+export * from "./store";
+export * from "./inference";
+export * from "./approval";
+export * from "./evals";
+export { executeFactoryRun } from "./execute";
+import { assertCredentialRef, hostedRuntimeDefaults, parseRuntimeProfile, type RuntimeProfile } from "./runtime";
 
 export const WORK_ORDER_STATES = [
   "intake",
@@ -156,6 +164,7 @@ export interface FactoryDefinition {
   skills: SkillDefinition[];
   autonomy: AutonomyPolicy;
   evolution: EvolutionPolicy;
+  runtime: RuntimeProfile;
 }
 
 export interface WorkOrder {
@@ -186,6 +195,8 @@ export interface WorkOrder {
   policyJson?: string;
   dependenciesJson?: string;
   heldBy?: string;
+  origin?: "local" | "hosted";
+  executionPlanId?: string;
 }
 
 export interface WorkOrderEvent {
@@ -297,7 +308,7 @@ export function containsRawCredentials(value: unknown): boolean {
   if (typeof value === "string") return SECRET_PATTERN.test(value) || /gh[ps]_|sk_live_|sk_test_|whsec_/.test(value);
   if (Array.isArray(value)) return value.some(containsRawCredentials);
   if (value && typeof value === "object") {
-    return Object.entries(value as Record<string, unknown>).some(([key, nested]) => CREDENTIAL_KEYS.test(key) && typeof nested === "string" && nested.length > 8 && !nested.startsWith("secret://") && !nested.startsWith("env:") || containsRawCredentials(nested));
+    return Object.entries(value as Record<string, unknown>).some(([key, nested]) => CREDENTIAL_KEYS.test(key) && typeof nested === "string" && nested.length > 8 && !nested.startsWith("secret://") && !nested.startsWith("env:") && !nested.startsWith("keychain://") || containsRawCredentials(nested));
   }
   return false;
 }
@@ -310,6 +321,11 @@ export function parseFactoryDefinition(input: unknown): FactoryDefinition {
   const source = typeof input === "string" ? parseYaml(input) : input;
   if (!source || typeof source !== "object" || Array.isArray(source)) throw new Error("Factory definition must be a mapping.");
   const raw = source as Record<string, unknown>;
+  const runtimeRaw = raw.runtime && typeof raw.runtime === "object" && !Array.isArray(raw.runtime) ? raw.runtime as Record<string, unknown> : undefined;
+  const inferenceRaw = runtimeRaw?.inference && typeof runtimeRaw.inference === "object" && !Array.isArray(runtimeRaw.inference) ? runtimeRaw.inference as Record<string, unknown> : undefined;
+  if (typeof inferenceRaw?.credentialRef === "string") {
+    assertCredentialRef(inferenceRaw.credentialRef, "runtime.inference");
+  }
   if (containsRawCredentials(raw)) throw new Error("Factory definition must not contain raw credentials.");
   const schemaVersion = parseFactorySchemaVersion(raw);
   const name = typeof raw.name === "string" ? raw.name.trim() : "";
@@ -354,6 +370,7 @@ export function parseFactoryDefinition(input: unknown): FactoryDefinition {
   const budgets = raw.budgets && typeof raw.budgets === "object" ? raw.budgets as Record<string, unknown> : {};
   const approvals = raw.approvals && typeof raw.approvals === "object" ? raw.approvals as Record<string, unknown> : {};
   const runnerType = runner.type === "tinkerbot-sandbox" || agentDefaults.workerHost === "warp" ? "tinkerbot-sandbox" : "github_actions";
+  const runtime = parseRuntimeProfile(raw.runtime, hostedRuntimeDefaults(runnerType));
   return {
     version: 1,
     schemaVersion,
@@ -387,6 +404,7 @@ export function parseFactoryDefinition(input: unknown): FactoryDefinition {
     skills: [],
     autonomy: parseAutonomyDocument({}),
     evolution: parseEvolutionDocument({}),
+    runtime,
   };
 }
 
@@ -463,6 +481,8 @@ export function createWorkOrder(input: Omit<WorkOrder, "workOrderId" | "createdA
     policyJson: input.policyJson,
     dependenciesJson: input.dependenciesJson,
     heldBy: input.heldBy,
+    origin: input.origin,
+    executionPlanId: input.executionPlanId,
   };
 }
 
@@ -593,92 +613,4 @@ export interface FactoryRunStepResult {
   stage: FactoryStageId;
   status: AgentStageResult["status"];
   summary: string;
-}
-
-export async function executeFactoryRun(input: {
-  definition: FactoryDefinition;
-  sourceType: WorkOrder["sourceType"];
-  untrustedText?: string;
-  ai?: FactoryAi;
-  verificationVerdict?: string;
-  specApproved?: boolean;
-  sandboxComplete?: boolean;
-  pullRequestSha?: string;
-  verificationIngested?: boolean;
-  reviewRequestsRevision?: boolean;
-  workOrderId?: string;
-  factoryId?: string;
-  paths?: string[];
-}): Promise<{ stages: FactoryRunStepResult[]; terminal: WorkOrderState; wait?: ReturnType<typeof waitForFactoryRun>; lineId?: ProductionLineId; autonomyMode?: AutonomyMode }> {
-  const routed = routeProductionLine({ sourceType: input.sourceType, text: input.untrustedText, paths: input.paths });
-  const autonomyMode = resolveAutonomy({ lineId: routed.lineId, paths: input.paths, text: input.untrustedText, policy: input.definition.autonomy });
-  const product = resolveProduct(input.definition, input.definition.repositories[0] ?? "unknown/unknown");
-  const decision = planForemanActions({
-    sourceType: input.sourceType,
-    untrustedText: input.untrustedText,
-    specApproved: input.specApproved,
-    sandboxComplete: input.sandboxComplete,
-    pullRequestSha: input.pullRequestSha,
-    verificationIngested: input.verificationIngested ?? ingestedVerdict(input.verificationVerdict),
-    verificationVerdict: input.verificationVerdict,
-    reviewRequestsRevision: input.reviewRequestsRevision,
-  });
-  const skip = decision.skip.filter((stage) => stage !== "verification" && autonomyAllowsSkip(autonomyMode ?? "approval_gated", stage));
-  const planned = runForeman(input.definition, input.sourceType, skip, routed.lineId);
-  if (!planned.length) return { stages: [{ stage: "foreman", status: "skipped", summary: "Source is not enabled for this factory." }], terminal: "cancelled", lineId: routed.lineId, autonomyMode: autonomyMode };
-  if (product.blocked) {
-    return { stages: [{ stage: "foreman", status: "blocked", summary: product.action ?? "map repository to product" }], terminal: "blocked", lineId: routed.lineId, autonomyMode: autonomyMode };
-  }
-  const stages: FactoryRunStepResult[] = [{ stage: "foreman", status: "ok", summary: `${decision.summary || planned.join(",")} line=${routed.lineId} autonomy=${autonomyMode}` }];
-  const agentById = new Map(input.definition.agents.map((agent) => [agent.id, agent]));
-  if (planned.includes("triage")) {
-    const result = await runTriageAgent(input.ai, agentById.get("triage"), { body: input.untrustedText });
-    stages.push({ stage: "triage", status: result.status, summary: result.summary });
-    if (result.status === "blocked") return { stages, terminal: "blocked", lineId: routed.lineId, autonomyMode: autonomyMode };
-  }
-  const skipSpec = skip.includes("specification");
-  if (planned.includes("specification") && !skipSpec) {
-    const result = await runSpecificationAgent(input.ai, agentById.get("specification") ?? agentById.get("spec"), { body: input.untrustedText });
-    stages.push({ stage: "specification", status: result.status, summary: result.summary });
-    const spec = runAssuranceCheckpoint("specification", { acceptanceCriteria: result.summary });
-    if (!input.specApproved) return { stages, terminal: "specification", wait: "spec_approval", lineId: routed.lineId, autonomyMode: autonomyMode };
-    if (spec.status === "blocked" && autonomyMode === "restricted") return { stages, terminal: "blocked", lineId: routed.lineId, autonomyMode: autonomyMode };
-  }
-  if (planned.includes("architecture")) {
-    const architecture = runAssuranceCheckpoint("architecture", { architectureFit: true });
-    stages.push({ stage: "architecture", status: architecture.status, summary: architecture.summary });
-  }
-  if (decision.requestRevision || planned.includes("implementation")) {
-    if (routed.lineId !== "release" && !input.sandboxComplete) {
-      stages.push({ stage: "implementation", status: "ok", summary: "Queued Cloudflare Sandbox implement in a leased work cell. GitHub Actions remains verification-only. No application code has been written yet." });
-      return { stages, terminal: "implementation", wait: decision.requestRevision ? "revision" : "sandbox", lineId: routed.lineId, autonomyMode: autonomyMode };
-    }
-    if (routed.lineId !== "release") stages.push({ stage: "implementation", status: "ok", summary: "Sandbox pushed a tinkerbot/* branch. Merge is forbidden." });
-  }
-  if (planned.includes("security")) {
-    const security = runAssuranceCheckpoint("security", { securityChecked: true, verdict: input.verificationVerdict });
-    stages.push({ stage: "security", status: security.status, summary: security.summary });
-  }
-  if (planned.includes("review")) {
-    const result = await runReviewAgent(input.ai, agentById.get("review"), { verdict: input.verificationVerdict, evidenceRef: "evidence://run" });
-    stages.push({ stage: "review", status: result.status, summary: result.summary });
-    if (reviewRequestsRevision(result.summary) && !input.reviewRequestsRevision) return { stages, terminal: "implementation", wait: "revision", lineId: routed.lineId, autonomyMode: autonomyMode };
-  }
-  if (planned.includes("verification")) {
-    const ingested = input.verificationIngested ?? ingestedVerdict(input.verificationVerdict);
-    if (!ingested) {
-      stages.push({ stage: "verification", status: "unknown", summary: "Waiting for Action OIDC ingest. Deterministic verdict stays UNKNOWN until tb check arrives." });
-      return { stages, terminal: "verification", wait: "oidc_ingest", lineId: routed.lineId, autonomyMode: autonomyMode };
-    }
-    const authority = verificationAuthority(input.verificationVerdict ?? "UNKNOWN");
-    stages.push({ stage: "verification", status: authority === "unknown" ? "unknown" : "ok", summary: `Deterministic verdict ${input.verificationVerdict ?? "UNKNOWN"}. LLM review cannot override this.` });
-    if (authority === "fail") return { stages, terminal: "failed", lineId: routed.lineId, autonomyMode: autonomyMode };
-  }
-  if (planned.includes("release")) stages.push({ stage: "release", status: input.definition.approvals.required ? "ok" : "skipped", summary: input.definition.approvals.required ? "Waiting for human merge. Agents cannot merge." : "Approval not required." });
-  if (planned.includes("outcome")) stages.push({ stage: "outcome", status: "unknown", summary: "Post-release outcome is not confirmed." });
-  const failed = stages.some((stage) => stage.status === "blocked");
-  const unknown = stages.some((stage) => stage.status === "unknown");
-  if (failed) return { stages, terminal: "blocked", lineId: routed.lineId, autonomyMode: autonomyMode };
-  if (unknown && verificationAuthority(input.verificationVerdict ?? "UNKNOWN") !== "pass") return { stages, terminal: "unknown", lineId: routed.lineId, autonomyMode: autonomyMode };
-  return { stages, terminal: input.definition.approvals.required ? "approval" : "ready", wait: "human_merge", lineId: routed.lineId, autonomyMode: autonomyMode };
 }

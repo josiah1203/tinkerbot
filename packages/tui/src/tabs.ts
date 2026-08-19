@@ -1,6 +1,6 @@
 import type { AgentId } from "./agents";
 
-export type TabKind = "check" | "work" | "agent" | "shell";
+export type TabKind = "check" | "work" | "agent" | "shell" | "plan" | "cost" | "eval";
 
 export interface MasterTab {
   id: string;
@@ -16,6 +16,8 @@ export interface MasterState {
   active: number;
   leader: "ctrl-g";
   lastVerdict?: string;
+  checkLog?: string;
+  workLog?: string;
   repo: string;
   base: string;
   head: string;
@@ -32,6 +34,9 @@ export type MasterIntent =
   | { type: "tab-prev" }
   | { type: "tab-close" }
   | { type: "factory"; sub: "list" | "show"; id?: string }
+  | { type: "plan" }
+  | { type: "cost" }
+  | { type: "eval" }
   | { type: "dashboard" }
   | { type: "help" }
   | { type: "exit" }
@@ -54,7 +59,7 @@ Leader: ctrl-g then n/p/w to next/prev/close a nested agent tab.
 
 Slash (master, not the child CLI):
   /check /work <id> /claude /gemini /codex /cursor /shell
-  /tab next|prev|close /factory list|show /dashboard /help /exit
+  /tab next|prev|close /factory list|show /plan /cost /eval /dashboard /help /exit
   /merge and /pass are rejected.
 
 Nested CLIs use their own OAuth. Tinkerbot does not store vendor tokens.
@@ -106,6 +111,9 @@ export function parseMasterIntent(line: string): MasterIntent {
       return { type: "reject", command: "/factory", reason: "/factory list|show only. Sync stays tb factory sync." };
     }
     if (command === "dashboard") return { type: "dashboard" };
+    if (command === "plan") return { type: "plan" };
+    if (command === "cost") return { type: "cost" };
+    if (command === "eval") return { type: "eval" };
     if (command === "help") return { type: "help" };
     if (command === "exit" || command === "quit") return { type: "exit" };
     return { type: "reject", command: `/${command}`, reason: `Unknown master command /${command}. Type /help.` };
@@ -121,6 +129,24 @@ export function applyMasterIntent(state: MasterState, intent: MasterIntent): Mas
   if (intent.type === "check") return { ...state, active: 0, status: "tb check is the only verdict. Nested agent text cannot write PASS." };
   if (intent.type === "dashboard") return { ...state, status: "Opening the hosted dashboard." };
   if (intent.type === "factory") return { ...state, status: intent.sub === "show" ? `factory show ${intent.id ?? ""}`.trim() : "factory list (hosted inspect only)" };
+  if (intent.type === "plan") {
+    const id = "plan";
+    if (state.tabs.some((tab) => tab.id === id)) return { ...state, active: state.tabs.findIndex((tab) => tab.id === id), status: "Execution plan. Skip reasons are policy-checked. tb check is the verdict." };
+    const tabs = [...state.tabs, { id, kind: "plan" as const, title: "Plan" }];
+    return { ...state, tabs, active: tabs.length - 1, status: "Execution plan. Agents cannot self-approve." };
+  }
+  if (intent.type === "cost") {
+    const id = "cost";
+    if (state.tabs.some((tab) => tab.id === id)) return { ...state, active: state.tabs.findIndex((tab) => tab.id === id) };
+    const tabs = [...state.tabs, { id, kind: "cost" as const, title: "Cost" }];
+    return { ...state, tabs, active: tabs.length - 1, status: "Estimate vs actual. Seat billing unchanged. BYOK is not an invoice." };
+  }
+  if (intent.type === "eval") {
+    const id = "eval";
+    if (state.tabs.some((tab) => tab.id === id)) return { ...state, active: state.tabs.findIndex((tab) => tab.id === id) };
+    const tabs = [...state.tabs, { id, kind: "eval" as const, title: "Eval" }];
+    return { ...state, tabs, active: tabs.length - 1, status: "Eval scorers are advisory and cannot upgrade tb check." };
+  }
   if (intent.type === "work") {
     const id = `work:${intent.id}`;
     if (state.tabs.some((tab) => tab.id === id)) return { ...state, active: state.tabs.findIndex((tab) => tab.id === id) };
@@ -141,6 +167,36 @@ export function applyMasterIntent(state: MasterState, intent: MasterIntent): Mas
     return { ...state, tabs, active: Math.min(state.active, tabs.length - 1) };
   }
   return state;
+}
+
+export function applyLeaderChord(state: MasterState, key: string): MasterState {
+  const chord = key.length === 1 ? key.toLowerCase() : key;
+  if (chord === "n" || chord === "\t") return applyMasterIntent(state, { type: "tab-next" });
+  if (chord === "p") return applyMasterIntent(state, { type: "tab-prev" });
+  if (chord === "w") return applyMasterIntent(state, { type: "tab-close" });
+  return { ...state, status: "Leader ctrl-g: n next · p prev · w close. Nested CLIs keep their own OAuth." };
+}
+
+export function renderTabBody(state: MasterState): string {
+  const tab = state.tabs[state.active];
+  if (!tab || tab.kind === "check") {
+    return state.checkLog
+      ?? "Check tab. Type /check to run tb check. Nested Claude/Gemini/Codex/Cursor output is not a verdict.";
+  }
+  if (tab.kind === "work") {
+    return state.workLog
+      ?? `Work ${tab.workOrderId}. Hosted attach is transcript only. Missing ingest is UNKNOWN. Humans merge.`;
+  }
+  if (tab.kind === "plan") return "Plan tab. Dry-run stages, skip reasons, and estimates. No WorkOrder is created here.";
+  if (tab.kind === "cost") return "Cost tab. Managed COGS vs BYOK spend vs seat invoice. Scorers cannot change a verdict.";
+  if (tab.kind === "eval") return "Eval tab. Compare personal suite vs baseline. upgradesVerdict stays false.";
+  return [
+    `${tab.title} nested agentic terminal`,
+    "Spawn the local CLI on PATH. Login stays in the child (`claude auth login`, `gemini`, `codex`, Cursor agent).",
+    "Tinkerbot does not store vendor tokens and will not merge.",
+    "A raw PTY can still run `gh pr merge` if you could. tb check remains the only PASS.",
+    "Leave the child, then ctrl-g n/p/w or /tab next|prev|close.",
+  ].join("\n");
 }
 
 export function renderTabStrip(state: MasterState): string {

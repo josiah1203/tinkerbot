@@ -64,6 +64,7 @@ import {
 import { runDoctor, renderDoctor } from "./doctor";
 import { clearStoredCredentials, hostedSession, saveStoredCredentials } from "./credentials";
 import { loadFactoryDefinition, validateAgentReceipt, buildFactoryStarter } from "../../factory/src";
+import { evalCli, executeLocalRun, factoryPlanPayload, localDashboardPayload } from "./runtime-cli";
 import { isInteractiveTty, runTui, TUI_HELP, type TuiDeps, type TuiOptions } from "./tui/index";
 import { isAgentId, listAgentsJson, runMasterTuiInteractive } from "../../tui/src";
 import { planVerificationStreams } from "./tui/streams";
@@ -121,6 +122,9 @@ interface CliOptions {
   help: boolean;
   once?: boolean;
   agent?: string;
+  local?: boolean;
+  profile?: string;
+  allowProcessRunner?: boolean;
 }
 
 function valueAfter(rest: string[], index: number, flag: string): string {
@@ -143,7 +147,7 @@ function parseArgs(argv: string[]): CliOptions {
   const rest = first === "--version" || first === "-V" || first === "--help" || first === "-h" ? argv.slice(1) : argv.slice(1);
   const options: CliOptions = { command, head: "HEAD", format: "terminal", baseTests: true, verbose: false, help: false };
   let index = 0;
-  if (["config", "baseline", "policy", "history", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "org", "github", "factory", "work", "run", "receipt", "cell", "product", "skill", "evolution", "billing", "tui"].includes(command) && rest[0] && !rest[0].startsWith("--")) {
+  if (["config", "baseline", "policy", "history", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "org", "github", "factory", "work", "run", "receipt", "cell", "product", "skill", "evolution", "billing", "tui", "eval"].includes(command) && rest[0] && !rest[0].startsWith("--")) {
     options.subcommand = rest[0];
     index = 1;
   }
@@ -193,8 +197,11 @@ function parseArgs(argv: string[]): CliOptions {
     else if (token === "--verbose") options.verbose = true;
     else if (token === "--once") options.once = true;
     else if (token === "--agent") options.agent = valueAfter(rest, index++, token);
+    else if (token === "--local") options.local = true;
+    else if (token === "--profile") options.profile = valueAfter(rest, index++, token);
+    else if (token === "--allow-process-runner") options.allowProcessRunner = true;
     else if (token.startsWith("--")) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown option: ${token}`);
-    else if (["policy", "history", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "org", "github", "factory", "work", "run", "receipt", "cell", "product", "skill", "evolution", "billing", "tui"].includes(command) && !options.positional) options.positional = token;
+    else if (["policy", "history", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "org", "github", "factory", "work", "run", "receipt", "cell", "product", "skill", "evolution", "billing", "tui", "eval"].includes(command) && !options.positional) options.positional = token;
     else throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unexpected argument: ${token}`);
   }
   if (!["terminal", "json", "markdown", "sarif", "review-context", "receipt", "change-assurance", "release-manifest"].includes(options.format)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown report format: ${options.format}`);
@@ -214,9 +221,10 @@ function parseArgs(argv: string[]): CliOptions {
   if (command === "org" && options.subcommand === "switch" && !options.positional) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "org switch requires an organization identifier");
   if (command === "billing" && options.subcommand && !["summary", "catalog", "portal"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown billing command: ${options.subcommand}`);
   if (command === "github" && options.subcommand && options.subcommand !== "run") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown github command: ${options.subcommand}`);
-  if (command === "factory" && options.subcommand && !["list", "show", "validate", "sync", "mcp", "new"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown factory command: ${options.subcommand}`);
+  if (command === "factory" && options.subcommand && !["list", "show", "validate", "sync", "mcp", "new", "plan"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown factory command: ${options.subcommand}`);
   if (command === "work" && options.subcommand && !["list", "show", "retry", "approve", "cancel", "take", "return"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown work command: ${options.subcommand}`);
-  if (command === "run" && options.subcommand && !["show", "logs"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown run command: ${options.subcommand}`);
+  if (command === "run" && options.subcommand && !["show", "logs"].includes(options.subcommand) && !options.local) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown run command: ${options.subcommand}`);
+  if (command === "eval" && options.subcommand && !["init", "add", "run", "compare", "baseline", "export"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown eval command: ${options.subcommand}`);
   if (command === "cell" && options.subcommand && !["list", "show"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown cell command: ${options.subcommand}`);
   if (command === "product" && options.subcommand && !["list", "show"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown product command: ${options.subcommand}`);
   if (command === "skill" && options.subcommand && !["list", "show"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown skill command: ${options.subcommand}`);
@@ -450,25 +458,26 @@ function versionText(root = process.cwd()): string {
 function help(command?: string): string {
   if (command === "tui") return TUI_HELP;
   if (command === "agents") return "Usage: tb agents\n\nList local agent CLIs on PATH. OAuth stays in the child CLI. Tinkerbot does not store vendor tokens.\n";
-  if (command === "dashboard") return "Usage: tb dashboard\n\nOpen the authenticated Tinkerbot dashboard in a browser.\n";
+  if (command === "dashboard") return "Usage: tb dashboard [--local]\n\nOpen the authenticated Tinkerbot dashboard, or print local plan/cost/eval state with --local.\n";
   if (command === "login") return "Usage: tb login --token SESSION [--url https://control.example]\n\nStore a short-lived control-plane session. Browser login opens the public website.\n";
-  if (command === "factory") return "Usage: tb factory list|show|validate|sync|mcp|new\n\n`tb factory new` writes a local .tinkerbot starter tree. Agents and automations stay git-edited. Then `tb factory sync`.\n";
+  if (command === "factory") return "Usage: tb factory list|show|validate|sync|mcp|new|plan\n\n`tb factory new` writes a local .tinkerbot starter tree. `tb factory plan` prints a dry-run ExecutionPlan. Then `tb factory sync` for hosted upload.\n";
   if (command === "work") return "Usage: tb work list|show|retry|approve|cancel|take|return [id]\n";
   if (command === "cell") return "Usage: tb cell list\n";
   if (command === "product") return "Usage: tb product list|show [id]\n";
   if (command === "skill") return "Usage: tb skill list|show [id]\n";
   if (command === "evolution") return "Usage: tb evolution list|show|approve [id]\n";
-  if (command === "run") return "Usage: tb run show|logs <id>\n";
+  if (command === "run") return "Usage: tb run show|logs <id>\n       tb run --local [--profile solo] [--allow-process-runner]\n";
+  if (command === "eval") return "Usage: tb eval init|add|run|compare|baseline|export\n\nPortable personal evals. Scorers are advisory and never upgrade tb check.\n";
   if (command === "org") return "Usage: tb org list|switch|seats [organization-id]\n";
   if (command === "billing") return "Usage: tb billing summary|catalog|portal\n\nHosted billing reads the server catalog and seat quantity. Portal opens the Stripe customer portal URL.\n";
   if (command === "receipt") return "Usage: tb receipt validate --input FILE\n\nValidate an agent execution receipt. A valid receipt never upgrades a failed or unknown verdict.\n";
-  if (command === "serve") return "Usage: tb serve is retired. Use the hosted dashboard.\n";
-  if (command === undefined) return "Tinkerbot — factory operating system and deterministic verification\n\nHosted: login, logout, whoami, org list|switch|seats, billing summary|catalog|portal, dashboard, factory, work, cell, product, skill, evolution, run, verify\nCore: tui, agents, check, test-integrity, impact, contracts, fixtures, select-tests, artifacts, history, report, doctor\nAssurance: proof create|verify|replay; repo inspect|map; change contract validate|assess; release assess; outcome record; evidence\n\nUse tb <command> --help for command details.\n";
+  if (command === "serve") return "Usage: tb serve is retired. Use the hosted dashboard or `tb dashboard --local`.\n";
+  if (command === undefined) return "Tinkerbot — factory operating system and deterministic verification\n\nHosted: login, logout, whoami, org list|switch|seats, billing summary|catalog|portal, dashboard, factory, work, cell, product, skill, evolution, run, verify\nLocal runtime: tb run --local, tb factory plan, tb eval, tb dashboard --local\nCore: tui, agents, check, test-integrity, impact, contracts, fixtures, select-tests, artifacts, history, report, doctor\nAssurance: proof create|verify|replay; repo inspect|map; change contract validate|assess; release assess; outcome record; evidence\n\nUse tb <command> --help for command details.\n";
   if (["proof", "repo", "change", "change-set", "release", "outcome", "evidence"].includes(command ?? "")) return `Usage: tb ${command} ...\n\nAssurance commands emit machine-readable JSON with --format json.\n`;
   if (["check", "test-integrity", "impact", "contracts", "fixtures", "select-tests"].includes(command ?? "")) return `Usage: tb ${command} [options]\n\nOptions:\n  --base REF              base revision\n  --head REF              head revision (default: HEAD)\n  --format FORMAT         terminal, json, markdown, or sarif\n  --output FILE           write rendered output\n  --config FILE           configuration path\n  --policy PACK           policy pack\n  --mode MODE             advisory or blocking\n  --fail-on RULES         comma-separated impact rules\n  --timeout SECONDS       analysis timeout\n  --max-files N           bound files analyzed\n  --max-findings N        bound findings emitted\n  --mutation-enabled BOOL enable/disable mutation testing\n  --mutation-max N        maximum mutants\n  --no-base-tests         skip base/head execution\n  --verbose               include additional diagnostics\n`;
   if (command === "artifacts") return "Usage: tb artifacts --input FILE [--type TYPE] [--format json|terminal]\n";
-  return `Tinkerbot — factory operating system and deterministic verification\n\nCommands:\n  tb --version\n  tb login --token SESSION\n  tb tui\n  tb dashboard\n  tb factory validate|list|show|sync|mcp|new
-  tb agents\n  tb work list|show|take|return|approve\n  tb cell list\n  tb product list\n  tb skill list\n  tb evolution list|approve\n  tb run show <id>\n  tb check --base origin/main --head HEAD\n  tb doctor\n`;
+  return `Tinkerbot — factory operating system and deterministic verification\n\nCommands:\n  tb --version\n  tb login --token SESSION\n  tb tui\n  tb dashboard [--local]\n  tb factory validate|list|show|sync|mcp|new|plan
+  tb run --local [--profile solo]\n  tb eval init|add|run|compare|baseline|export\n  tb agents\n  tb work list|show|take|return|approve\n  tb cell list\n  tb product list\n  tb skill list\n  tb evolution list|approve\n  tb run show <id>\n  tb check --base origin/main --head HEAD\n  tb doctor\n`;
 }
 
 function legacyInvocationWarning(): void {
@@ -890,12 +899,26 @@ export function runCli(argv = process.argv.slice(2)): number {
   try {
     if (options.help || options.command === "help" || options.command === "-h") { process.stdout.write(help(options.command === "help" ? undefined : options.command)); return EXIT_CODES.PASS; }
     if (options.command === "version") { process.stdout.write(versionText()); return EXIT_CODES.PASS; }
-    if (options.command === "dashboard") return dashboardCommand();
+    if (options.command === "dashboard") {
+      if (options.local) {
+        process.stdout.write(`${JSON.stringify(localDashboardPayload(getRepoRoot(process.cwd())), null, 2)}\n`);
+        return EXIT_CODES.PASS;
+      }
+      return dashboardCommand();
+    }
     if (options.command === "tui") return tuiCommand(options);
     if (options.command === "login") return loginCommand(options);
     if (options.command === "factory" && options.subcommand === "validate") return factoryValidateCommand();
+    if (options.command === "factory" && options.subcommand === "plan") {
+      process.stdout.write(`${JSON.stringify(factoryPlanPayload(getRepoRoot(process.cwd()), options.profile, options.positional), null, 2)}\n`);
+      return EXIT_CODES.PASS;
+    }
     if (options.command === "factory" && options.subcommand === "mcp") return factoryMcpCommand();
     if (options.command === "factory" && options.subcommand === "new") return factoryNewCommand(options);
+    if (options.command === "eval") {
+      process.stdout.write(`${JSON.stringify(evalCli(getRepoRoot(process.cwd()), options.subcommand ?? "run", options.positional), null, 2)}\n`);
+      return EXIT_CODES.PASS;
+    }
     if (options.command === "agents") {
       process.stdout.write(listAgentsJson(process.env));
       return EXIT_CODES.PASS;
@@ -1082,6 +1105,34 @@ function tuiCommand(options: CliOptions): number {
   return runTui(tuiOptionsFrom(options), makeTuiDeps());
 }
 
+export async function dispatchTui(options: TuiOptions, deps: TuiDeps, interactive: boolean): Promise<number> {
+  if (interactive && !options.once && !options.help) {
+    const agent = isAgentId(options.agent) ? options.agent : undefined;
+    return runMasterTuiInteractive({
+      workOrderId: options.subcommand === "work" ? options.positional : undefined,
+      agent,
+      help: options.help,
+    }, {
+      stdout: deps.stdout,
+      stderr: deps.stderr,
+      cwd: deps.cwd,
+      env: deps.env,
+      stdin: deps.stdin,
+      header: () => {
+        const header = deps.header();
+        return { repo: header.repo, base: header.base, head: header.head };
+      },
+      openDashboard: deps.openDashboard,
+      createReport: (input) => deps.createReport({ cwd: input.cwd, command: "check", base: options.base, head: options.head, runBaseTests: options.baseTests }),
+      fetchWork: deps.fetchWork ? (id) => {
+        const view = deps.fetchWork!(id);
+        return { summary: `Work ${id}. Agent stage text is not a verdict.`, verdict: view.workOrder?.verificationVerdict };
+      } : undefined,
+    });
+  }
+  return runTui(options, deps);
+}
+
 function hostedConfigurationError(): string | undefined {
   const session = hostedSession();
   const base = session.url?.replace(/\/$/, "");
@@ -1114,7 +1165,7 @@ async function hostedRequest(pathname: string, method = "GET", payload?: Record<
 async function runHostedCli(argv: string[]): Promise<number | undefined> {
   const command = argv[0];
   if (!command) return undefined;
-    if (command === "factory" && argv[1] && argv[1] !== "validate" && argv[1] !== "mcp" && argv[1] !== "new") {
+    if (command === "factory" && argv[1] && argv[1] !== "validate" && argv[1] !== "mcp" && argv[1] !== "new" && argv[1] !== "plan") {
     const subcommand = argv[1];
     const id = argv[2];
     const pathname = subcommand === "list" || !id ? "/factories" : `/factories/${id}`;
@@ -1159,6 +1210,7 @@ async function runHostedCli(argv: string[]): Promise<number | undefined> {
     return EXIT_CODES.PASS;
   }
   if (command === "run") {
+    if (argv.includes("--local")) return undefined;
     const id = argv[2] ?? argv[1];
     if (!id || id === "show" || id === "logs") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb run show requires a run id.");
     const response = await hostedRequest(`/runs/${id}${argv[1] === "logs" ? "/events" : ""}`);
@@ -1232,6 +1284,12 @@ async function runHostedCli(argv: string[]): Promise<number | undefined> {
 
 export async function mainAsync(argv = process.argv.slice(2)): Promise<number> {
   try {
+    if (argv[0] === "run" && argv.includes("--local")) {
+      const options = parseArgs(argv);
+      const payload = await executeLocalRun(getRepoRoot(process.cwd()), { profile: options.profile, allowProcessRunner: options.allowProcessRunner, text: options.positional });
+      process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+      return EXIT_CODES.PASS;
+    }
     if (argv[0] === "tui") {
       const options = parseArgs(argv);
       const deps: TuiDeps = {
@@ -1247,27 +1305,11 @@ export async function mainAsync(argv = process.argv.slice(2)): Promise<number> {
           return { ok: true, message: action === "approve" ? "Specification approval recorded. Humans still merge." : `${action} recorded.` };
         },
       };
-      if (isInteractiveTty(process.stdout, process.stdin, process.env) && !options.once && !options.help) {
-        const agent = isAgentId(options.agent) ? options.agent : undefined;
-        return runMasterTuiInteractive({
-          workOrderId: options.subcommand === "work" ? options.positional : undefined,
-          agent,
-          help: options.help,
-        }, {
-          stdout: process.stdout,
-          stderr: process.stderr,
-          cwd: process.cwd(),
-          env: process.env,
-          stdin: process.stdin,
-          header: deps.header,
-          openDashboard: deps.openDashboard,
-        });
-      }
       if (options.subcommand === "work" && options.positional && deps.fetchWorkAsync) {
         const view = await deps.fetchWorkAsync(options.positional);
         deps.fetchWork = () => view;
       }
-      return runTui(tuiOptionsFrom(options), deps);
+      return dispatchTui(tuiOptionsFrom(options), deps, isInteractiveTty(process.stdout, process.stdin, process.env) && !options.once && !options.help);
     }
     const hosted = await runHostedCli(argv);
     return hosted ?? runCli(argv);

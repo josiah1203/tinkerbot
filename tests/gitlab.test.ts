@@ -19,4 +19,7 @@ test("GitLab job pipeline deployment and system hooks are rejected", () => {
     expect(result).toEqual({ accepted: false, reason: "unsafe_event" });
   }
   expect(admitGitlabWebhook({ payload: "{}", token: "nope", secret, eventName: "Issue Hook", deliveryId: "x" }).reason).toBe("invalid_token");
+  expect(admitGitlabWebhook({ payload: "{", token: secret, secret, eventName: "Issue Hook", deliveryId: "x" }).reason).toBe("malformed_payload");
+  expect(admitGitlabWebhook({ payload: "{}", token: secret, secret, eventName: "Issue Hook" }).reason).toBe("missing_delivery");
+  expect(admitGitlabWebhook({ payload: "[]", token: secret, secret, eventName: "Issue Hook", deliveryId: "x" }).reason).toBe("malformed_payload");
 });
