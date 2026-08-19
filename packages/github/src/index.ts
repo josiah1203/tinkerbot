@@ -5,7 +5,9 @@ export const LEGACY_CHECK_NAMES = ["PR Proof"] as const;
 export const TINKERBOT_COMMENT_MARKER = "<!-- tinkerbot:verify -->" as const;
 export const LEGACY_COMMENT_MARKERS = ["<!-- pr-proof:sticky -->"] as const;
 export const SAFE_PULL_REQUEST_ACTIONS = ["opened", "synchronize", "reopened", "ready_for_review"] as const;
+export const SAFE_ISSUE_ACTIONS = ["opened", "reopened", "edited"] as const;
 export const SAFE_INSTALLATION_ACTIONS = ["created", "deleted", "suspend", "unsuspend", "added", "removed"] as const;
+export const SAFE_SECURITY_EVENTS = ["dependabot_alert", "code_scanning_alert", "secret_scanning_alert"] as const;
 export const MAX_CHECK_ANNOTATIONS = 50;
 
 export type GitHubPermission = "none" | "read" | "write" | undefined;
@@ -121,8 +123,10 @@ export function admitWebhook(options: WebhookAdmissionOptions): WebhookAdmission
   const eventName = options.eventName;
   const action = eventAction(payload);
   const safePullRequest = isSafePullRequestEvent(eventName, action);
+  const safeIssue = eventName === "issues" && SAFE_ISSUE_ACTIONS.includes(action as (typeof SAFE_ISSUE_ACTIONS)[number]);
   const safeInstallation = (eventName === "installation" || eventName === "installation_repositories") && (!action || SAFE_INSTALLATION_ACTIONS.includes(action as (typeof SAFE_INSTALLATION_ACTIONS)[number]));
-  if (eventName === "pull_request_target" || (!safePullRequest && !safeInstallation)) {
+  const safeSecurity = Boolean(eventName && (SAFE_SECURITY_EVENTS as readonly string[]).includes(eventName));
+  if (eventName === "pull_request_target" || (!safePullRequest && !safeIssue && !safeInstallation && !safeSecurity)) {
     return { accepted: false, reason: eventName === "pull_request" || eventName === "installation" || eventName === "installation_repositories" ? "unsafe_action" : "unsafe_event", idempotencyKey: deliveryId, audit: createGitHubAuditEvent({ action: action ?? "webhook_rejected", deliveryId: options.deliveryId, repository: eventRepository(payload), installationId: eventNumber(payload, "installation_id"), repositoryId: eventNumber(payload, "repository_id"), outcome: "rejected" }) };
   }
   return {
@@ -251,4 +255,111 @@ export function hasLegacyCommentMarker(body: string | undefined): boolean {
 
 export function stableFindingFingerprint(finding: GitHubFindingAnnotation): string {
   return `sha256:${crypto.createHash("sha256").update(JSON.stringify({ ruleId: finding.ruleId ?? "", file: normalizeAnnotationPath(finding.file) ?? "repository", line: finding.startLine ?? finding.line ?? 0, message: oneLine(finding.message, "") })).digest("hex")}`;
+}
+
+export interface InlineReviewComment {
+  path: string;
+  line: number;
+  side: "RIGHT";
+  body: string;
+  commit_id: string;
+}
+
+export function sanitizePublicationBody(value: string, secrets: readonly string[] = [], limit = 8_000): string {
+  return redactGitHubSecrets(oneLine(value, "Tinkerbot factory update."), secrets).slice(0, limit);
+}
+
+export function inlineReviewComments(findings: readonly GitHubFindingAnnotation[], commitSha: string, dashboardUrl: string, cap = 20): InlineReviewComment[] {
+  if (!/^[0-9a-f]{7,40}$/i.test(commitSha)) return [];
+  return mapCheckAnnotations(findings, cap).map((annotation) => ({
+    path: annotation.path,
+    line: annotation.start_line,
+    side: "RIGHT" as const,
+    commit_id: commitSha,
+    body: sanitizePublicationBody(`${annotation.title}: ${annotation.message}\n\n[Open in Tinkerbot](${dashboardUrl})`),
+  }));
+}
+
+export function createGitHubAppJwt(appId: string, privateKeyPem: string, now = Date.now()): string {
+  const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
+  const iat = Math.floor(now / 1000) - 60;
+  const payload = Buffer.from(JSON.stringify({ iat, exp: iat + 600, iss: appId })).toString("base64url");
+  const signer = crypto.createSign("RSA-SHA256");
+  signer.update(`${header}.${payload}`);
+  return `${header}.${payload}.${signer.sign(privateKeyPem, "base64url")}`;
+}
+
+export async function mintInstallationToken(options: { appId: string; privateKeyPem: string; installationId: number; apiBaseUrl?: string; fetcher?: typeof fetch; now?: number }): Promise<string> {
+  const jwt = createGitHubAppJwt(options.appId, options.privateKeyPem, options.now);
+  const base = (options.apiBaseUrl ?? "https://api.github.com").replace(/\/$/, "");
+  const fetcher = options.fetcher ?? fetch;
+  const response = await fetcher(`${base}/app/installations/${options.installationId}/access_tokens`, { method: "POST", headers: { accept: "application/vnd.github+json", authorization: `Bearer ${jwt}`, "x-github-api-version": "2022-11-28" } });
+  if (!response.ok) throw new Error(`GitHub installation token mint failed (${response.status}).`);
+  const body = await response.json() as { token?: string };
+  if (!body.token) throw new Error("GitHub installation token mint returned no token.");
+  return body.token;
+}
+
+export interface GitHubPublisherRequest {
+  token: string;
+  repository: string;
+  apiBaseUrl?: string;
+  fetcher?: typeof fetch;
+}
+
+async function githubApi(request: GitHubPublisherRequest, method: string, pathname: string, body?: unknown): Promise<Response> {
+  const base = (request.apiBaseUrl ?? "https://api.github.com").replace(/\/$/, "");
+  const fetcher = request.fetcher ?? fetch;
+  return fetcher(`${base}${pathname}`, { method, headers: { accept: "application/vnd.github+json", authorization: `Bearer ${request.token}`, "x-github-api-version": "2022-11-28", ...(body ? { "content-type": "application/json" } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) });
+}
+
+export async function publishCheckRun(request: GitHubPublisherRequest, input: { headSha: string; verdict: string; summary: string; annotations: GitHubCheckAnnotation[]; detailsUrl?: string }): Promise<number | undefined> {
+  const response = await githubApi(request, "POST", `/repos/${request.repository}/check-runs`, {
+    name: TINKERBOT_CHECK_NAME,
+    head_sha: input.headSha,
+    status: "completed",
+    conclusion: checkConclusion(input.verdict),
+    details_url: input.detailsUrl,
+    output: { title: TINKERBOT_CHECK_NAME, summary: sanitizePublicationBody(input.summary, [], 64_000), annotations: input.annotations.slice(0, MAX_CHECK_ANNOTATIONS) },
+  });
+  if (!response.ok) return undefined;
+  const payload = await response.json() as { id?: number };
+  return payload.id;
+}
+
+export async function publishInlineComments(request: GitHubPublisherRequest, pullNumber: number, comments: InlineReviewComment[], event: "COMMENT" | "REQUEST_CHANGES" = "COMMENT"): Promise<boolean> {
+  if (!comments.length) return true;
+  const response = await githubApi(request, "POST", `/repos/${request.repository}/pulls/${pullNumber}/reviews`, { commit_id: comments[0]?.commit_id, event, comments: comments.slice(0, 20) });
+  return response.ok;
+}
+
+export async function dispatchGitHubEnvironmentWorkflow(request: GitHubPublisherRequest, input: { workflow: string; ref: string; environment?: string }): Promise<boolean> {
+  const response = await githubApi(request, "POST", `/repos/${request.repository}/actions/workflows/${input.workflow}/dispatches`, { ref: input.ref, inputs: input.environment ? { environment: input.environment } : {} });
+  return response.ok;
+}
+
+export async function createImplementPullRequest(request: GitHubPublisherRequest, input: { title: string; head: string; base?: string; body: string }): Promise<number | undefined> {
+  if (input.head === "main" || input.head === "master" || input.head === "production") return undefined;
+  const response = await githubApi(request, "POST", `/repos/${request.repository}/pulls`, { title: input.title, head: input.head, base: input.base ?? "main", body: sanitizePublicationBody(input.body) });
+  if (!response.ok) return undefined;
+  const payload = await response.json() as { number?: number };
+  return typeof payload.number === "number" ? payload.number : undefined;
+}
+
+export function githubEventKind(eventName: string | undefined): "installation" | "pull_request" | "issue" | "dependabot" | "code_scanning" | "secret_scanning" | "deployment" | "check_run" | "other" {
+  if (eventName === "installation" || eventName === "installation_repositories") return "installation";
+  if (eventName === "pull_request") return "pull_request";
+  if (eventName === "issues") return "issue";
+  if (eventName === "dependabot_alert") return "dependabot";
+  if (eventName === "code_scanning_alert") return "code_scanning";
+  if (eventName === "secret_scanning_alert") return "secret_scanning";
+  if (eventName === "deployment" || eventName === "deployment_status") return "deployment";
+  if (eventName === "check_run" || eventName === "workflow_run") return "check_run";
+  return "other";
+}
+
+export function githubInstallationAccount(payload: Record<string, unknown>): { id?: number; login?: string } {
+  const installation = payload.installation && typeof payload.installation === "object" ? payload.installation as Record<string, unknown> : {};
+  const account = (installation.account && typeof installation.account === "object" ? installation.account : payload.account && typeof payload.account === "object" ? payload.account : {}) as Record<string, unknown>;
+  return { id: typeof account.id === "number" ? account.id : undefined, login: typeof account.login === "string" ? account.login : undefined };
 }

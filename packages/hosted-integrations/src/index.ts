@@ -31,7 +31,7 @@ export interface SessionStore {
 }
 
 export interface AuthProvider {
-  authorizationUrl(input: { redirectUri: string; state: string; connectionId?: string }): string;
+  authorizationUrl(input: { redirectUri: string; state: string; connectionId?: string; codeChallenge?: string; nonce?: string }): string;
   exchangeCode(input: { code: string; codeVerifier?: string; ipAddress?: string; userAgent?: string }): Promise<HostedSession>;
   refreshSession(input: { refreshToken: string; organizationId?: string }): Promise<HostedSession>;
 }
@@ -91,10 +91,7 @@ export interface StripePlan {
   id: string;
   monthlyPriceId: string;
   annualPriceId?: string;
-  privateRepositoryLimit: number;
-  memberLimit: number;
-  retentionDays: number;
-  features: Record<string, boolean>;
+  catalogVersion?: string;
 }
 
 export interface CheckoutSessionInput {
@@ -105,6 +102,8 @@ export interface CheckoutSessionInput {
   cancelUrl: string;
   customerId?: string;
   customerEmail?: string;
+  seatQuantity?: number;
+  trialPeriodDays?: number;
   idempotencyKey: string;
 }
 
@@ -156,6 +155,8 @@ export interface TenantMembership {
   userId: string;
   role: TenantRole;
   status: MembershipStatus;
+  identityType?: "human" | "bot" | "github_app" | "service" | "system";
+  accessState?: "enabled" | "suspended" | "disabled";
   updatedAt?: string;
 }
 
@@ -390,7 +391,7 @@ export class WorkOSAuthProvider implements AuthProvider {
     this.fetcher = config.fetcher ?? fetch;
   }
 
-  authorizationUrl(input: { redirectUri: string; state: string; connectionId?: string }): string {
+  authorizationUrl(input: { redirectUri: string; state: string; connectionId?: string; codeChallenge?: string; nonce?: string }): string {
     const clientId = requiredSecret(this.clientId, "WORKOS_CLIENT_ID", "workos");
     const url = new URL("/user_management/authorize", this.apiBaseUrl);
     url.searchParams.set("response_type", "code");
@@ -398,6 +399,11 @@ export class WorkOSAuthProvider implements AuthProvider {
     url.searchParams.set("redirect_uri", input.redirectUri);
     url.searchParams.set("state", input.state);
     if (input.connectionId) url.searchParams.set("connection_id", input.connectionId);
+    if (input.codeChallenge) {
+      url.searchParams.set("code_challenge", input.codeChallenge);
+      url.searchParams.set("code_challenge_method", "S256");
+    }
+    if (input.nonce) url.searchParams.set("nonce", input.nonce);
     return url.toString();
   }
 
@@ -602,7 +608,9 @@ export class StripeBillingProvider implements BillingProvider {
     if (!plan) throw new ProviderError("stripe", `Billing plan ${input.planId} is not configured on the server.`, { code: "plan_not_configured" });
     const price = input.interval === "year" ? plan.annualPriceId : plan.monthlyPriceId;
     if (!price) throw new ProviderError("stripe", `Billing interval ${input.interval} is not configured for plan ${input.planId}.`, { code: "price_not_configured" });
-    const payload = await this.post("/v1/checkout/sessions", { mode: "subscription", success_url: input.successUrl, cancel_url: input.cancelUrl, client_reference_id: input.organizationId, customer: input.customerId, customer_email: input.customerEmail, "line_items": [{ price, quantity: 1 }], "subscription_data": { metadata: { organization_id: input.organizationId, plan_id: plan.id, billing_interval: input.interval } }, metadata: { organization_id: input.organizationId, plan_id: plan.id } }, input.idempotencyKey);
+    const subscriptionData: Record<string, unknown> = { metadata: { organization_id: input.organizationId, plan_id: plan.id, billing_interval: input.interval } };
+    if (input.trialPeriodDays && input.trialPeriodDays > 0) subscriptionData.trial_period_days = input.trialPeriodDays;
+    const payload = await this.post("/v1/checkout/sessions", { mode: "subscription", success_url: input.successUrl, cancel_url: input.cancelUrl, client_reference_id: input.organizationId, customer: input.customerId, customer_email: input.customerEmail, "line_items": [{ price, quantity: Math.max(0, Math.floor(input.seatQuantity ?? 0)) }], "subscription_data": subscriptionData, metadata: { organization_id: input.organizationId, plan_id: plan.id } }, input.idempotencyKey);
     if (typeof payload.id !== "string") throw new ProviderError("stripe", "Stripe returned an incomplete checkout session.", { code: "provider_invalid_response" });
     return { id: payload.id, url: typeof payload.url === "string" ? payload.url : undefined };
   }
@@ -617,6 +625,39 @@ export class StripeBillingProvider implements BillingProvider {
     const payload = await this.post(`/v1/subscriptions/${encodeURIComponent(input.subscriptionId)}`, { cancel_at_period_end: input.cancelAtPeriodEnd }, input.idempotencyKey);
     if (typeof payload.id !== "string") throw new ProviderError("stripe", "Stripe returned an incomplete subscription.", { code: "provider_invalid_response" });
     return { id: payload.id, status: typeof payload.status === "string" ? payload.status : undefined, cancelAtPeriodEnd: typeof payload.cancel_at_period_end === "boolean" ? payload.cancel_at_period_end : undefined };
+  }
+
+  async retrieveSubscription(subscriptionId: string): Promise<Record<string, unknown>> {
+    const secretKey = requiredSecret(this.secretKey, "STRIPE_SECRET_KEY", "stripe");
+    return jsonRequest("stripe", this.fetcher, `${this.apiBaseUrl}/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, { method: "GET", headers: { accept: "application/json", authorization: basicAuth(secretKey) } });
+  }
+
+  async updateSubscriptionQuantity(input: { subscriptionId: string; quantity: number; idempotencyKey: string }): Promise<{ id: string; quantity?: number }> {
+    const subscription = await this.retrieveSubscription(input.subscriptionId);
+    const items = recordValue(subscription.items);
+    const data = Array.isArray(items.data) ? items.data : [];
+    const first = data[0] && typeof data[0] === "object" ? data[0] as Record<string, unknown> : undefined;
+    const itemId = typeof first?.id === "string" ? first.id : undefined;
+    if (!itemId) throw new ProviderError("stripe", "Stripe subscription has no billable item to update.", { code: "subscription_item_missing" });
+    const payload = await this.post(`/v1/subscription_items/${encodeURIComponent(itemId)}`, { quantity: Math.max(0, Math.floor(input.quantity)), proration_behavior: "create_prorations" }, input.idempotencyKey);
+    if (typeof payload.id !== "string") throw new ProviderError("stripe", "Stripe returned an incomplete subscription item.", { code: "provider_invalid_response" });
+    return { id: payload.id, quantity: typeof payload.quantity === "number" ? payload.quantity : undefined };
+  }
+
+  async changeSubscriptionPrice(input: { subscriptionId: string; priceId: string; quantity: number; prorationBehavior: "create_prorations" | "none"; idempotencyKey: string }): Promise<{ id: string; status?: string }> {
+    const subscription = await this.retrieveSubscription(input.subscriptionId);
+    const items = recordValue(subscription.items);
+    const data = Array.isArray(items.data) ? items.data : [];
+    const first = data[0] && typeof data[0] === "object" ? data[0] as Record<string, unknown> : undefined;
+    const itemId = typeof first?.id === "string" ? first.id : undefined;
+    if (!itemId) throw new ProviderError("stripe", "Stripe subscription has no billable item to update.", { code: "subscription_item_missing" });
+    const payload = await this.post(`/v1/subscriptions/${encodeURIComponent(input.subscriptionId)}`, {
+      items: [{ id: itemId, price: input.priceId, quantity: Math.max(0, Math.floor(input.quantity)) }],
+      proration_behavior: input.prorationBehavior,
+      cancel_at_period_end: false,
+    }, input.idempotencyKey);
+    if (typeof payload.id !== "string") throw new ProviderError("stripe", "Stripe returned an incomplete subscription.", { code: "provider_invalid_response" });
+    return { id: payload.id, status: typeof payload.status === "string" ? payload.status : undefined };
   }
 
   async handleWebhook(payload: string, signatureHeader: string | null | undefined, ledger: WebhookLedger, onEvent: (event: StripeWebhookEvent) => Promise<void>, options: { nowSeconds?: number; toleranceSeconds?: number } = {}): Promise<{ duplicate: boolean; event: StripeWebhookEvent }> {
@@ -829,7 +870,7 @@ export class D1TenantStore implements TenantAccessStore {
   }
 
   async countSeatUsage(organizationId: string): Promise<number> {
-    const row = await this.database.prepare("SELECT COUNT(*) AS count FROM tinkerbot_memberships WHERE organization_id = ?1 AND status = 'active'").bind(organizationId).first<{ count?: number | string }>();
+    const row = await this.database.prepare("SELECT COUNT(*) AS count FROM tinkerbot_memberships WHERE organization_id = ?1 AND status = 'active' AND COALESCE(identity_type, 'human') = 'human' AND COALESCE(access_state, 'enabled') = 'enabled'").bind(organizationId).first<{ count?: number | string }>();
     const count = typeof row?.count === "number" ? row.count : Number(row?.count);
     return Number.isFinite(count) && count >= 0 ? Math.trunc(count) : 0;
   }
@@ -882,7 +923,9 @@ export class D1TenantStore implements TenantAccessStore {
   async upsertMembership(membership: TenantMembership): Promise<void> {
     if (!isTenantRole(membership.role) || !isMembershipStatus(membership.status)) throw new Error("Invalid tenant membership state.");
     const updatedAt = membership.updatedAt ?? new Date().toISOString();
-    await this.database.prepare("INSERT INTO tinkerbot_memberships (organization_id, user_id, role, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5) ON CONFLICT(organization_id, user_id) DO UPDATE SET role = excluded.role, status = excluded.status, updated_at = excluded.updated_at WHERE excluded.updated_at >= tinkerbot_memberships.updated_at").bind(membership.organizationId, membership.userId, membership.role, membership.status, updatedAt, updatedAt).run();
+    const identityType = membership.identityType ?? "human";
+    const accessState = membership.accessState ?? (membership.status === "active" ? "enabled" : "disabled");
+    await this.database.prepare("INSERT INTO tinkerbot_memberships (organization_id, user_id, role, status, identity_type, access_state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) ON CONFLICT(organization_id, user_id) DO UPDATE SET role = excluded.role, status = excluded.status, identity_type = excluded.identity_type, access_state = excluded.access_state, updated_at = excluded.updated_at WHERE excluded.updated_at >= tinkerbot_memberships.updated_at").bind(membership.organizationId, membership.userId, membership.role, membership.status, identityType, accessState, updatedAt, updatedAt).run();
   }
 }
 
@@ -1021,17 +1064,69 @@ export class R2JsonEvidenceStore implements EvidenceStore {
   }
 }
 
+/** Optional customer S3/GCS-compatible HTTP replica. Failures never change a tb check verdict. */
+export class HttpEvidenceReplica implements EvidenceStore {
+  constructor(
+    private readonly endpoint: string,
+    private readonly token?: string,
+    private readonly fetchImpl: typeof fetch = fetch,
+  ) {}
+
+  async put(key: string, value: unknown): Promise<void> {
+    const response = await this.fetchImpl(`${this.endpoint.replace(/\/$/, "")}/${key}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) },
+      body: JSON.stringify(value),
+    });
+    if (!response.ok) throw new Error(`Evidence export HTTP ${response.status}`);
+  }
+
+  async get<T>(): Promise<T | null> {
+    return null;
+  }
+
+  async delete(): Promise<void> {
+    return;
+  }
+}
+
+export class FanoutEvidenceStore implements EvidenceStore {
+  constructor(private readonly primary: EvidenceStore, private readonly replica?: EvidenceStore) {}
+
+  async put(key: string, value: unknown): Promise<void> {
+    await this.primary.put(key, value);
+    if (!this.replica) return;
+    try { await this.replica.put(key, value); } catch { /* replica fan-out cannot set or rewrite a verification verdict */ }
+  }
+
+  async get<T>(key: string): Promise<T | null> {
+    return this.primary.get<T>(key);
+  }
+
+  async delete(key: string): Promise<void> {
+    await this.primary.delete(key);
+  }
+}
+
+export function evidenceStoreFromEnv(input: { bucket?: R2BucketLike; exportEndpoint?: string; exportToken?: string; fetchImpl?: typeof fetch }): EvidenceStore | undefined {
+  if (!input.bucket) return undefined;
+  const primary = new R2JsonEvidenceStore(input.bucket);
+  const replica = input.exportEndpoint ? new HttpEvidenceReplica(input.exportEndpoint, input.exportToken, input.fetchImpl) : undefined;
+  return new FanoutEvidenceStore(primary, replica);
+}
+
 export function parseStripePlans(value: unknown): StripePlan[] {
   if (typeof value !== "string" || !value.trim()) return [];
   try {
     const parsed = JSON.parse(value) as unknown;
     if (!Array.isArray(parsed)) return [];
+    const prohibited = ["memberLimit", "seatLimit", "privateRepositoryLimit", "repositoryLimit", "additionalRepositoryPrice", "perRepositoryPrice", "perRunPrice", "perTokenPrice", "factoryLimit"];
     const plans = parsed.filter((item): item is StripePlan => {
-      if (!item || typeof item !== "object") return false;
+      if (!item || typeof item !== "object" || Array.isArray(item)) return false;
       const plan = item as Record<string, unknown>;
+      if (prohibited.some((field) => Object.prototype.hasOwnProperty.call(plan, field))) return false;
       if (typeof plan.id !== "string" || !plan.id.trim() || typeof plan.monthlyPriceId !== "string" || !plan.monthlyPriceId.trim() || (plan.annualPriceId !== undefined && (typeof plan.annualPriceId !== "string" || !plan.annualPriceId.trim()))) return false;
-      for (const limit of [plan.privateRepositoryLimit, plan.memberLimit, plan.retentionDays]) if (!Number.isSafeInteger(limit) || (limit as number) < 0) return false;
-      if (!plan.features || typeof plan.features !== "object" || Array.isArray(plan.features) || Object.values(plan.features as Record<string, unknown>).some((flag) => typeof flag !== "boolean")) return false;
+      if (!["developer", "team", "business"].includes(plan.id)) return false;
       return true;
     });
     const ids = new Set<string>();

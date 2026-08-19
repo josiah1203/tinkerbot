@@ -1,32 +1,43 @@
 # Architecture
 
-Tinkerbot is a hosted change-assurance control plane with bounded client-side evidence preparation:
+Tinkerbot is a software production operating system. Cloudflare hosts the control plane, orchestration, AI, storage, usage, and dashboard. GitHub remains source control and merge authority. GitHub Actions are work cells for `tb check`. The deterministic engine is the quality laboratory woven through every stage.
 
 ```text
-Git diff + repository files
-          |
-          +--> git adapter ----> normalized diff
-          |
-          +--> language-core ---> language detection/capabilities
-          +--> parser ----------> multi-language symbol graph
-          |                             |
-          +--> coverage ---------+       +--> impact analysis
-          |                      |                    |
-          +--> test integrity ---+--------------------+
-                                 |
-                    shared report schema and verdict policy
-                                 |
-                  terminal client / JSON / Markdown / SARIF / GitHub Action
-                                 |
-                      authenticated hosted ingestion
-                                 |
-          organization policy, entitlements, and assurance state
+Organization → Portfolio → Product → Factory
+  → Production line → Work cell → Work order
+    → Run → Stage → Evidence → Decision → Outcome
 ```
 
-`core` owns configuration, identifiers, findings, verdicts, and report schemas. `git` is the only layer that reads revisions. `language-core` owns extension/test conventions and capability declarations. `language-validation` runs bounded read-only front-end checks without executing repository code. `parser` preserves the TypeScript compiler API adapter, resolves common workspace metadata, and dispatches bounded line-oriented adapters for Python, Go, Rust, C, and C++. `test-integrity`, `coverage`, `mutation`, and `impact-analysis` are independent analysis adapters. `reporters` are pure formatters. The CLI composes them; the GitHub Action is a thin wrapper around the CLI/report contract.
+Demand adapters (GitHub issues/PRs, GitLab MR/issues, Dependabot, code/secret scanning, Slack, Linear, Jira, MCP, incidents, support, roadmap, cron) normalize into a WorkOrder. The Foreman routes onto a versioned production line. It cannot invent workflows.
 
-The isolated `packages/tui` application is a Bun/OpenTUI client for the hosted control plane. It requires a control-plane URL, a session token, and a repository identifier; it loads server-authoritative assurance snapshots and invokes `tb verify` only to prepare and submit bounded evidence. The GitHub App/Action boundary publishes one `Tinkerbot Verify` Check Run, bounded annotations, a sticky summary, and source-minimized artifacts. It never executes untrusted pull-request code on an App server.
+```text
+Demand
+  → Product intent
+  → Specification and architecture
+  → Work cell (Sandbox / Actions / branch)
+  → Specialist agents
+  → tb check (authoritative verdict)
+  → Review / approval
+  → Release candidate / deployment record / rollback
+  → Outcome
+  → Factory Steward (proposals only; humans activate)
+```
 
-GitHub remains authoritative for pull requests, full diffs, changed-file navigation, review comments, threaded discussions, approvals, branch protections, required checks, merge controls, permissions, and audit history. Tinkerbot contributes deterministic findings, impact/reachability evidence, test/contract/fixture evidence, policy/baseline context, explicit stale/unknown states, and integrity-checkable receipts.
+## Non-negotiables
 
-The implementation does not replace GitHub’s PR client, execute untrusted PR code in a hosted service, or upload source/full diffs through assurance ingestion. `tb serve` is not a hosted product surface; it remains a compatibility command only. Current provider and distribution gates are recorded in [`release-readiness.md`](./release-readiness.md).
+- `tb check` is the only verification verdict. Agents explain; they never rewrite findings, evidence, severity, or pass/fail.
+- Humans merge. The GitHub App never merges, never uses `pull_request_target`, and never auto-merges factory-definition or skill PRs.
+- Autonomy is risk-based (advisory, assisted, approval-gated, policy-autonomous, restricted). Formatting may open a PR autonomously; auth/billing/release stay restricted. Policy-autonomous still cannot merge.
+- Factory Steward may propose versioned skills or definition changes. Activation requires a distinct human approver. The Steward cannot approve itself, lower standards, or train on raw customer source.
+
+## Five systems
+
+1. Demand — WorkOrder normalization
+2. Production — lines and leased work cells
+3. Quality — assurance checkpoints plus `tb check`
+4. Delivery — PR, merge readiness, release candidates, GitHub Environment dispatch, rollback work orders, outcomes
+5. Learning — Factory Analyst / Skill Builder / Evaluator / Reviewer / Release Steward
+
+Customer production deploys are orchestrated and evidenced, not executed by Tinkerbot on the customer cluster.
+
+The interactive terminal is `tb tui`: a tabbed master in `packages/tui` on a TTY, and a Node `--once` transcript for CI. Nested vendor CLIs are user-owned PTYs. The browser control tower remains `tb dashboard`. OpenTUI is isolated from the Node engine, Action, and hosted inference.

@@ -20,7 +20,6 @@ import { selectTests } from "../packages/selection/src";
 import { createReport, main, runCli } from "../packages/cli/src";
 import { createControlPlaneServer } from "../packages/cli/src/serve";
 import { renderDoctor, runDoctor } from "../packages/cli/src/doctor";
-import { runTui } from "../packages/cli/src/tui";
 import { createAssuranceBundle, createReleaseManifest, createRuntimeOutcome, createVerificationReceipt, serializeReceipt } from "../packages/assurance/src";
 
 function git(root: string, args: string[]): string {
@@ -513,7 +512,7 @@ test("CLI dispatch is measured in-process across configuration, report, assuranc
     expect(capture(() => runCli(["--help"])).code).toBe(0);
     expect(capture(() => runCli([])).code).toBe(0);
     expect(capture(() => runCli(["check", "--version"])).code).toBe(0);
-    expect(capture(() => runCli(["--version"])).stdout).toContain("pr-proof");
+    expect(capture(() => runCli(["--version"])).stdout).toContain("tinkerbot");
     expect(capture(() => runCli(["policy", "list", "--format", "json"])).stdout).toContain("default");
     expect(capture(() => runCli(["policy", "explain", "strict", "--format", "json"])).stdout).toContain("unknownHandling");
     expect(capture(() => runCli(["config", "validate"])).code).toBe(0);
@@ -750,31 +749,11 @@ test("local control-plane server handles safe request methods without binding a 
   server.close();
 });
 
-test("TUI launcher resolves configured entries, forwards options, and reports runtime failures", () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tinkerbot-tui-launch-"));
-  const entry = path.join(root, "entry.js");
-  fs.writeFileSync(entry, "process.exit(process.argv.includes('--base') ? 0 : 2);\n");
-  const previousEntry = process.env.TINKERBOT_TUI_ENTRY;
-  const previousRuntime = process.env.TINKERBOT_TUI_RUNTIME;
-  try {
-    process.env.TINKERBOT_TUI_ENTRY = entry;
-    process.env.TINKERBOT_TUI_RUNTIME = process.execPath;
-    expect(runTui({ cwd: root, base: "base", head: "head", config: "config.yml" })).toBe(0);
-    expect(runTui()).toBe(2);
-    expect(capture(() => runCli(["tui", "--base", "base", "--head", "head", "--config", "config.yml"])).code).toBe(0);
-    delete process.env.TINKERBOT_TUI_RUNTIME;
-    expect(runTui({ cwd: root })).toBe(2);
-    process.env.TINKERBOT_TUI_RUNTIME = process.execPath;
-    process.env.TINKERBOT_TUI_RUNTIME = "definitely-missing-tui-runtime";
-    expect(capture(() => runTui({ cwd: root })).code).toBe(4);
-    delete process.env.TINKERBOT_TUI_ENTRY;
-    const exists = vi.spyOn(fs, "existsSync").mockReturnValue(false);
-    expect(capture(() => runTui({ cwd: root })).code).toBe(4);
-    exists.mockRestore();
-  } finally {
-    if (previousEntry === undefined) delete process.env.TINKERBOT_TUI_ENTRY; else process.env.TINKERBOT_TUI_ENTRY = previousEntry;
-    if (previousRuntime === undefined) delete process.env.TINKERBOT_TUI_RUNTIME; else process.env.TINKERBOT_TUI_RUNTIME = previousRuntime;
-  }
+test("dashboard opens the hosted app and tui is a TTY session", () => {
+  expect(capture(() => runCli(["tui"])).code).toBe(2);
+  expect(capture(() => runCli(["tui"])).stderr).toContain("TTY");
+  expect(capture(() => runCli(["dashboard"])).code).toBe(2);
+  expect(capture(() => runCli([])).code).toBe(0);
 });
 
 test("CLI argument and subcommand validation covers every public option family", () => {
@@ -823,7 +802,7 @@ test("CLI argument and subcommand validation covers every public option family",
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain("configuration error");
   }
-  expect(capture(() => runCli(["-V"])).stdout).toContain("pr-proof");
+  expect(capture(() => runCli(["-V"])).stdout).toContain("tinkerbot");
   expect(capture(() => runCli(["check", "-h"])).stdout).toContain("Usage");
   for (const command of ["tui", "serve", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "impact", "contracts", "fixtures", "select-tests", "artifacts", "config"]) {
     expect(capture(() => runCli([command, "--help"])).code).toBe(0);

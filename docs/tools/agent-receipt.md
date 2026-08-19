@@ -2,24 +2,18 @@
 
 ## User problem
 
-Developers may want a local record of how an agent-assisted change was produced without requiring vendor cooperation or treating the record as correctness proof.
+Record how an agent-assisted factory stage ran without storing prompts, source, or secrets, and without treating the receipt as a correctness proof.
 
-## CLI and Action surface
+## CLI
 
-Planned: `pr-proof receipt validate --input .pr-proof/agent-receipt.json`. No public command is shipped yet.
+```sh
+tb receipt validate --input .tinkerbot/agent-receipt.json
+```
 
-## Inputs and outputs
+A valid receipt never upgrades a failed or unknown verification verdict. Malformed receipts, missing identity, or credential-like values are `UNKNOWN`.
 
-The optional JSON receipt may include agent/version/model identifiers, task ID, prompt hash, changed files, commands, tests, failed attempts, backtracks, human decisions, and a summary. Output would validate shape, redact secrets, and report missing fields.
+## Required fields
 
-## Rules and unknowns
+Identity (repository, agent, workflow), model/provider, harness, prompt/config hash when present, definition hash, input/output references, tool-call names (not payloads), tokens/cost, duration, retries, human decisions, commit/PR, and the deterministic verification result.
 
-Malformed receipts, commands not independently observable, and missing human decisions are `UNKNOWN`. A valid receipt only proves that a record was supplied.
-
-## Security, false positives, and configuration
-
-Never store prompts, source, secrets, or tokens by default. Prompt hashes must be opt-in. Receipt paths and size limits must be bounded. Presence of a receipt must never lower a finding or create a pass.
-
-## Fixtures and out of scope
-
-Fixtures need valid, malformed, secret-containing, truncated, and vendor-neutral receipts. Vendor APIs, prompt uploads, provenance attestation, and correctness claims are out of scope.
+Do not store prompts, source, or secrets. A signature over the receipt is independent of pass/fail.

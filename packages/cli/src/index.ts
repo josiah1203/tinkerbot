@@ -62,8 +62,12 @@ import {
   type VerificationReceipt,
 } from "../../assurance/src";
 import { runDoctor, renderDoctor } from "./doctor";
-import { runControlPlaneServer } from "./serve";
-import { runTui } from "./tui";
+import { clearStoredCredentials, hostedSession, saveStoredCredentials } from "./credentials";
+import { loadFactoryDefinition, validateAgentReceipt, buildFactoryStarter } from "../../factory/src";
+import { isInteractiveTty, runTui, TUI_HELP, type TuiDeps, type TuiOptions } from "./tui/index";
+import { isAgentId, listAgentsJson, runMasterTuiInteractive } from "../../tui/src";
+import { planVerificationStreams } from "./tui/streams";
+import type { StageEvent } from "./tui/types";
 
 export const EXIT_CODES = {
   PASS: 0,
@@ -111,8 +115,12 @@ interface CliOptions {
   host?: string;
   directory?: string;
   repository?: string;
+  token?: string;
+  url?: string;
   verbose: boolean;
   help: boolean;
+  once?: boolean;
+  agent?: string;
 }
 
 function valueAfter(rest: string[], index: number, flag: string): string {
@@ -131,11 +139,11 @@ function parseArgs(argv: string[]): CliOptions {
   const first = argv[0];
   // `tb` is the interactive product surface. A non-interactive invocation
   // remains safe for automation and package probes by printing help instead.
-  const command = first === "--version" || first === "-V" ? "version" : first === "--help" || first === "-h" ? "help" : first ?? (process.stdout.isTTY ? "tui" : "help");
+  const command = first === "--version" || first === "-V" ? "version" : first === "--help" || first === "-h" ? "help" : first ?? "help";
   const rest = first === "--version" || first === "-V" || first === "--help" || first === "-h" ? argv.slice(1) : argv.slice(1);
   const options: CliOptions = { command, head: "HEAD", format: "terminal", baseTests: true, verbose: false, help: false };
   let index = 0;
-  if (["config", "baseline", "policy", "history", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "org", "github"].includes(command) && rest[0] && !rest[0].startsWith("--")) {
+  if (["config", "baseline", "policy", "history", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "org", "github", "factory", "work", "run", "receipt", "cell", "product", "skill", "evolution", "billing", "tui"].includes(command) && rest[0] && !rest[0].startsWith("--")) {
     options.subcommand = rest[0];
     index = 1;
   }
@@ -180,9 +188,13 @@ function parseArgs(argv: string[]): CliOptions {
     else if (token === "--host") options.host = valueAfter(rest, index++, token);
     else if (token === "--directory") options.directory = valueAfter(rest, index++, token);
     else if (token === "--repository") options.repository = valueAfter(rest, index++, token);
+    else if (token === "--token") options.token = valueAfter(rest, index++, token);
+    else if (token === "--url") options.url = valueAfter(rest, index++, token);
     else if (token === "--verbose") options.verbose = true;
+    else if (token === "--once") options.once = true;
+    else if (token === "--agent") options.agent = valueAfter(rest, index++, token);
     else if (token.startsWith("--")) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown option: ${token}`);
-    else if (["policy", "history", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "org", "github"].includes(command) && !options.positional) options.positional = token;
+    else if (["policy", "history", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "org", "github", "factory", "work", "run", "receipt", "cell", "product", "skill", "evolution", "billing", "tui"].includes(command) && !options.positional) options.positional = token;
     else throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unexpected argument: ${token}`);
   }
   if (!["terminal", "json", "markdown", "sarif", "review-context", "receipt", "change-assurance", "release-manifest"].includes(options.format)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown report format: ${options.format}`);
@@ -198,9 +210,21 @@ function parseArgs(argv: string[]): CliOptions {
   if (command === "release" && options.subcommand && !["assess", "manifest"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown release command: ${options.subcommand}`);
   if (command === "outcome" && options.subcommand && !["record", "export"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown outcome command: ${options.subcommand}`);
   if (command === "evidence" && options.subcommand && !["export"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown evidence command: ${options.subcommand}`);
-  if (command === "org" && options.subcommand && !["list", "switch"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown org command: ${options.subcommand}`);
+  if (command === "org" && options.subcommand && !["list", "switch", "seats"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown org command: ${options.subcommand}`);
   if (command === "org" && options.subcommand === "switch" && !options.positional) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "org switch requires an organization identifier");
+  if (command === "billing" && options.subcommand && !["summary", "catalog", "portal"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown billing command: ${options.subcommand}`);
   if (command === "github" && options.subcommand && options.subcommand !== "run") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown github command: ${options.subcommand}`);
+  if (command === "factory" && options.subcommand && !["list", "show", "validate", "sync", "mcp", "new"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown factory command: ${options.subcommand}`);
+  if (command === "work" && options.subcommand && !["list", "show", "retry", "approve", "cancel", "take", "return"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown work command: ${options.subcommand}`);
+  if (command === "run" && options.subcommand && !["show", "logs"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown run command: ${options.subcommand}`);
+  if (command === "cell" && options.subcommand && !["list", "show"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown cell command: ${options.subcommand}`);
+  if (command === "product" && options.subcommand && !["list", "show"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown product command: ${options.subcommand}`);
+  if (command === "skill" && options.subcommand && !["list", "show"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown skill command: ${options.subcommand}`);
+  if (command === "evolution" && options.subcommand && !["list", "show", "approve"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown evolution command: ${options.subcommand}`);
+  if (command === "receipt" && options.subcommand && options.subcommand !== "validate") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown receipt command: ${options.subcommand}`);
+  if (command === "tui" && options.subcommand && !["check", "work"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown tui command: ${options.subcommand}`);
+  if (command === "tui" && options.subcommand === "work" && !options.positional) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb tui work requires a work-order id");
+  if (command === "tui" && options.agent && !["claude", "gemini", "codex", "cursor", "shell"].includes(options.agent)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "--agent must be claude, gemini, codex, cursor, or shell");
   if (command === "serve" && options.format !== "terminal") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "serve does not support report formats");
   return options;
 }
@@ -284,6 +308,7 @@ export interface RunOptions {
   timeout?: number;
   maxFiles?: number;
   maxFindings?: number;
+  onStage?: (event: StageEvent) => void;
 }
 
 export function createReport(run: RunOptions = {}): PrProofReport {
@@ -299,21 +324,54 @@ export function createReport(run: RunOptions = {}): PrProofReport {
   const runTest = !run.command || run.command === "check" || run.command === "test-integrity";
   const runImpact = !run.command || run.command === "check" || run.command === "impact";
   const runFixtures = (!run.command || run.command === "check") && config.fixtures.enabled;
+  const emit = (event: StageEvent) => { run.onStage?.(event); };
+  emit({ type: "stage_start", id: "coverage", label: "Coverage", feedsVerdict: true });
   const coverage = readCoverage(root, config.framework.coverage_file);
+  emit({ type: "stage_end", id: "coverage", status: "done", summary: coverage.available ? "coverage artifact present" : (coverage.unknowns ?? ["coverage unavailable"]).join(" "), feedsVerdict: true });
   const artifacts = config.framework.coverage_file ? [loadArtifact(root, config.framework.coverage_file)] : [];
+  emit({ type: "stage_start", id: "suite", label: `Bash(${config.framework.command})`, feedsVerdict: true });
   const testIntegrity = runTest ? analyzeTestIntegrity(root, gitContext.diffs, config, { base: gitContext.base, head: gitContext.head, coverage }) : undefined;
+  emit({ type: "stage_end", id: "suite", status: config.test_integrity.run_base_tests ? "done" : "locked", summary: config.test_integrity.run_base_tests ? `${testIntegrity?.unknowns.length ?? 0} suite unknowns` : "Base/head execution is disabled; missing suite evidence is UNKNOWN.", feedsVerdict: true });
+  emit({ type: "stage_start", id: "integrity", label: "TestIntegrity", feedsVerdict: true });
   if (testIntegrity && coverage.unknowns?.length) testIntegrity.unknowns.push(...coverage.unknowns);
+  emit({ type: "stage_end", id: "integrity", status: "done", summary: testIntegrity ? `${testIntegrity.findings.length} findings · ${testIntegrity.newTests} new tests` : "not run", feedsVerdict: true });
   let mutation;
-  if (runTest && (run.runMutation ?? config.test_integrity.mutation_testing.enabled)) mutation = runTargetedMutation({ root, diffs: gitContext.diffs, config: config.test_integrity.mutation_testing, base: gitContext.base, head: gitContext.head, toolVersion: TOOL_VERSION, allowShellCommands: config.validation.allow_shell_commands, testConfiguration: { runner: config.framework.test_runner, command: config.framework.command, coverageFile: config.framework.coverage_file, timeoutSeconds: config.framework.test_timeout_seconds } });
+  if (runTest && (run.runMutation ?? config.test_integrity.mutation_testing.enabled)) {
+    emit({ type: "stage_start", id: "mutation", label: "Mutation", feedsVerdict: true });
+    mutation = runTargetedMutation({ root, diffs: gitContext.diffs, config: config.test_integrity.mutation_testing, base: gitContext.base, head: gitContext.head, toolVersion: TOOL_VERSION, allowShellCommands: config.validation.allow_shell_commands, testConfiguration: { runner: config.framework.test_runner, command: config.framework.command, coverageFile: config.framework.coverage_file, timeoutSeconds: config.framework.test_timeout_seconds } });
+    emit({ type: "stage_end", id: "mutation", status: "done", summary: `${mutation.killed} killed / ${mutation.results.length} mutants`, feedsVerdict: true });
+  }
   if (testIntegrity && mutation) {
     testIntegrity.mutation = mutation;
     testIntegrity.findings = [...testIntegrity.findings, ...mutationFindings(mutation)];
     if (mutation.limitation && mutation.enabled) testIntegrity.unknowns.push(mutation.limitation);
   }
+  emit({ type: "stage_start", id: "impact", label: "Impact", feedsVerdict: true });
   const impact = runImpact ? analyzeImpact({ root, base: gitContext.base, head: gitContext.head, diffs: gitContext.diffs, config, coverage }) : undefined;
+  emit({ type: "stage_end", id: "impact", status: "done", summary: impact ? `${impact.paths.length} paths · ${impact.unknowns.length} unknowns` : "not run", feedsVerdict: true });
+  if (run.onStage && impact) {
+    const selection = selectTests({ root, head: gitContext.head, diffs: gitContext.diffs, impact, config });
+    const planned = planVerificationStreams(selection, {
+      runBaseTests: config.test_integrity.run_base_tests,
+      runMutation: Boolean(mutation),
+      watchSubset: true,
+      coverageConfigured: Boolean(config.framework.coverage_file),
+      fixturesEnabled: Boolean(runFixtures),
+      testCommand: config.framework.command,
+    });
+    const subset = planned.find((stream) => stream.id === "subset");
+    emit({ type: "stage_start", id: "select", label: "SelectTests", feedsVerdict: false });
+    emit({ type: "stage_end", id: "select", status: "done", summary: `${selection.selected.length} selected · ${selection.requiresFullSuite ? "full suite required" : "recommendation only"}`, feedsVerdict: false });
+    emit({ type: "stage_start", id: "subset", label: "Subset", feedsVerdict: false });
+    emit({ type: "stage_end", id: "subset", status: subset?.locked ? "locked" : "done", summary: subset?.locked ? subset.lockReason : `${selection.selected.join("\n")}\nearly signal; does not feed the verdict`, feedsVerdict: false });
+  }
   const languageFiles = listFilesAtRevision(gitContext.head, root).filter((file) => isSourceFile(file) && languageEnabled(file, config.languages));
   const languages = summarizeLanguageFiles(languageFiles, [...(impact?.unknowns ?? []), ...(testIntegrity?.unknowns ?? [])]);
   const fixtures = runFixtures ? analyzeFixtures(gitContext.diffs, config.fixtures) : undefined;
+  if (runFixtures) {
+    emit({ type: "stage_start", id: "fixtures", label: "Fixtures", feedsVerdict: true });
+    emit({ type: "stage_end", id: "fixtures", status: "done", summary: `${fixtures?.findings.length ?? 0} findings · ${fixtures?.unknowns.length ?? 0} unknowns`, feedsVerdict: true });
+  }
   const provenance = impact ? buildProvenance(root, gitContext.diffs, impact) : [];
   const policy = getPolicyPack(config.policy.pack);
   const policyUnknowns = [...new Set([...(testIntegrity?.unknowns ?? []), ...(impact?.unknowns ?? []), ...(fixtures?.unknowns ?? []), ...artifacts.flatMap((artifact) => artifact.unknowns)])];
@@ -390,13 +448,27 @@ function versionText(root = process.cwd()): string {
 }
 
 function help(command?: string): string {
-  if (command === "tui") return "Usage: tb tui [--base REF] [--head REF] [--config FILE]\n\nLaunch the local-first OpenTUI workspace.\n";
-  if (command === "serve") return "Usage: pr-proof serve [--host 127.0.0.1] [--port 4173] [--directory apps/control-plane]\n";
-  if (command === undefined) return "Tinkerbot — deterministic change assurance\n\nInteractive: tb (or tb tui)\nCore: check, test-integrity, impact, contracts, fixtures, select-tests, artifacts, history, report\nAssurance: proof create|verify|replay; repo inspect|map; change contract validate|assess; change assess; policy simulate; change-set assess|export; release assess|manifest; outcome record|export; evidence --format review-context|receipt|change-assurance|release-manifest\n\nHosted commands that are not compiled into this client exit 12; they never succeed by printing help. Use tb <command> --help for command details.\n";
-  if (["proof", "repo", "change", "change-set", "release", "outcome", "evidence"].includes(command ?? "")) return `Usage: tb ${command} ...\n\nAssurance commands are local-first and emit machine-readable JSON with --format json.\n`;
-  if (["check", "test-integrity", "impact", "contracts", "fixtures", "select-tests"].includes(command ?? "")) return `Usage: pr-proof ${command} [options]\n\nOptions:\n  --base REF              base revision\n  --head REF              head revision (default: HEAD)\n  --format FORMAT         terminal, json, markdown, or sarif\n  --output FILE           write rendered output\n  --config FILE           configuration path\n  --policy PACK           policy pack\n  --mode MODE             advisory or blocking\n  --fail-on RULES         comma-separated impact rules\n  --timeout SECONDS       analysis timeout\n  --max-files N           bound files analyzed\n  --max-findings N        bound findings emitted\n  --mutation-enabled BOOL enable/disable mutation testing\n  --mutation-max N        maximum mutants\n  --no-base-tests         skip base/head execution\n  --verbose               include additional diagnostics\n`;
-  if (command === "artifacts") return "Usage: pr-proof artifacts --input FILE [--type TYPE] [--format json|terminal]\n";
-  return `Tinkerbot — deterministic change assurance\n\nCommands:\n  tb [tui]\n  tb --version\n  tb doctor\n  tb config validate|explain [--config FILE]\n  tb policy list|explain <pack>\n  tb baseline init|check|update\n  tb check --base origin/main --head HEAD\n  tb test-integrity --base origin/main --head HEAD\n  tb impact --base origin/main --head HEAD\n  tb contracts --base origin/main --head HEAD\n  tb fixtures --base origin/main --head HEAD\n  tb select-tests --base origin/main --head HEAD\n  tb artifacts --input coverage/lcov.info\n  tb history [compare <revision>]\n  tb report --format sarif --input .tinkerbot/report.json\n  tb usage [--json]\n\nHosted command names: login, logout, whoami, org list|switch, verify, explain, github run. An unavailable hosted command exits 12.\n\nRun tb <command> --help for command options.\n`;
+  if (command === "tui") return TUI_HELP;
+  if (command === "agents") return "Usage: tb agents\n\nList local agent CLIs on PATH. OAuth stays in the child CLI. Tinkerbot does not store vendor tokens.\n";
+  if (command === "dashboard") return "Usage: tb dashboard\n\nOpen the authenticated Tinkerbot dashboard in a browser.\n";
+  if (command === "login") return "Usage: tb login --token SESSION [--url https://control.example]\n\nStore a short-lived control-plane session. Browser login opens the public website.\n";
+  if (command === "factory") return "Usage: tb factory list|show|validate|sync|mcp|new\n\n`tb factory new` writes a local .tinkerbot starter tree. Agents and automations stay git-edited. Then `tb factory sync`.\n";
+  if (command === "work") return "Usage: tb work list|show|retry|approve|cancel|take|return [id]\n";
+  if (command === "cell") return "Usage: tb cell list\n";
+  if (command === "product") return "Usage: tb product list|show [id]\n";
+  if (command === "skill") return "Usage: tb skill list|show [id]\n";
+  if (command === "evolution") return "Usage: tb evolution list|show|approve [id]\n";
+  if (command === "run") return "Usage: tb run show|logs <id>\n";
+  if (command === "org") return "Usage: tb org list|switch|seats [organization-id]\n";
+  if (command === "billing") return "Usage: tb billing summary|catalog|portal\n\nHosted billing reads the server catalog and seat quantity. Portal opens the Stripe customer portal URL.\n";
+  if (command === "receipt") return "Usage: tb receipt validate --input FILE\n\nValidate an agent execution receipt. A valid receipt never upgrades a failed or unknown verdict.\n";
+  if (command === "serve") return "Usage: tb serve is retired. Use the hosted dashboard.\n";
+  if (command === undefined) return "Tinkerbot — factory operating system and deterministic verification\n\nHosted: login, logout, whoami, org list|switch|seats, billing summary|catalog|portal, dashboard, factory, work, cell, product, skill, evolution, run, verify\nCore: tui, agents, check, test-integrity, impact, contracts, fixtures, select-tests, artifacts, history, report, doctor\nAssurance: proof create|verify|replay; repo inspect|map; change contract validate|assess; release assess; outcome record; evidence\n\nUse tb <command> --help for command details.\n";
+  if (["proof", "repo", "change", "change-set", "release", "outcome", "evidence"].includes(command ?? "")) return `Usage: tb ${command} ...\n\nAssurance commands emit machine-readable JSON with --format json.\n`;
+  if (["check", "test-integrity", "impact", "contracts", "fixtures", "select-tests"].includes(command ?? "")) return `Usage: tb ${command} [options]\n\nOptions:\n  --base REF              base revision\n  --head REF              head revision (default: HEAD)\n  --format FORMAT         terminal, json, markdown, or sarif\n  --output FILE           write rendered output\n  --config FILE           configuration path\n  --policy PACK           policy pack\n  --mode MODE             advisory or blocking\n  --fail-on RULES         comma-separated impact rules\n  --timeout SECONDS       analysis timeout\n  --max-files N           bound files analyzed\n  --max-findings N        bound findings emitted\n  --mutation-enabled BOOL enable/disable mutation testing\n  --mutation-max N        maximum mutants\n  --no-base-tests         skip base/head execution\n  --verbose               include additional diagnostics\n`;
+  if (command === "artifacts") return "Usage: tb artifacts --input FILE [--type TYPE] [--format json|terminal]\n";
+  return `Tinkerbot — factory operating system and deterministic verification\n\nCommands:\n  tb --version\n  tb login --token SESSION\n  tb tui\n  tb dashboard\n  tb factory validate|list|show|sync|mcp|new
+  tb agents\n  tb work list|show|take|return|approve\n  tb cell list\n  tb product list\n  tb skill list\n  tb evolution list|approve\n  tb run show <id>\n  tb check --base origin/main --head HEAD\n  tb doctor\n`;
 }
 
 function legacyInvocationWarning(): void {
@@ -818,8 +890,18 @@ export function runCli(argv = process.argv.slice(2)): number {
   try {
     if (options.help || options.command === "help" || options.command === "-h") { process.stdout.write(help(options.command === "help" ? undefined : options.command)); return EXIT_CODES.PASS; }
     if (options.command === "version") { process.stdout.write(versionText()); return EXIT_CODES.PASS; }
-    if (options.command === "tui") return runTui({ base: options.base, head: options.head, config: options.config, repository: options.repository });
-    if (["login", "logout", "whoami", "org", "verify", "explain", "github"].includes(options.command)) return unsupportedCommand(options.subcommand ? `${options.command} ${options.subcommand}` : options.command);
+    if (options.command === "dashboard") return dashboardCommand();
+    if (options.command === "tui") return tuiCommand(options);
+    if (options.command === "login") return loginCommand(options);
+    if (options.command === "factory" && options.subcommand === "validate") return factoryValidateCommand();
+    if (options.command === "factory" && options.subcommand === "mcp") return factoryMcpCommand();
+    if (options.command === "factory" && options.subcommand === "new") return factoryNewCommand(options);
+    if (options.command === "agents") {
+      process.stdout.write(listAgentsJson(process.env));
+      return EXIT_CODES.PASS;
+    }
+    if (options.command === "receipt") return receiptValidateCommand(options);
+    if (["logout", "whoami", "org", "verify", "explain", "github", "cell", "product", "skill", "evolution", "billing"].includes(options.command)) return unsupportedCommand(options.subcommand ? `${options.command} ${options.subcommand}` : options.command);
     if (options.command === "doctor") {
       const doctor = runDoctor(process.cwd(), options.config, options.base, options.head);
       process.stdout.write(renderDoctor(doctor));
@@ -881,17 +963,138 @@ interface HostedResponse {
   body: Record<string, unknown>;
 }
 
+function factoryMcpCommand(): number {
+  const url = hostedSession().url;
+  if (!url || !/^https:\/\//.test(url)) {
+    process.stderr.write("Tinkerbot Factory MCP requires `tb login` with an HTTPS control-plane URL.\n");
+    return EXIT_CODES.UNKNOWN;
+  }
+  process.stdout.write(`${url.replace(/\/$/, "")}/mcp\n`);
+  return EXIT_CODES.PASS;
+}
+
+function factoryValidateCommand(): number {
+  try {
+    const loaded = loadFactoryDefinition(getRepoRoot(process.cwd()));
+    process.stdout.write(`${JSON.stringify({ valid: true, path: loaded.path, digest: loaded.digest, name: loaded.definition.name, repositories: loaded.definition.repositories }, null, 2)}\n`);
+    return EXIT_CODES.PASS;
+  } catch (error) {
+    throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error));
+  }
+}
+
+function factoryNewCommand(options: CliOptions): number {
+  const root = getRepoRoot(process.cwd());
+  const existing = path.join(root, ".tinkerbot", "factory.yaml");
+  if (fs.existsSync(existing)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "A factory definition already exists. Edit it in git, then run tb factory sync.");
+  const starter = buildFactoryStarter({
+    name: options.positional?.trim() || path.basename(root),
+    owner: "owner",
+    repository: "repository",
+  });
+  for (const file of starter.files) {
+    const dest = path.join(root, file.path);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, file.contents);
+  }
+  process.stdout.write(`${JSON.stringify({ created: true, path: ".tinkerbot", files: starter.files.map((file) => file.path), next: "tb factory validate && tb factory sync" }, null, 2)}\n`);
+  return EXIT_CODES.PASS;
+}
+
+function receiptValidateCommand(options: CliOptions): number {
+  if (options.subcommand !== "validate") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "Usage: tb receipt validate --input FILE");
+  if (!options.input) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb receipt validate requires --input.");
+  const root = getRepoRoot(process.cwd());
+  let parsed: unknown;
+  try { parsed = JSON.parse(fs.readFileSync(resolveRepositoryPath(root, options.input), "utf8")); }
+  catch (error) { throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Invalid receipt input: ${error instanceof Error ? error.message : String(error)}`); }
+  const result = validateAgentReceipt(parsed);
+  process.stdout.write(`${JSON.stringify({ ...result, upgradesVerdict: false }, null, 2)}\n`);
+  return result.valid ? EXIT_CODES.PASS : EXIT_CODES.UNKNOWN;
+}
+
+function loginCommand(options: CliOptions): number {
+  const url = options.url ?? hostedSession().url;
+  const token = options.token ?? hostedSession().token;
+  if (!url || !/^https:\/\//.test(url) || !token || !/^[A-Za-z0-9_-]{20,200}$/.test(token)) {
+    process.stderr.write("Tinkerbot: open the website to authenticate, then run `tb login --url https://… --token SESSION`.\n");
+    return EXIT_CODES.CONFIGURATION_ERROR;
+  }
+  saveStoredCredentials({ controlPlaneUrl: url.replace(/\/$/, ""), sessionToken: token });
+  process.stdout.write("Stored Tinkerbot control-plane credentials.\n");
+  return EXIT_CODES.PASS;
+}
+
+function shouldOpenDashboardBrowser(): boolean {
+  if (process.env.CI === "true" || process.env.VITEST || process.env.TINKERBOT_OPEN_BROWSER === "0") return false;
+  return process.env.TINKERBOT_OPEN_BROWSER === "1" || Boolean(process.stdout.isTTY && process.stdin.isTTY);
+}
+
+function dashboardCommand(): number {
+  const url = hostedSession().url;
+  if (!url || !/^https:\/\//.test(url)) {
+    process.stderr.write("Tinkerbot dashboard is unavailable until `tb login` stores an HTTPS control-plane URL.\n");
+    return EXIT_CODES.UNKNOWN;
+  }
+  const target = `${url.replace(/\/$/, "")}/app`;
+  process.stdout.write(`${target}\n`);
+  if (!shouldOpenDashboardBrowser()) return EXIT_CODES.PASS;
+  try { execFileSync(process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open", process.platform === "win32" ? ["/c", "start", "", target] : [target], { stdio: "ignore" }); } catch { /* print the URL even if a browser cannot be launched */ }
+  return EXIT_CODES.PASS;
+}
+
+function tuiOptionsFrom(options: CliOptions): TuiOptions {
+  return { help: options.help, subcommand: options.subcommand, positional: options.positional, once: options.once, base: options.base, head: options.head, config: options.config, mutation: options.mutation, baseTests: options.baseTests, mode: options.mode, failOn: options.failOn, mutationMax: options.mutationMax, policy: options.policy, timeout: options.timeout, maxFiles: options.maxFiles, maxFindings: options.maxFindings, agent: options.agent };
+}
+
+function makeTuiDeps(): TuiDeps {
+  return {
+    header: () => {
+      try {
+        const root = getRepoRoot(process.cwd());
+        const config = loadConfig(root);
+        return { repo: repositoryLabel(root), base: config.base.ref, head: "HEAD", cwd: root };
+      } catch {
+        return { repo: "local", base: "origin/main", head: "HEAD", cwd: process.cwd() };
+      }
+    },
+    createReport,
+    reportExitCode: (report) => {
+      try {
+        const config = loadConfig(getRepoRoot(process.cwd()));
+        if (report.verdict === "FAIL" || (config.test_integrity.mode === "blocking" && report.verdict === "NEEDS_REVIEW")) return EXIT_CODES.FAIL;
+        if (report.verdict === "UNKNOWN" && config.output.fail_on_unknown) return EXIT_CODES.UNKNOWN;
+        return EXIT_CODES.PASS;
+      } catch {
+        return report.verdict === "FAIL" ? EXIT_CODES.FAIL : report.verdict === "UNKNOWN" ? EXIT_CODES.UNKNOWN : EXIT_CODES.PASS;
+      }
+    },
+    openDashboard: dashboardCommand,
+    stdout: process.stdout,
+    stderr: process.stderr,
+    stdin: process.stdin,
+    env: process.env,
+    cwd: process.cwd(),
+  };
+}
+
+function tuiCommand(options: CliOptions): number {
+  return runTui(tuiOptionsFrom(options), makeTuiDeps());
+}
+
 function hostedConfigurationError(): string | undefined {
-  const base = process.env.TINKERBOT_CONTROL_PLANE_URL?.replace(/\/$/, "");
-  const token = process.env.TINKERBOT_SESSION_TOKEN;
-  if (!base || !/^https:\/\//.test(base)) return "Hosted commands require an HTTPS TINKERBOT_CONTROL_PLANE_URL.";
+  const session = hostedSession();
+  const base = session.url?.replace(/\/$/, "");
+  const token = session.token;
+  if (!base || !/^https:\/\//.test(base)) return "Hosted commands require an HTTPS TINKERBOT_CONTROL_PLANE_URL or `tb login`.";
   if (!token || !/^[A-Za-z0-9_-]{20,200}$/.test(token)) return "Hosted commands require TINKERBOT_SESSION_TOKEN from an authenticated Tinkerbot session.";
   return undefined;
 }
 
 async function hostedRequest(pathname: string, method = "GET", payload?: Record<string, unknown>): Promise<HostedResponse> {
-  const base = process.env.TINKERBOT_CONTROL_PLANE_URL?.replace(/\/$/, "");
-  const token = process.env.TINKERBOT_SESSION_TOKEN;
+  const session = hostedSession();
+  const base = session.url?.replace(/\/$/, "");
+  const token = session.token;
   const configurationError = hostedConfigurationError();
   if (configurationError) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, configurationError);
   let response: Response;
@@ -910,20 +1113,81 @@ async function hostedRequest(pathname: string, method = "GET", payload?: Record<
 
 async function runHostedCli(argv: string[]): Promise<number | undefined> {
   const command = argv[0];
-  if (!command || command === "tui") {
-    const response = await hostedRequest("/auth/session");
+  if (!command) return undefined;
+    if (command === "factory" && argv[1] && argv[1] !== "validate" && argv[1] !== "mcp" && argv[1] !== "new") {
+    const subcommand = argv[1];
+    const id = argv[2];
+    const pathname = subcommand === "list" || !id ? "/factories" : `/factories/${id}`;
+    let payload: Record<string, unknown> | undefined;
+    if (subcommand === "sync") {
+      const loaded = loadFactoryDefinition(getRepoRoot(process.cwd()));
+      payload = { name: loaded.definition.name, yaml: fs.readFileSync(loaded.path, "utf8"), files: loaded.files };
+    }
+    const response = await hostedRequest(pathname, subcommand === "sync" ? "POST" : "GET", payload);
     if (response.status < 200 || response.status >= 300) {
       process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
       return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
     }
-    return undefined;
+    process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
+    return EXIT_CODES.PASS;
+  }
+  if (command === "work") {
+    const subcommand = argv[1] ?? "list";
+    const id = argv[2];
+    const method = ["retry", "approve", "cancel", "take", "return"].includes(subcommand) ? "POST" : "GET";
+    const pathname = !id && subcommand === "list" ? "/work-orders" : id ? `/work-orders/${id}${method === "POST" ? `/${subcommand}` : ""}` : `/work-orders/${subcommand}`;
+    const response = await hostedRequest(pathname, method);
+    if (response.status < 200 || response.status >= 300) {
+      process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
+      return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
+    }
+    process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
+    return EXIT_CODES.PASS;
+  }
+  if (command === "cell" || command === "product" || command === "skill" || command === "evolution") {
+    const subcommand = argv[1] ?? "list";
+    const id = argv[2];
+    const collection = command === "cell" ? "cells" : command === "product" ? "products" : command === "skill" ? "skills" : "evolution";
+    const method = command === "evolution" && subcommand === "approve" ? "POST" : "GET";
+    const pathname = subcommand === "approve" && id ? `/evolution/${id}/approve` : subcommand === "show" && id ? `/${collection}/${id}` : `/${collection}`;
+    const response = await hostedRequest(pathname, method);
+    if (response.status < 200 || response.status >= 300) {
+      process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
+      return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
+    }
+    process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
+    return EXIT_CODES.PASS;
+  }
+  if (command === "run") {
+    const id = argv[2] ?? argv[1];
+    if (!id || id === "show" || id === "logs") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb run show requires a run id.");
+    const response = await hostedRequest(`/runs/${id}${argv[1] === "logs" ? "/events" : ""}`);
+    if (response.status < 200 || response.status >= 300) {
+      process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
+      return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
+    }
+    process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
+    return EXIT_CODES.PASS;
   }
   if (command === "org") {
     const subcommand = argv[1] ?? "list";
-    if (subcommand !== "list" && subcommand !== "switch") return undefined;
+    if (subcommand !== "list" && subcommand !== "switch" && subcommand !== "seats") return undefined;
     const organizationId = argv[2];
     if (subcommand === "switch" && !organizationId) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb org switch requires an organization identifier.");
-    const response = await hostedRequest(subcommand === "list" ? "/tenant/organizations" : "/tenant/organizations/switch", subcommand === "list" ? "GET" : "POST", subcommand === "switch" ? { organizationId } : undefined);
+    const pathname = subcommand === "list" ? "/tenant/organizations" : subcommand === "seats" ? "/org/seats" : "/tenant/organizations/switch";
+    const response = await hostedRequest(pathname, subcommand === "switch" ? "POST" : "GET", subcommand === "switch" ? { organizationId } : undefined);
+    if (response.status < 200 || response.status >= 300) {
+      process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
+      return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
+    }
+    process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
+    return EXIT_CODES.PASS;
+  }
+  if (command === "billing") {
+    const subcommand = argv[1] ?? "summary";
+    if (!["summary", "catalog", "portal"].includes(subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb billing supports summary, catalog, or portal.");
+    const pathname = subcommand === "summary" ? "/billing/summary" : subcommand === "catalog" ? "/billing/catalog" : "/billing/portal";
+    const response = await hostedRequest(pathname, subcommand === "portal" ? "POST" : "GET", subcommand === "portal" ? {} : undefined);
     if (response.status < 200 || response.status >= 300) {
       process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
       return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
@@ -959,12 +1223,52 @@ async function runHostedCli(argv: string[]): Promise<number | undefined> {
     return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
   }
   if (command === "whoami") process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
-  else process.stdout.write("Signed out of the Tinkerbot control plane.\n");
+  else {
+    clearStoredCredentials();
+    process.stdout.write("Signed out of the Tinkerbot control plane.\n");
+  }
   return EXIT_CODES.PASS;
 }
 
 export async function mainAsync(argv = process.argv.slice(2)): Promise<number> {
   try {
+    if (argv[0] === "tui") {
+      const options = parseArgs(argv);
+      const deps: TuiDeps = {
+        ...makeTuiDeps(),
+        fetchWorkAsync: async (id) => {
+          const response = await hostedRequest(`/work-orders/${id}`);
+          if (response.status < 200 || response.status >= 300) return {};
+          return response.body as { workOrder?: { workOrderId?: string; status?: string; currentStage?: string; verificationVerdict?: string; verificationIngested?: boolean }; run?: { run_id?: string; status?: string }; stages?: Array<{ stage?: string; status?: string; summary?: string }> };
+        },
+        workActionAsync: async (id, action, note) => {
+          const response = await hostedRequest(`/work-orders/${id}/${action}`, "POST", action === "steer" ? { note } : undefined);
+          if (response.status < 200 || response.status >= 300) return { ok: false, message: String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`) };
+          return { ok: true, message: action === "approve" ? "Specification approval recorded. Humans still merge." : `${action} recorded.` };
+        },
+      };
+      if (isInteractiveTty(process.stdout, process.stdin, process.env) && !options.once && !options.help) {
+        const agent = isAgentId(options.agent) ? options.agent : undefined;
+        return runMasterTuiInteractive({
+          workOrderId: options.subcommand === "work" ? options.positional : undefined,
+          agent,
+          help: options.help,
+        }, {
+          stdout: process.stdout,
+          stderr: process.stderr,
+          cwd: process.cwd(),
+          env: process.env,
+          stdin: process.stdin,
+          header: deps.header,
+          openDashboard: deps.openDashboard,
+        });
+      }
+      if (options.subcommand === "work" && options.positional && deps.fetchWorkAsync) {
+        const view = await deps.fetchWorkAsync(options.positional);
+        deps.fetchWork = () => view;
+      }
+      return runTui(tuiOptionsFrom(options), deps);
+    }
     const hosted = await runHostedCli(argv);
     return hosted ?? runCli(argv);
   } catch (error) {

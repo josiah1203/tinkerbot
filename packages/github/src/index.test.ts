@@ -34,6 +34,7 @@ describe("GitHub assurance boundary", () => {
     expect(isSafePullRequestEvent("pull_request", "synchronize")).toBe(true);
     expect(isSafePullRequestEvent("pull_request_target", "opened")).toBe(false);
     expect(isSafePullRequestEvent("workflow_dispatch", undefined)).toBe(true);
+    expect(admitWebhook({ payload: JSON.stringify({ action: "created", alert: { number: 1 } }), signature: `sha256=${createHmac("sha256", "secret").update(JSON.stringify({ action: "created", alert: { number: 1 } })).digest("hex")}`, secret: "secret", eventName: "dependabot_alert", deliveryId: "dep-1" }).accepted).toBe(true);
     expect(isForkPullRequest({ pull_request: { head: { repo: { fork: true } } } })).toBe(true);
     expect(isForkPullRequest({ pull_request: { head: { repo: { full_name: "contrib/repo" } }, base: { repo: { full_name: "owner/repo" } } } })).toBe(true);
     expect(isForkPullRequest({ pull_request: { head: { repo: { full_name: "owner/repo" } }, base: { repo: { full_name: "owner/repo" } } } })).toBe(false);

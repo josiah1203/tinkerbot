@@ -9,8 +9,6 @@ pnpm install --frozen-lockfile
 pnpm lint
 pnpm typecheck
 pnpm test
-pnpm tui:test
-pnpm tui:build
 pnpm release:dry-run
 git diff --check
 ```
@@ -18,7 +16,6 @@ git diff --check
 Build artifacts only in an approved release environment:
 
 ```sh
-TINKERBOT_TUI_TARGETS=bun-darwin-arm64,bun-darwin-x64,bun-linux-arm64,bun-linux-x64 \
 pnpm release:clients
 TINKERBOT_RELEASE_BASE_URL=https://<approved-download-host>/<version> \
 pnpm release:homebrew

@@ -3,54 +3,18 @@
     "id": "developer",
     "monthlyPriceId": "price_REPLACE_DEVELOPER_MONTHLY",
     "annualPriceId": "price_REPLACE_DEVELOPER_ANNUAL",
-    "privateRepositoryLimit": 3,
-    "memberLimit": 5,
-    "retentionDays": 90,
-    "features": {
-      "assurance_metadata": true,
-      "repository_policies": true,
-      "baselines_and_waivers": true,
-      "team_invitations": false,
-      "required_evidence_rules": false,
-      "blocking_policy_controls": false,
-      "policy_revision_history": false,
-      "audit_event_export": false
-    }
+    "catalogVersion": "2026-08-18.seat-v1"
   },
   {
     "id": "team",
     "monthlyPriceId": "price_REPLACE_TEAM_MONTHLY",
     "annualPriceId": "price_REPLACE_TEAM_ANNUAL",
-    "privateRepositoryLimit": 15,
-    "memberLimit": 25,
-    "retentionDays": 365,
-    "features": {
-      "assurance_metadata": true,
-      "repository_policies": true,
-      "baselines_and_waivers": true,
-      "team_invitations": true,
-      "required_evidence_rules": true,
-      "blocking_policy_controls": false,
-      "policy_revision_history": false,
-      "audit_event_export": false
-    }
+    "catalogVersion": "2026-08-18.seat-v1"
   },
   {
     "id": "business",
     "monthlyPriceId": "price_REPLACE_BUSINESS_MONTHLY",
     "annualPriceId": "price_REPLACE_BUSINESS_ANNUAL",
-    "privateRepositoryLimit": 50,
-    "memberLimit": 100,
-    "retentionDays": 730,
-    "features": {
-      "assurance_metadata": true,
-      "repository_policies": true,
-      "baselines_and_waivers": true,
-      "team_invitations": true,
-      "required_evidence_rules": true,
-      "blocking_policy_controls": true,
-      "policy_revision_history": true,
-      "audit_event_export": true
-    }
+    "catalogVersion": "2026-08-18.seat-v1"
   }
 ]

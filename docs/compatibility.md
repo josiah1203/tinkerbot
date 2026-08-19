@@ -11,22 +11,22 @@
 | Coverage | LCOV, Istanbul JSON, coverage.py JSON, Go coverprofile, gcov, and LLVM coverage JSON |
 | CI | GitHub Actions using safe `pull_request` events; `pull_request_target` is unsupported |
 | Package manager | pnpm 9.x with the checked-in lockfile; npm consumers may use the packed CLI artifact |
-| TUI runtime | Bun-first OpenTUI bundle; Node remains the canonical verification engine runtime |
+| Product UI | Browser dashboard at `/app` (`tb dashboard`). Terminal is `tb tui` (master tabs on a TTY; `--once` for CI). |
 
 ## Not supported as a completeness claim
 
 Java, Ruby, hosted source processing, coding-agent logs, reflection-complete runtime analysis, arbitrary module alias resolution, and full-repository mutation testing remain outside the release. Dynamic imports, generated code, aliases without recognized metadata, Rust/C/C++ macros or conditional compilation, and missing artifacts are surfaced as partial or unknown evidence.
 
-The GitHub Action uses Node 20 and the example workflow uses Node 22 for repository tooling. `tb` uses the pinned OpenTUI packages and requires a hosted authenticated session for release use.
+The GitHub Action uses Node 20. Repository CI uses Node 22. Hosted CLI commands (`login`, `whoami`, `factory`, `work`, `run`, `verify`, `dashboard`) require an HTTPS control-plane URL and an authenticated session. Local `tb check` does not.
 
 ## Upgrades
 
 For a patch release, update the package and rerun the local gates:
 
 ```sh
-pnpm update -D pr-proof
-pnpm pr-proof config validate
-pnpm pr-proof check --base origin/main --head HEAD
+pnpm update -D @tinkerbot/cli
+pnpm tb config validate
+pnpm tb check --base origin/main --head HEAD
 ```
 
-Review report schema changes before upgrading across a major version. To roll back, restore the previous package version or Action tag and rerun the release gates; do not delete a published package version.
+`pr-proof` remains a deprecated CLI alias. Review report schema changes before upgrading across a major version. To roll back, restore the previous package version or Action tag and rerun the release gates; do not delete a published package version.

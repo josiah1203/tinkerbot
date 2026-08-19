@@ -7,7 +7,12 @@ pnpm add -D pr-proof
 pr-proof --version
 pr-proof doctor
 pr-proof check --base origin/main --head HEAD
+tb tui --once
+pnpm tui
+tb agents
 ```
+
+`tb tui` is a tabbed master terminal on a TTY (`pnpm tui`). `tb tui --once` is the CI transcript. Nested CLIs use their own OAuth. `select-tests` remains a recommendation; the configured suite is the merge gate.
 
 ## Advisory and blocking behavior
 

@@ -13,6 +13,9 @@ import {
   parseStripePlans,
   verifyWorkOSSignature,
   verifyStripeSignature,
+  FanoutEvidenceStore,
+  HttpEvidenceReplica,
+  evidenceStoreFromEnv,
 } from "../packages/hosted-integrations/src";
 
 test("WorkOS adapter keeps credentials server-side and normalizes AuthKit sessions", async () => {
@@ -101,7 +104,7 @@ test("Stripe adapter uses server-configured prices and idempotent requests", asy
   const provider = new StripeBillingProvider({
     secretKey: "stripe_test_secret",
     webhookSecret: "whsec_test",
-    plans: [{ id: "developer", monthlyPriceId: "price_month", annualPriceId: "price_year", privateRepositoryLimit: 3, memberLimit: 5, retentionDays: 30, features: {} }],
+    plans: [{ id: "developer", monthlyPriceId: "price_month", annualPriceId: "price_year" }],
     fetcher: async (input, init) => {
       requests.push({ url: String(input), init });
       const path = new URL(String(input)).pathname;
@@ -117,6 +120,18 @@ test("Stripe adapter uses server-configured prices and idempotent requests", asy
   expect(String(requests[0]?.init?.body)).not.toContain("stripe_test_secret");
   expect((await provider.createPortalSession({ customerId: "cus_1", returnUrl: "https://tinkerbot.example/app/settings/billing", idempotencyKey: "portal-org_1" })).id).toBe("bps_test");
   expect((await provider.setSubscriptionCancellation({ subscriptionId: "sub_1", cancelAtPeriodEnd: true, idempotencyKey: "cancel-org_1" })).status).toBe("canceled");
+  const quantityProvider = new StripeBillingProvider({
+    secretKey: "stripe_test_secret",
+    webhookSecret: "whsec_test",
+    plans: [{ id: "team", monthlyPriceId: "price_team" }],
+    fetcher: async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path.includes("/v1/subscriptions/") && !path.includes("items")) return new Response(JSON.stringify({ id: "sub_1", items: { data: [{ id: "si_1" }] } }), { status: 200, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ id: "si_1", quantity: 3, status: "active" }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  expect(await quantityProvider.updateSubscriptionQuantity({ subscriptionId: "sub_1", quantity: 3, idempotencyKey: "qty-1" })).toMatchObject({ id: "si_1", quantity: 3 });
+  expect(await quantityProvider.changeSubscriptionPrice({ subscriptionId: "sub_1", priceId: "price_team", quantity: 3, prorationBehavior: "create_prorations", idempotencyKey: "chg-1" })).toMatchObject({ id: "sub_1" });
 });
 
 test("Stripe webhook verification rejects replay and invalid signatures", async () => {
@@ -158,6 +173,18 @@ test("Cloudflare secret bindings and portable metadata/evidence stores are provi
   const evidence = new R2JsonEvidenceStore(bucket, "runs/");
   await evidence.put("run_1", { schemaVersion: 1, organizationId: "org_1" });
   expect(await evidence.get("run_1")).toEqual({ schemaVersion: 1, organizationId: "org_1" });
+  const replicaPuts: string[] = [];
+  const replica = new HttpEvidenceReplica("https://export.example", "export-token", (async (input) => {
+    replicaPuts.push(String(input));
+    return new Response("no", { status: 500 });
+  }) as typeof fetch);
+  const fanout = new FanoutEvidenceStore(evidence, replica);
+  await fanout.put("run_2", { ok: true });
+  expect(await fanout.get("run_2")).toEqual({ ok: true });
+  expect(replicaPuts[0]).toContain("https://export.example/run_2");
+  const store = evidenceStoreFromEnv({ bucket, exportEndpoint: "https://export.example" });
+  await store?.put("run_3", { primary: true });
+  expect(await store?.get("run_3")).toEqual({ primary: true });
 });
 
 test("D1 sessions encrypt provider tokens and webhook claims are replay-safe", async () => {
@@ -218,9 +245,11 @@ test("D1 sessions encrypt provider tokens and webhook claims are replay-safe", a
 });
 
 test("Stripe plan fixtures and D1 billing mappings fail closed and reject stale events", async () => {
-  expect(parseStripePlans(JSON.stringify([{ id: "team", monthlyPriceId: "price_month", privateRepositoryLimit: 10, memberLimit: 5, retentionDays: 30, features: { team_invitations: true } }]))).toHaveLength(1);
-  expect(parseStripePlans(JSON.stringify([{ id: "unsafe", monthlyPriceId: "price_bad", privateRepositoryLimit: 10, retentionDays: 30 }]))).toEqual([]);
-  expect(parseStripePlans(JSON.stringify([{ id: "unsafe", monthlyPriceId: "price_bad", privateRepositoryLimit: -1, memberLimit: 5, retentionDays: 30, features: {} }]))).toEqual([]);
+  expect(parseStripePlans(JSON.stringify([{ id: "team", monthlyPriceId: "price_month", catalogVersion: "2026-08-18.seat-v1" }]))).toHaveLength(1);
+  expect(parseStripePlans(JSON.stringify([{ id: "team", monthlyPriceId: "price_month", memberLimit: 5 }]))).toEqual([]);
+  expect(parseStripePlans(JSON.stringify([{ id: "team", monthlyPriceId: "price_month", privateRepositoryLimit: 10 }]))).toEqual([]);
+  expect(parseStripePlans(JSON.stringify([{ id: "unsafe", monthlyPriceId: "price_bad", retentionDays: 30 }]))).toEqual([]);
+  expect(parseStripePlans(JSON.stringify([{ id: "unsafe", monthlyPriceId: "price_bad", retentionDays: -1, features: {} }]))).toEqual([]);
 
   let row: Record<string, unknown> | null = null;
   const database = {
@@ -298,4 +327,17 @@ test("D1 tenant invitation state and seat usage are organization-scoped", async 
   expect(await tenants.getPendingInvitation("org_1", "INVITEE@example.com")).toMatchObject({ invitationId: "inv_1", role: "viewer", state: "pending" });
   expect(await tenants.listInvitations("org_1")).toHaveLength(1);
   expect(await tenants.getPendingInvitation("org_2", "invitee@example.com")).toBeNull();
+});
+
+test("malformed provider signatures, unavailable providers, and incomplete sessions fail closed", async () => {
+  expect(await verifyStripeSignature("{}", null, "whsec_test")).toBe(false);
+  expect(await verifyStripeSignature("{}", "t=1,v1=nothex", "whsec_test")).toBe(false);
+  expect(await verifyWorkOSSignature("{}", "not-a-signature", "workos_webhook_secret")).toBe(false);
+  expect(await verifyWorkOSSignature("{}", null, "workos_webhook_secret")).toBe(false);
+  const workos = new WorkOSAuthProvider({});
+  await expect(workos.exchangeCode({ code: "auth_code" })).rejects.toMatchObject({ code: "provider_not_configured" });
+  const stripe = new StripeBillingProvider({ plans: [] });
+  await expect(stripe.createPortalSession({ customerId: "cus_1", returnUrl: "https://tinkerbot.example/app", idempotencyKey: "portal-1" })).rejects.toMatchObject({ code: "provider_not_configured" });
+  const config = await hostedProviderConfig({ ENVIRONMENT: "staging" });
+  expect(providerStatuses(config).some((item) => item.provider === "workos" && item.state === "unavailable")).toBe(true);
 });

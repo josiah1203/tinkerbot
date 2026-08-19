@@ -1,11 +1,16 @@
 # Tinkerbot Verify GitHub Action
 
-The Action runs in the customer’s runner and uses the local `tb`/`tinkerbot` engine. It emits a local report, Markdown summary, SARIF when enabled, a verification receipt, a versioned `evidence-contract.json`, workflow annotations, a step summary, and best-effort native `Tinkerbot Verify` Check Run/sticky comment output. The example workflow uploads only source-minimized assurance artifacts by default; the full local report remains available in the workspace.
+The Action runs `tb check` on the customer runner and submits a source-minimized assurance bundle. That verification cell is the quality laboratory for every production line. The GitHub App is the authoritative Check Run and inline-comment publisher. Action-side `GITHUB_TOKEN` publication is a fork/degraded fallback only.
 
-Inputs include `base`, `head`, `config`, `mode`, `fail-on`, `mutation-enabled`, `mutation-max`, `policy`, `timeout`, `max-files`, `max-findings`, `comment`, `check-run`, and `sarif`. `control-plane-url` and `session-token` optionally submit the source-minimized assurance bundle to the hosted control plane; a missing or invalid pair skips submission rather than leaking a token. Outputs expose the local report, SARIF, receipt, review context, evidence contract, and assurance-bundle paths. The published Action reference is intentionally a placeholder until the actual repository owner/name is selected.
+## OIDC
 
-Use `pull_request` with least-privilege permissions and `persist-credentials: false` on checkout. Do not change the example to `pull_request_target`: that event can expose privileged secrets while executing contributor-controlled code. Fork PRs are explicitly write-disabled; they retain local artifacts, deterministic workflow annotations, and the step summary while safely degrading when Check Run/comment permissions are unavailable.
+1. Workflow `permissions: id-token: write`
+2. Action requests a GitHub OIDC token with audience `tinkerbot`
+3. `POST /actions/oidc/exchange` validates issuer, audience, repository, SHA, and installation
+4. Worker returns a short-lived run token
+5. Action `POST /assurance/ingest` with that token
+6. App publishes Check Run + inline comments, deduped by `runId + fingerprint + commitSha`
 
-The canonical Check Run name is `Tinkerbot Verify`. Existing `PR Proof` Check Runs are discovered for compatibility and updated in place when possible. The sticky comment uses `<!-- tinkerbot:verify -->`; the legacy `<!-- pr-proof:sticky -->` marker is also recognized, so repeated pushes update one comment instead of creating duplicate reports. Inline annotations are deterministic, path-normalized, line-bound, sorted by stable finding identity, and capped at 50.
+`session-token` remains a deprecated developer fallback. Fork PRs stay write-disabled. Use `pull_request` only, never `pull_request_target`. Unauthorized publication leaves local artifacts and an explicit UNKNOWN.
 
-GitHub App installations use [`github-app/manifest.json`](../github-app/manifest.json) as a template. App webhooks must verify signatures and delivery IDs; the App is never an execution environment for untrusted pull-request code. The customer runner remains the only verification execution boundary.
+App permissions: `metadata: read`, `contents: read`, `pull_requests: write`, `issues: write`, `checks: write`. Webhook URL: `/integrations/github/webhook`.

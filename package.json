@@ -31,7 +31,6 @@
   },
   "files": [
     "dist/packages",
-    "dist/tui",
     "dist/action",
     "action.yml",
     "action/index.js",
@@ -46,18 +45,17 @@
     "test:coverage": "pnpm build && vitest run --coverage && node scripts/verify-coverage.mjs",
     "coverage:check": "node scripts/verify-coverage.mjs",
     "test:watch": "vitest",
+    "test:e2e": "playwright install chromium && playwright test",
+    "test:all": "pnpm test && pnpm test:e2e",
     "validate:providers": "node scripts/validate-live-providers.mjs",
     "prepare": "npm run build",
     "prepack": "node scripts/prepare-package.mjs",
     "tb": "node dist/packages/cli/src/index.js",
-    "tui:build": "bun --cwd packages/tui scripts/build.ts",
-    "tui:compile": "bun --cwd packages/tui scripts/compile.ts",
-    "tui:compile:release": "node scripts/build-release-clients.mjs",
-    "tui:test": "bun --cwd packages/tui test --preload @opentui/solid/preload src",
-    "tui:test:coverage": "bun --cwd packages/tui test --coverage --preload @opentui/solid/preload src",
-    "release:clients": "pnpm build && pnpm tui:compile:release && node scripts/package-release-clients.mjs && node scripts/generate-release-manifest.mjs",
+    "tui": "node dist/packages/cli/src/index.js tui",
+    "tui:once": "node dist/packages/cli/src/index.js tui --once",
+    "release:clients": "pnpm build && node scripts/package-release-clients.mjs && node scripts/generate-release-manifest.mjs",
     "release:homebrew": "node scripts/render-homebrew-formula.mjs",
-    "release:dry-run": "pnpm build && pnpm tui:build && pnpm pack --pack-destination /tmp/tinkerbot-pack-release && NPM_CONFIG_CACHE=/tmp/tinkerbot-npm-cache npm pack --dry-run"
+    "release:dry-run": "pnpm build && pnpm pack --pack-destination /tmp/tinkerbot-pack-release && NPM_CONFIG_CACHE=/tmp/tinkerbot-npm-cache npm pack --dry-run"
   },
   "engines": {
     "node": ">=20"
@@ -67,18 +65,9 @@
     "yaml": "2.9.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.55.1",
     "@types/node": "22.20.1",
     "@vitest/coverage-v8": "3.2.7",
     "vitest": "3.2.7"
-  },
-  "optionalDependencies": {
-    "@opentui/core-darwin-arm64": "0.4.5",
-    "@opentui/core-darwin-x64": "0.4.5",
-    "@opentui/core-linux-arm64": "0.4.5",
-    "@opentui/core-linux-x64": "0.4.5",
-    "@opentui/core-linux-arm64-musl": "0.4.5",
-    "@opentui/core-linux-x64-musl": "0.4.5",
-    "@opentui/core-win32-arm64": "0.4.5",
-    "@opentui/core-win32-x64": "0.4.5"
   }
 }

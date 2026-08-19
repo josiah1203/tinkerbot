@@ -10,13 +10,13 @@ test("exposes version, command help, config validation, and effective config", (
   const version = execFileSync(process.execPath, [cli, "--version"], { encoding: "utf8" });
   expect(version).toContain("tinkerbot 0.1.0");
   expect(version).toContain("capabilities:");
-  expect(execFileSync(process.execPath, [cli, "check", "--help"], { encoding: "utf8" })).toContain("Usage: pr-proof check");
+  expect(execFileSync(process.execPath, [cli, "check", "--help"], { encoding: "utf8" })).toContain("Usage: tb check");
   expect(execFileSync(process.execPath, [cli, "config", "validate"], { encoding: "utf8" })).toContain("Configuration valid");
   expect(execFileSync(process.execPath, [cli, "config", "explain"], { encoding: "utf8" })).toContain('"max_files_analyzed"');
 });
 
 test("recognizes unavailable hosted commands without returning successful help", () => {
-  for (const args of [["login"], ["github", "run"], ["serve"]]) {
+  for (const args of [["github", "run"], ["serve"]]) {
     const result = spawnSync(process.execPath, [cli, ...args], { encoding: "utf8" });
     expect(result.status).toBe(12);
     expect(result.stderr).toContain("recognized but unavailable");
@@ -31,12 +31,15 @@ test("hosted identity commands fail closed without an authenticated control-plan
   }
 });
 
-test("the executable does not open the TUI before hosted authentication is configured", () => {
-  for (const args of [[], ["tui"]]) {
-    const result = spawnSync(process.execPath, [cli, ...args], { encoding: "utf8", env: { ...process.env, TINKERBOT_CONTROL_PLANE_URL: "", TINKERBOT_SESSION_TOKEN: "" } });
-    expect(result.status).toBe(3);
-    expect(result.stderr).toContain("TINKERBOT_CONTROL_PLANE_URL");
-  }
+test("empty invocation prints help and login requires a session token", () => {
+  const help = spawnSync(process.execPath, [cli], { encoding: "utf8", env: { ...process.env, TINKERBOT_CONTROL_PLANE_URL: "", TINKERBOT_SESSION_TOKEN: "" } });
+  expect(help.status).toBe(0);
+  expect(help.stdout).toContain("Tinkerbot");
+  const login = spawnSync(process.execPath, [cli, "login"], { encoding: "utf8", env: { ...process.env, TINKERBOT_CONTROL_PLANE_URL: "", TINKERBOT_SESSION_TOKEN: "" } });
+  expect(login.status).toBe(3);
+  const dashboard = spawnSync(process.execPath, [cli, "tui"], { encoding: "utf8", env: { ...process.env, TINKERBOT_CONTROL_PLANE_URL: "", TINKERBOT_SESSION_TOKEN: "" } });
+  expect(dashboard.status).toBe(2);
+  expect(dashboard.stderr).toContain("TTY");
 });
 
 test("uses stable configuration error exit code", () => {

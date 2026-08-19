@@ -1,26 +1,21 @@
 # Roadmap
 
-## Available in the current release
+## Available in the current source tree
 
-- Test-integrity analysis with base/head non-vacuity checks, coverage, and optional targeted mutation evidence.
-- TypeScript/JavaScript, Python, Go, Rust, C, and C++ impact analysis with explicit unresolved runtime, macro, and preprocessing paths.
-- Bounded read-only toolchain validation plus workspace-aware import resolution for TypeScript aliases, Python `src/` layouts, nested Go modules, Rust crates, and C/C++ compile databases.
-- Stable report schema and terminal, JSON, Markdown, and SARIF output.
-- Baselines, narrow waivers, stale-state detection, and explicit `new`, `existing`, `resolved`, `unknown`, `waived`, and `expired` states.
-- Policy packs, normalized CI artifact parsing, test-to-change provenance, fail-closed test selection recommendations, local JSONL history, API Contract Guard, and Fixture/Snapshot Integrity.
-- Fork-safe `pull_request` Action behavior with local reports and best-effort GitHub publishing.
+- Factory definitions (`.tinkerbot/factory.yaml`), append-only work-order state machine, and `tb factory validate`.
+- Cloudflare Worker queue/workflow stages: Foreman, Triage, Specification, GitHub Actions implementation, deterministic verification, Review, Release/approval.
+- Dashboard pages for factories, work orders, runs, findings, GitHub, usage, and billing.
+- GitHub App publisher (inline comments, Check Runs, dedupe) and Action OIDC run-token exchange.
+- Seat-based Stripe catalog ($20 / $40 / $60 per active human seat; annual $200 / $400 / $600) with a Tinkerbot-owned 14-day Team trial and past-due grace. Tokens and runs are usage telemetry, not the billing unit.
+- OS matrix CI (`ubuntu-latest`, `macos-latest`, `windows-latest`) with `fail-fast: false`.
 
-## Next implementation candidates
+## Next
 
-1. Add runtime test-execution adapters that can associate individual test cases with changed lines without changing the default test runner.
-2. Add reliable GraphQL schema parsing when a repository provides an established parser and fixtures.
-3. Add bounded cache indexes for contract parses, fixture scans, and provenance evidence with complete revision/config keys.
-4. Validate the Action against an authorized GitHub repository, including missing permissions, fork runs, repeated comments, and Check Run updates.
+1. Provision production Queue, R2, Workflow, Workers AI, GitHub App keys, and nonempty `STRIPE_PLANS_JSON`.
+2. Enable WorkOS event sync and Stripe scheduled reconciliation against live events.
+3. Add tag-release signing (checksums, npm provenance, Developer ID, Authenticode, cosign) and only then set `"signed": true`.
+4. Optional later: AI Gateway DLP, Sandbox/Containers for hosted implementation.
 
 ## Intentionally deferred
 
-Scope drift, release safety, agent receipts, context drift, agent collision, flaky-test decisions, and dependency impact have extension contracts under `docs/tools/`. CI Impact Selector is represented by the implemented fail-closed `select-tests` recommendation. The remaining tools do not have public placeholder commands; each needs representative repository fixtures and a deterministic evidence source before implementation.
-
-## Release discipline
-
-A feature is release-ready only when it has a real vertical slice, unit/integration/CLI tests, documented unknown and security behavior, stable report output, bounded execution, and passing `pnpm lint`, `pnpm typecheck`, `pnpm test`, `pnpm build`, and `git diff --check`.
+Realtime dashboard streaming, autonomous merge, `pull_request_target`, token/run billing, and unrestricted coding agents.

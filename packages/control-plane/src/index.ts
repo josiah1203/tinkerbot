@@ -1,125 +1,44 @@
 import type { PrProofReport, Verdict } from "../../core/src/types";
+export {
+  BILLING_CATALOG_VERSION,
+  BILLING_POLICY,
+  ENTITLEMENT_KEYS,
+  PAID_CAP_FIELDS,
+  PLAN_CATALOG,
+  calculateEntitlements,
+  canConnectPrivateRepository,
+  containsPaidCapField,
+  effectivePlanId,
+  getPlan,
+  hasEntitlement,
+  isBillableSeat,
+  isPlanId,
+  modelForCostClass,
+  normalizeBillingStatus,
+  publicBillingCatalog,
+  publicCapabilities,
+  type AiCostClass,
+  type BillingInterval,
+  type BillingStatus,
+  type CalculatedEntitlements,
+  type EntitlementAvailability,
+  type EntitlementInput,
+  type EntitlementKey,
+  type EnterpriseGrant,
+  type IdentityType,
+  type Plan,
+  type PlanId,
+  type TrialState,
+} from "./entitlements";
+import { type BillingStatus, type PlanId } from "./entitlements";
 
-export type BillingStatus =
-  | "free"
-  | "trialing"
-  | "active"
-  | "past_due"
-  | "canceled"
-  | "expired"
-  | "payment_required"
-  | "enterprise_inquiry"
-  | "billing_unavailable";
-
-export type PlanId = "free" | "developer" | "team" | "business" | "enterprise";
 export type OrganizationRole = "owner" | "admin" | "maintainer" | "reviewer" | "viewer" | "billing_administrator";
-
-export interface Plan {
-  id: PlanId;
-  displayName: string;
-  price: { amountCents: number | null; currency: "USD"; interval: "month" | "year" | "custom" };
-  annualPriceCents?: number;
-  billingUnit: "active_seat" | "organization" | "custom";
-  privateRepositoryLimit: number | null;
-  historyRetention: string;
-  policyFeatures: string[];
-  teamFeatures: string[];
-  auditFeatures: string[];
-  supportLevel: "community" | "standard" | "priority" | "enterprise";
-  selfHostedAvailable: boolean;
-}
-
-export const PLAN_CATALOG: Readonly<Record<PlanId, Plan>> = {
-  free: {
-    id: "free",
-    displayName: "Free",
-    price: { amountCents: 0, currency: "USD", interval: "month" },
-    billingUnit: "organization",
-    privateRepositoryLimit: 0,
-    historyRetention: "Local only",
-    policyFeatures: ["Default advisory policy"],
-    teamFeatures: [],
-    auditFeatures: [],
-    supportLevel: "community",
-    selfHostedAvailable: false,
-  },
-  developer: {
-    id: "developer",
-    displayName: "Developer",
-    price: { amountCents: 1200, currency: "USD", interval: "month" },
-    annualPriceCents: 12000,
-    billingUnit: "active_seat",
-    privateRepositoryLimit: null,
-    historyRetention: "90 days",
-    policyFeatures: ["Repository policies", "Baselines and waivers"],
-    teamFeatures: ["Unlimited repositories", "Per active accepted seat"],
-    auditFeatures: ["90-day audit log"],
-    supportLevel: "standard",
-    selfHostedAvailable: false,
-  },
-  team: {
-    id: "team",
-    displayName: "Team",
-    price: { amountCents: 1800, currency: "USD", interval: "month" },
-    annualPriceCents: 18000,
-    billingUnit: "active_seat",
-    privateRepositoryLimit: null,
-    historyRetention: "1 year",
-    policyFeatures: ["Repository policies", "Baselines and waivers", "Required evidence rules"],
-    teamFeatures: ["Unlimited repositories", "Role-based access", "Per active accepted seat"],
-    auditFeatures: ["1-year audit log"],
-    supportLevel: "priority",
-    selfHostedAvailable: false,
-  },
-  business: {
-    id: "business",
-    displayName: "Business",
-    price: { amountCents: 2900, currency: "USD", interval: "month" },
-    annualPriceCents: 29000,
-    billingUnit: "active_seat",
-    privateRepositoryLimit: null,
-    historyRetention: "2 years",
-    policyFeatures: ["Required evidence rules", "Blocking policy controls", "Policy revision history"],
-    teamFeatures: ["Unlimited repositories", "Advanced repository access", "Per active accepted seat"],
-    auditFeatures: ["2-year audit log", "Exportable audit events"],
-    supportLevel: "priority",
-    selfHostedAvailable: false,
-  },
-  enterprise: {
-    id: "enterprise",
-    displayName: "Enterprise",
-    price: { amountCents: null, currency: "USD", interval: "custom" },
-    billingUnit: "custom",
-    privateRepositoryLimit: null,
-    historyRetention: "Configurable",
-    policyFeatures: ["Custom policy controls", "Approval workflows"],
-    teamFeatures: ["Custom member limit", "SCIM / SSO configuration"],
-    auditFeatures: ["Configurable audit retention"],
-    supportLevel: "enterprise",
-    selfHostedAvailable: false,
-  },
-};
 
 export interface EntitlementSnapshot {
   planId: PlanId;
   billingStatus: BillingStatus;
   activePrivateRepositories: number;
   memberCount: number;
-}
-
-export function getPlan(planId: PlanId): Plan {
-  const plan = PLAN_CATALOG[planId];
-  if (!plan) throw new Error(`Unknown plan: ${String(planId)}`);
-  return plan;
-}
-
-export function canConnectPrivateRepository(snapshot: EntitlementSnapshot): boolean {
-  if (!snapshot || !Number.isFinite(snapshot.activePrivateRepositories) || snapshot.activePrivateRepositories < 0) return false;
-  let plan: Plan;
-  try { plan = getPlan(snapshot.planId); } catch { return false; }
-  if (snapshot.billingStatus === "past_due" || snapshot.billingStatus === "payment_required" || snapshot.billingStatus === "expired") return false;
-  if (plan.privateRepositoryLimit === null) return true;
-  return snapshot.activePrivateRepositories < plan.privateRepositoryLimit;
 }
 
 export function usageRatio(used: number, limit: number | null): number | null {
@@ -139,7 +58,7 @@ export type OrganizationAction =
 
 const ROLE_ACTIONS: Readonly<Record<OrganizationRole, ReadonlySet<OrganizationAction>>> = {
   owner: new Set(["manage_billing", "manage_members", "manage_policy", "view_audit", "connect_repository", "delete_metadata"]),
-  admin: new Set(["manage_members", "manage_policy", "view_audit", "connect_repository", "delete_metadata"]),
+  admin: new Set(["manage_billing", "manage_members", "manage_policy", "view_audit", "connect_repository", "delete_metadata"]),
   maintainer: new Set(["manage_policy", "connect_repository"]),
   reviewer: new Set(["view_audit"]),
   viewer: new Set(),
@@ -150,7 +69,7 @@ export function isOrganizationActionAllowed(role: OrganizationRole, action: Orga
   return ROLE_ACTIONS[role]?.has(action) ?? false;
 }
 
-export function safeReturnTo(value: unknown, fallback = "/app/overview"): string {
+export function safeReturnTo(value: unknown, fallback = "/app"): string {
   if (typeof value !== "string" || value.length === 0) return fallback;
   if (value.length > 2048 || /[\u0000-\u001f\u007f\\]/.test(value) || !value.startsWith("/") || value.startsWith("//") || value.includes("://")) return fallback;
   return value;
@@ -184,7 +103,7 @@ export interface AuthAdapter {
   signOut(): Promise<void>;
 }
 
-const SESSION_KEY = "pr-proof.control-plane.session";
+const SESSION_KEY = "tinkerbot.control-plane.session";
 
 function sessionFromInput(name: string, email: string): AuthSession {
   return {

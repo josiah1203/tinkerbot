@@ -15,5 +15,5 @@
     "types": ["node", "vitest/globals"]
   },
   "include": ["packages/**/*.ts", "action/**/*.ts", "tests/**/*.ts"],
-  "exclude": ["node_modules", "dist", "fixtures/**/node_modules", "packages/tui/**", "packages/**/*.test.ts"]
+  "exclude": ["node_modules", "dist", "fixtures/**/node_modules", "packages/**/*.test.ts", "tests/e2e"]
 }

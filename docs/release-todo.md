@@ -7,7 +7,7 @@ This is the remaining work required to make Tinkerbot a production release. It s
 ### Hosted web application
 
 - [ ] Replace the browser's development-preview authentication with the deployed WorkOS session flow.
-- [ ] Connect overview, repositories, runs, findings, policies, baselines, change sets, releases, outcomes, and integrations to authoritative hosted data rather than bundled preview data.
+- [ ] Live-validate Overview, Factories, Work orders, Findings, GitHub integrations, Usage, Billing, and Settings against the deployed Worker APIs.
 - [ ] Implement and authorize the currently preview-only writes: repository connection/settings, policy assignment, hosted baseline state, settings persistence, and integration management.
 - [ ] Persist organization selection in the web app and refresh all organization-scoped data after a switch.
 - [ ] Connect GitHub App installation and repository-sync state to the Integrations and Repositories views.
@@ -18,7 +18,7 @@ This is the remaining work required to make Tinkerbot a production release. It s
 
 ### Control plane and data model
 
-- [ ] Reconcile the paid-plan repository-limit policy across the control-plane catalog, hosted-integration schema, UI copy, and the Stripe catalog before launch. The current product catalog describes unlimited paid repositories while the deployable Stripe schema requires explicit numeric limits.
+- [ ] Confirm seat-based Stripe catalog (no private-repository or member caps) with live Price IDs; factory entitlements stay in `features_json`.
 - [ ] Add scheduled Stripe reconciliation and alerting for missed or failed webhook processing.
 - [ ] Verify all entitlement checks cover repository access, seat limits, retention, policy features, audit access, and assurance ingestion.
 - [ ] Add production observability: structured error logging, request correlation, alerts, and an operational runbook.
@@ -28,20 +28,18 @@ This is the remaining work required to make Tinkerbot a production release. It s
 
 ### GitHub App and GitHub Action
 
-- [ ] Replace GitHub App manifest placeholder URLs with canonical production URLs.
+- [ ] Register the GitHub App using the Worker routes in `github-app/manifest.json` (homepage, callback, setup, webhook `/integrations/github/webhook`).
 - [ ] Complete App authentication/token-minting configuration and restrict permissions to the minimum required scope.
 - [ ] Test GitHub installation, uninstall, permission change, webhook retry, signature rejection, and replay rejection.
 - [ ] Add repository synchronization and installation state to the hosted app.
-- [ ] Configure the Action with an appropriate short-lived production service credential; do not rely on a developer's personal session token.
-- [ ] Run the Action in a real test repository for PR Checks, annotations, sticky comments, retries, failures, and forked PR behavior.
-- [ ] Decide and document the public check identity: Action-owned check versus GitHub-App-owned check.
+- [ ] Configure customer workflows with `id-token: write` so the Action exchanges GitHub OIDC for a run token; do not paste a developer WorkOS session UUID.
+- [ ] Run the Action in a real test repository for App-owned Checks, inline comments, retries, failures, and forked PR behavior (Action publish is fallback only).
 - [ ] Publish and pin the versioned Action release (`v0.x.y` and major tag) only after live validation.
 
-### TUI and CLI
+### CLI and dashboard
 
-- [ ] Implement a supported interactive/device/browser login flow for `tb login`, or document and ship a secure alternative credential-bootstrap workflow.
-- [ ] Live-test `tb whoami`, `tb logout`, `tb org list`, `tb org switch`, `tb tui`, and `tb verify` against production.
-- [ ] Verify the TUI’s loading, refresh, cancellation, server error, forbidden/entitlement, expired-session, empty-state, and verification-submission paths against the live API.
+- [ ] Live-test `tb login`, `tb whoami`, `tb logout`, `tb org list`, `tb org switch`, `tb dashboard`, `tb factory`, `tb work`, `tb run`, and `tb verify` against production.
+- [ ] Verify dashboard loading, server error, forbidden/entitlement, expired-session, and empty-state paths against the live API.
 - [ ] Publish a clear local-versus-hosted command matrix and remove any command that looks available but is unsupported.
 - [ ] Build all promised target binaries, including Darwin ARM64 and x64; add Linux targets if they are part of the supported release promise.
 - [ ] Sign release binaries, produce checksums and provenance, and make the manifest attest to the actual signing state.
@@ -49,9 +47,9 @@ This is the remaining work required to make Tinkerbot a production release. It s
 
 ### Quality, security, and documentation
 
-- [ ] Raise and enforce **unified** coverage to at least 98% for branches, functions, lines, and statements across all packages, including TUI sources.
+- [ ] Raise and enforce **unified** coverage to at least 98% for branches, functions, lines, and statements across all shipped packages.
 - [ ] Add branch thresholds to coverage configuration and remove exclusions that prevent the release metric from measuring shipped code.
-- [ ] Run final lint, typecheck, complete test suite, coverage suite, TUI build, CLI package build, and clean-install smoke tests on the release commit.
+- [ ] Run final lint, typecheck, complete test suite, coverage suite, CLI package build, and clean-install smoke tests on the release commit.
 - [ ] Run security/dependency/license review and fix or accept findings through a documented release decision.
 - [ ] Review all public documentation, CLI help, Action README, installation paths, architecture docs, ADRs, pricing, support contacts, and examples for consistency with the deployed product.
 - [ ] Write release notes, a changelog entry, support escalation path, incident response/runbook, and rollback procedure.
@@ -70,7 +68,7 @@ This is the remaining work required to make Tinkerbot a production release. It s
 
 - [ ] Authenticate the approved production deploy identity. Wrangler is currently unauthenticated in this environment.
 - [ ] Confirm the Cloudflare account, Worker names, production domain, route, and deployment approval path.
-- [ ] Create/verify production D1 and R2 bindings; apply all required migrations; configure R2 retention/lifecycle rules.
+- [ ] Verify the newly enabled R2 account, create/confirm the evidence bucket, bind it as `EVIDENCE_BUCKET` in staging and production, apply required migrations, and configure R2 retention/lifecycle rules.
 - [ ] Set Worker secrets interactively or through the approved secret manager: WorkOS credentials, Stripe credentials, session encryption key, and GitHub webhook secret.
 - [ ] Set non-secret production variables, including the final `STRIPE_PLANS_JSON` catalog and approved WorkOS event-sync configuration.
 - [ ] Validate Worker health/config status and every protected endpoint after deployment.
@@ -110,7 +108,7 @@ This is the remaining work required to make Tinkerbot a production release. It s
 
 - [ ] Freeze a release candidate commit and verify a clean working tree.
 - [ ] Obtain green GitHub CI on that exact commit.
-- [ ] Deploy to staging and run the full cross-surface acceptance suite: web app, Worker, WorkOS, Stripe, GitHub App, GitHub Action, CLI, and TUI.
+- [ ] Deploy to staging and run the full cross-surface acceptance suite: dashboard, Worker, WorkOS, Stripe, GitHub App, GitHub Action, and CLI.
 - [ ] Verify that no source code, full diffs, credentials, or raw secrets can enter hosted assurance ingestion, logs, artifacts, or comments.
 - [ ] Exercise failure paths: unavailable providers, invalid/replayed webhooks, unauthorized org access, expired sessions, failed billing, Action retry, and rollback.
 - [ ] Produce and sign release artifacts; verify them independently on clean machines.
@@ -119,8 +117,8 @@ This is the remaining work required to make Tinkerbot a production release. It s
 
 ## Completed source foundations (not release approvals)
 
-- Hosted CLI/TUI adapters and source-minimized assurance ingestion are implemented.
+- Factory contracts, D1 schema, Worker queue/workflow path, PKCE auth, dashboard APIs, OIDC exchange, GitHub App publisher, seat billing, and CLI factory/work/run commands are implemented in source.
 - Worker routes for WorkOS, Stripe, GitHub lifecycle, tenant access, billing, and assurance are implemented.
-- The GitHub Action emits an assurance bundle and supports hosted ingest when configured.
-- Web routes and the local report viewer are implemented; many web screens remain preview data until the hosted wiring above is complete.
-- Distribution scripts, Homebrew formula rendering, a curl installer, and the Stripe catalog example are present, but publication and signing are not complete.
+- The GitHub Action emits an assurance bundle and supports OIDC ingest when configured; App publication is the intended Check identity.
+- Dashboard pages call Worker factory/work/run APIs; live data still requires a deployed control plane.
+- Distribution scripts, Homebrew formula rendering, a curl installer, and the Stripe catalog example are present, but publication and signing are not complete. The OpenTUI client has been retired.

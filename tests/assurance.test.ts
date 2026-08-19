@@ -460,3 +460,15 @@ test("evidence contracts preserve deterministic identity, explicit states, priva
   expect(createEvidenceContract({ report: report({ verdict: "PASS" }) }).verdict).toBe("PASS");
   expect(createEvidenceContract({ report: report({ verdict: "UNKNOWN" }) }).verdict).toBe("UNKNOWN");
 });
+
+test("release assessment blocks without rollback and outcomes cannot upgrade a tb check verdict", () => {
+  const failing = report({ verdict: "FAIL" });
+  const outcome = createRuntimeOutcome({ outcomeType: "successful_release", observedAt: "2026-01-01T00:00:00.000Z", facts: { note: "shipped" } });
+  expect(failing.verdict).toBe("FAIL");
+  expect(JSON.stringify(outcome)).not.toMatch(/"verdict":"PASS"/);
+  const blocked = assessReleaseSafety({
+    manifest: createReleaseManifest({ releaseId: "rel-rollback", includedRepositories: [{ repository: "acme/pay", commitSha: "abc", receiptIds: [] }], requiredReceiptIds: [], policyStatus: "present", migrationSequence: ["001"], rollbackReferences: [] }),
+  });
+  expect(blocked.status).toBe("blocked");
+  expect(blocked.blocking.some((item) => /rollback/i.test(item))).toBe(true);
+});

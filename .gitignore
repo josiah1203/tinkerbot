@@ -13,9 +13,14 @@ dist/
 !.tinkerbot/tinkerbot.yml
 !.tinkerbot/tinkerbot.yaml
 !.tinkerbot/tinkerbot.json
+!.tinkerbot/factory.yml
+!.tinkerbot/factory.yaml
 .DS_Store
 *.log
 *.tsbuildinfo
+/test-results/
+/playwright-report/
+/blob-report/
 **/.dev.vars
 **/.env.*
 !.env.example

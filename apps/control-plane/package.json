@@ -1,5 +1,5 @@
 {
-  "name": "@pr-proof/control-plane-preview",
+  "name": "@tinkerbot/control-plane",
   "private": true,
   "type": "module",
   "scripts": {
