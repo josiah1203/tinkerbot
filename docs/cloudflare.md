@@ -1,6 +1,8 @@
 # Cloudflare hosted runtime and secrets
 
-The factory Worker binds D1, R2 (`EVIDENCE_BUCKET`), Queue (`FACTORY_EVENTS`), Workers AI (`AI`), and static assets for the dashboard. Optional customer S3/GCS export uses Worker secrets `EVIDENCE_EXPORT_ENDPOINT` and `EVIDENCE_EXPORT_TOKEN` after a successful R2 put. Export failure does not change a `tb check` verdict. Cron (`*/15 * * * *`) reconciles billing metadata and, when enabled, WorkOS Events.
+The factory Worker binds D1, R2 (`EVIDENCE_BUCKET`), Queue (`FACTORY_EVENTS`), Workers AI (`AI`), a `Sandbox` Durable Object binding, and static assets for the dashboard. Wrangler `database_id` values are placeholders: operators must create distinct D1 databases for development, staging, and production and replace `00000000-…`, `11111111-…`, and `22222222-…`. See [hosted provisioning](./hosted-provisioning.md).
+
+Optional customer S3/GCS export uses Worker secrets `EVIDENCE_EXPORT_ENDPOINT` and `EVIDENCE_EXPORT_TOKEN` after a successful R2 put. Export failure does not change a `tb check` verdict. Cron (`*/15 * * * *`) reconciles billing metadata and, when enabled, WorkOS Events.
 
 GitLab intake is `POST /integrations/gitlab/webhook` (MR and Issue hooks, `GITLAB_WEBHOOK_SECRET`). Job/Pipeline/Deployment/System hooks are rejected. GitLab CI OIDC is a peer of GitHub Actions for ingest only.
 

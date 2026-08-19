@@ -5,6 +5,7 @@ import {
   containsRawCredentials,
   createWorkOrder,
   decodeJwtPayload,
+  validateOidcClaims,
   executeFactoryRun,
   factoryDefinitionDigest,
   loadFactoryDefinition,
@@ -15,7 +16,9 @@ import {
   signRecord,
   transitionWorkOrder,
   validateFactoryDefinition,
-  validateOidcClaims,
+  verifyOidcJwt,
+  resetOidcJwksCache,
+  customerCostView,
   verificationAuthority,
   verifySignedRecord,
   workOrderEventIdempotencyKey,
@@ -106,6 +109,7 @@ import {
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { generateKeyPairSync, createSign } from "node:crypto";
 
 const yaml = `
 version: 1
@@ -206,18 +210,60 @@ describe("factory domain", () => {
     expect(ready.stages.find((stage) => stage.stage === "implementation")?.summary).not.toMatch(/Dispatched to GitHub Actions customer runner/);
   });
 
-  test("signed records and OIDC claims fail closed", () => {
+  test("signed records and OIDC JWKS verification fail closed", async () => {
     const record = signRecord({ workOrderId: "wo_1", decision: "approved" }, "unit-test-secret");
     expect(verifySignedRecord(record, "unit-test-secret")).toBe(true);
     expect(verifySignedRecord(record, "other-secret")).toBe(false);
     expect(publicationDedupeKey("run", "fp", "abc")).toBe("run:fp:abc");
     const payload = Buffer.from(JSON.stringify({ iss: "https://token.actions.githubusercontent.com", aud: "tinkerbot", repository: "acme/payments", sha: "abc" })).toString("base64url");
-    const token = `e30.${payload}.sig`;
-    expect(decodeJwtPayload(token)?.repository).toBe("acme/payments");
-    expect(validateOidcClaims(decodeJwtPayload(token)!, { audience: "tinkerbot", repository: "acme/payments", sha: "abc" })).toEqual({ ok: true });
-    expect(validateOidcClaims(decodeJwtPayload(token)!, { audience: "other", repository: "acme/payments" }).ok).toBe(false);
-    const gitlabPayload = Buffer.from(JSON.stringify({ iss: "https://gitlab.com", aud: "tinkerbot", project_path: "acme/payments", sha: "abc" })).toString("base64url");
-    expect(validateOidcClaims(decodeJwtPayload(`e30.${gitlabPayload}.sig`)!, { audience: "tinkerbot", repository: "acme/payments" })).toEqual({ ok: true });
+    const unsigned = `e30.${payload}.sig`;
+    expect(decodeJwtPayload(unsigned)?.repository).toBe("acme/payments");
+    expect(validateOidcClaims(decodeJwtPayload(unsigned)!, { audience: "tinkerbot", repository: "acme/payments", sha: "abc" })).toEqual({ ok: true });
+    expect((await verifyOidcJwt(unsigned, { audience: "tinkerbot", repository: "acme/payments" })).ok).toBe(false);
+    const { publicKey, privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const jwk = { ...publicKey.export({ format: "jwk" }), kid: "k1", alg: "RS256", use: "sig" };
+    const now = Math.floor(Date.now() / 1000);
+    const claims = { iss: "https://token.actions.githubusercontent.com", aud: "tinkerbot", repository: "acme/payments", sha: "abc", exp: now + 120, iat: now, nbf: now, jti: "jti-1" };
+    const header = Buffer.from(JSON.stringify({ alg: "RS256", kid: "k1", typ: "JWT" })).toString("base64url");
+    const body = Buffer.from(JSON.stringify(claims)).toString("base64url");
+    const signer = createSign("RSA-SHA256");
+    signer.update(`${header}.${body}`);
+    signer.end();
+    const token = `${header}.${body}.${signer.sign(privateKey).toString("base64url")}`;
+    resetOidcJwksCache();
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      expect(String(input)).toContain("token.actions.githubusercontent.com");
+      return new Response(JSON.stringify({ keys: [jwk] }), { status: 200 });
+    }) as typeof fetch;
+    expect((await verifyOidcJwt(token, { audience: "tinkerbot", repository: "acme/payments", sha: "abc" }, { fetchImpl, nowSeconds: now })).ok).toBe(true);
+    const forgedHeader = Buffer.from(JSON.stringify({ alg: "RS256", kid: "k1", typ: "JWT" })).toString("base64url");
+    const forgedBody = Buffer.from(JSON.stringify({ ...claims, repository: "evil/repo" })).toString("base64url");
+    expect((await verifyOidcJwt(`${forgedHeader}.${forgedBody}.${token.split(".")[2]}`, { audience: "tinkerbot", repository: "evil/repo" }, { fetchImpl, nowSeconds: now })).ok).toBe(false);
+    expect((await verifyOidcJwt(token, { audience: "tinkerbot", repository: "acme/payments" }, { fetchImpl, nowSeconds: now + 3600 })).ok).toBe(false);
+    resetOidcJwksCache();
+    let jwksCalls = 0;
+    const rotatingFetch = (async () => {
+      jwksCalls += 1;
+      const keys = jwksCalls === 1 ? [{ ...jwk, kid: "old" }] : [jwk];
+      return new Response(JSON.stringify({ keys }), { status: 200 });
+    }) as typeof fetch;
+    expect((await verifyOidcJwt(token, { audience: "tinkerbot", repository: "acme/payments", sha: "abc" }, { fetchImpl: rotatingFetch, nowSeconds: now })).ok).toBe(true);
+    expect(jwksCalls).toBe(2);
+    const gitlabClaims = { iss: "https://gitlab.com", aud: "tinkerbot", project_path: "acme/payments", exp: now + 120, iat: now };
+    const gitlabBody = Buffer.from(JSON.stringify(gitlabClaims)).toString("base64url");
+    const gitlabSigner = createSign("RSA-SHA256");
+    gitlabSigner.update(`${header}.${gitlabBody}`);
+    gitlabSigner.end();
+    const gitlabToken = `${header}.${gitlabBody}.${gitlabSigner.sign(privateKey).toString("base64url")}`;
+    resetOidcJwksCache();
+    const gitlabFetch = (async (input: RequestInfo | URL) => {
+      expect(String(input)).toContain("gitlab.com");
+      return new Response(JSON.stringify({ keys: [jwk] }), { status: 200 });
+    }) as typeof fetch;
+    expect((await verifyOidcJwt(gitlabToken, { audience: "tinkerbot", repository: "acme/payments" }, { fetchImpl: gitlabFetch, nowSeconds: now })).ok).toBe(true);
+    const customer = customerCostView({ catalogVersion: "x", plannedStages: ["foreman"], estimatedInputTokens: 1, estimatedOutputTokens: 1, estimatedDurationSeconds: 1, managedCogsCents: 8, byokSpendCents: 12, platformInvoice: "seats_only", confidence: "low", rangeCents: { low: 0, high: 1 }, provider: "anthropic" });
+    expect("managedCogsCents" in customer).toBe(false);
+    expect(customer.byokNote).toMatch(/not on your Tinkerbot invoice/);
   });
 
   test("agent receipts missing required factory fields stay UNKNOWN and never upgrade a verdict", () => {
@@ -576,12 +622,13 @@ describe("Warp v1alpha1 factory definition", () => {
       { path: ".tinkerbot/agents/b/agent.md", contents: "---\nagentType: FOREMAN\n---\nB\n" },
     ]);
     expect(validateFactoryDefinition(two, { requireForeman: true }).some((error) => /FOREMAN/.test(error))).toBe(true);
-    const metrics = factoryDashboardMetrics({ statuses: ["implementation", "released", "intake"], costCents: [12, 8] });
+    const metrics = factoryDashboardMetrics({ statuses: ["implementation", "released", "intake", "blocked"] });
     expect(metrics.opened).toBe(2);
     expect(metrics.merged).toBe(1);
-    expect(metrics.estimatedCostCents).toBe(20);
+    expect(metrics.blocked).toBe(1);
+    expect(metrics.waiting).toBe(0);
     expect(metrics.autonomyShare).toBeNull();
-    expect(metrics.caption).toMatch(/not billing/);
+    expect(metrics.caption).toMatch(/included on your plan/);
     expect(classifyActivityColumn("implementation")).toBe("building");
     expect(classifyActivityColumn("cancelled")).toBe("done");
     expect(classifyActivityColumn("review")).toBe("reviewing");

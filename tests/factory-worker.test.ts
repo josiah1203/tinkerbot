@@ -1,4 +1,5 @@
-import { createHmac } from "node:crypto";
+import { createHmac, generateKeyPairSync, createSign } from "node:crypto";
+import { resetOidcJwksCache } from "../packages/factory/src";
 import worker, { FactoryRunWorkflow, handleFactoryQueueMessage } from "../apps/control-plane-worker/src";
 import { D1FactoryStore } from "../apps/control-plane-worker/src/factory-store";
 import { ForemanDurableObject, handleFactoryMcpRequest, intakeFromIntegration, persistTranscript, runFactoryTurn, sweepFactoryOs } from "../apps/control-plane-worker/src/factory-runtime";
@@ -14,8 +15,13 @@ function oauthCookieHeader(response: Response): string {
   return `tinkerbot_oauth_state=${encodeURIComponent(cookieFrom(response, "tinkerbot_oauth_state"))}; tinkerbot_pkce=${encodeURIComponent(cookieFrom(response, "tinkerbot_pkce"))}`;
 }
 
-function oidcToken(claims: Record<string, unknown>): string {
-  return `e30.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.sig`;
+function signedOidcToken(claims: Record<string, unknown>, privateKey: ReturnType<typeof generateKeyPairSync>["privateKey"], kid = "k1"): string {
+  const header = Buffer.from(JSON.stringify({ alg: "RS256", kid, typ: "JWT" })).toString("base64url");
+  const body = Buffer.from(JSON.stringify(claims)).toString("base64url");
+  const signer = createSign("RSA-SHA256");
+  signer.update(`${header}.${body}`);
+  signer.end();
+  return `${header}.${body}.${signer.sign(privateKey).toString("base64url")}`;
 }
 
 function memoryFactoryDb(seed: {
@@ -37,10 +43,12 @@ function memoryFactoryDb(seed: {
   const decisions: Array<Record<string, unknown>> = [];
   const rateLimits = new Map<string, { count: number; window_started_at: string }>();
   const runs = new Map<string, Record<string, unknown>>();
+  const oidcJti = new Set<string>();
   const stages: Array<Record<string, unknown>> = [];
   const approvals: Array<Record<string, unknown>> = [];
   const publications: Array<Record<string, unknown>> = [];
   const installations = new Map<string, Record<string, unknown>>([["9", { installation_id: 9, organization_id: "org_1", status: "active", account_login: "acme" }]]);
+  const repositories = new Map([["acme/payments", { full_name: "acme/payments", installation_id: 9 }]]);
   const definitions = new Map<string, Record<string, unknown>>();
   const scorers: Array<Record<string, unknown>> = [];
   const selfImprovement: Array<Record<string, unknown>> = [];
@@ -56,6 +64,13 @@ function memoryFactoryDb(seed: {
           if (query.includes("FROM tinkerbot_webhook_events")) return (webhooks.has(`${String(args[1])}:${String(args[0])}`) ? { event_id: args[0] } : null) as T | null;
           if (query.includes("FROM tinkerbot_rate_limits")) return (rateLimits.get(String(args[0])) ?? null) as T | null;
           if (query.includes("FROM tinkerbot_github_installations") && query.includes("installation_id")) return (installations.get(String(args[0])) ?? null) as T | null;
+          if (query.includes("FROM tinkerbot_github_repositories")) {
+            const fullName = String(args[0]).toLowerCase();
+            const repo = [...repositories.values()].find((row) => String(row.full_name).toLowerCase() === fullName);
+            if (!repo) return null;
+            const installation = installations.get(String(repo.installation_id));
+            return (installation ? { organization_id: installation.organization_id } : null) as T | null;
+          }
           if (query.includes("FROM tinkerbot_factories") && query.includes("factory_id =")) return (factories.get(String(args[0])) ?? null) as T | null;
           if (query.includes("FROM tinkerbot_work_orders") && query.includes("work_order_id =")) return (workOrders.get(String(args[0])) ?? null) as T | null;
           if (query.includes("FROM tinkerbot_run_tokens")) {
@@ -96,6 +111,12 @@ function memoryFactoryDb(seed: {
           return { results: [] as T[] };
         },
         run: async () => {
+          if (query.startsWith("INSERT OR IGNORE INTO tinkerbot_oidc_jti")) {
+            const key = String(args[0]);
+            if (oidcJti.has(key)) return { meta: { changes: 0 } };
+            oidcJti.add(key);
+            return { meta: { changes: 1 } };
+          }
           if (query.startsWith("INSERT OR IGNORE INTO tinkerbot_webhook_events")) {
             const key = `${String(args[1])}:${String(args[0])}`;
             if (webhooks.has(key)) return { meta: { changes: 0 } };
@@ -235,7 +256,7 @@ function memoryFactoryDb(seed: {
         },
       }),
     }),
-    _state: { webhooks, sessions, workOrders, cells, proposals, decisions, runTokens, runs, factories, installations },
+    _state: { webhooks, sessions, workOrders, cells, proposals, decisions, runTokens, runs, factories, installations, memberships },
   };
   return database;
 }
@@ -273,17 +294,47 @@ test("incident and support webhooks normalize into factory work orders", async (
   expect(intakeFromIntegration("incident", { incident: { id: "inc_9", title: "Sev1", description: "500s" } }).sourceType).toBe("incident");
 });
 
-test("OIDC exchange rejects bad issuer, audience, and repository, and ingest without a run token stays unauthorized", async () => {
-  const env = { DB: memoryFactoryDb(), ACTION_OIDC_AUDIENCE: "tinkerbot" };
-  const badIssuer = await worker.fetch(new Request("https://control.example/actions/oidc/exchange", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: oidcToken({ iss: "https://evil.example", aud: "tinkerbot", repository: "acme/payments" }), repository: "acme/payments" }) }), env);
-  expect(badIssuer.status).toBe(401);
-  expect(await badIssuer.json()).toMatchObject({ code: "invalid_issuer" });
-  const badAudience = await worker.fetch(new Request("https://control.example/actions/oidc/exchange", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: oidcToken({ iss: "https://token.actions.githubusercontent.com", aud: "other", repository: "acme/payments" }), repository: "acme/payments" }) }), env);
-  expect(await badAudience.json()).toMatchObject({ code: "invalid_audience" });
-  const badRepo = await worker.fetch(new Request("https://control.example/actions/oidc/exchange", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: oidcToken({ iss: "https://token.actions.githubusercontent.com", aud: "tinkerbot", repository: "acme/other" }), repository: "acme/payments" }) }), env);
-  expect(await badRepo.json()).toMatchObject({ code: "invalid_repository" });
-  const ingest = await worker.fetch(new Request("https://control.example/assurance/ingest", { method: "POST", headers: { origin: "https://control.example", "content-type": "application/json" }, body: JSON.stringify({ repository: "acme/payments", assurance: { schemaVersion: 1 } }) }), { ...env, SESSION_ENCRYPTION_KEY: "session-encryption-test-key", WORKOS_CLIENT_ID: "client_test", WORKOS_API_KEY: "workos_test_secret" });
-  expect(ingest.status).toBe(401);
+test("OIDC exchange verifies JWKS, rejects unsigned helpers, and requires a GitHub App installation", async () => {
+  const { publicKey, privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const jwk = { ...publicKey.export({ format: "jwk" }), kid: "k1", alg: "RS256", use: "sig" };
+  const now = Math.floor(Date.now() / 1000);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    if (String(input).includes(".well-known/jwks") || String(input).includes("oauth/discovery/keys")) {
+      return new Response(JSON.stringify({ keys: [jwk] }), { status: 200 });
+    }
+    return new Response("{}", { status: 404 });
+  }) as typeof fetch;
+  resetOidcJwksCache();
+  try {
+    const env = { DB: memoryFactoryDb(), ACTION_OIDC_AUDIENCE: "tinkerbot" };
+    const unsigned = await worker.fetch(new Request("https://control.example/actions/oidc/exchange", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: `e30.${Buffer.from(JSON.stringify({ iss: "https://token.actions.githubusercontent.com", aud: "tinkerbot", repository: "acme/payments" })).toString("base64url")}.sig`, repository: "acme/payments" }) }), env);
+    expect(unsigned.status).toBe(401);
+    expect(await unsigned.json()).toMatchObject({ code: "unsigned_or_malformed" });
+    const baseClaims = { iss: "https://token.actions.githubusercontent.com", aud: "tinkerbot", repository: "acme/payments", sha: "abc", exp: now + 120, iat: now, nbf: now, jti: "jti-exchange-1" };
+    const badIssuer = await worker.fetch(new Request("https://control.example/actions/oidc/exchange", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: signedOidcToken({ ...baseClaims, iss: "https://evil.example" }, privateKey), repository: "acme/payments" }) }), env);
+    expect(await badIssuer.json()).toMatchObject({ code: "invalid_issuer" });
+    const badAudience = await worker.fetch(new Request("https://control.example/actions/oidc/exchange", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: signedOidcToken({ ...baseClaims, aud: "other", jti: "jti-aud" }, privateKey), repository: "acme/payments" }) }), env);
+    expect(await badAudience.json()).toMatchObject({ code: "invalid_audience" });
+    const expired = await worker.fetch(new Request("https://control.example/actions/oidc/exchange", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: signedOidcToken({ ...baseClaims, exp: now - 120, jti: "jti-exp" }, privateKey), repository: "acme/payments" }) }), env);
+    expect(await expired.json()).toMatchObject({ code: "expired" });
+    const forged = signedOidcToken({ ...baseClaims, jti: "jti-forged" }, privateKey).split(".");
+    const tampered = `${forged[0]}.${Buffer.from(JSON.stringify({ ...baseClaims, repository: "evil/repo", jti: "jti-forged" })).toString("base64url")}.${forged[2]}`;
+    expect((await (await worker.fetch(new Request("https://control.example/actions/oidc/exchange", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: tampered, repository: "evil/repo" }) }), env)).json())).toMatchObject({ code: "invalid_signature" });
+    const missingInstall = await worker.fetch(new Request("https://control.example/actions/oidc/exchange", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: signedOidcToken({ ...baseClaims, repository: "acme/missing", jti: "jti-missing" }, privateKey), repository: "acme/missing" }) }), env);
+    expect(missingInstall.status).toBe(401);
+    expect(await missingInstall.json()).toMatchObject({ code: "installation_required" });
+    const ok = await worker.fetch(new Request("https://control.example/actions/oidc/exchange", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: signedOidcToken(baseClaims, privateKey), repository: "acme/payments", sha: "abc" }) }), env);
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toMatchObject({ repository: "acme/payments" });
+    const replay = await worker.fetch(new Request("https://control.example/actions/oidc/exchange", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: signedOidcToken(baseClaims, privateKey), repository: "acme/payments" }) }), env);
+    expect(await replay.json()).toMatchObject({ code: "replay" });
+    const ingest = await worker.fetch(new Request("https://control.example/assurance/ingest", { method: "POST", headers: { origin: "https://control.example", "content-type": "application/json" }, body: JSON.stringify({ repository: "acme/payments", assurance: { schemaVersion: 1 } }) }), { ...env, SESSION_ENCRYPTION_KEY: "session-encryption-test-key", WORKOS_CLIENT_ID: "client_test", WORKOS_API_KEY: "workos_test_secret" });
+    expect(ingest.status).toBe(401);
+  } finally {
+    globalThis.fetch = originalFetch;
+    resetOidcJwksCache();
+  }
 });
 
 test("scheduled sweep marks expired work cells abandoned", async () => {
@@ -513,7 +564,7 @@ test("factory store methods persist cells, tokens, publications, products, and r
   const view = await store.factoryOperatorView("fac_3", "org_1");
   expect(view?.factory.alias).toBe("payments");
   expect(view?.agents.some((agent) => agent.agentType === "FOREMAN")).toBe(true);
-  expect(view?.metrics.caption).toMatch(/not billing/);
+  expect(view?.metrics.caption).toMatch(/included on your plan/);
   await database.prepare("INSERT INTO tinkerbot_factory_definitions (definition_id, factory_id, digest, yaml, files_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind("def_bad", "fac_2", "digest", "version: 1\nname: billing\nrepositories:\n  - acme/billing\nsources:\n  - type: manual\n", "not-json", now).run();
   expect(await store.getLatestDefinition("fac_2")).toMatchObject({ files: [] });
   expect(await store.factoryOperatorView("missing", "org_1")).toBeNull();
@@ -566,6 +617,21 @@ test("authenticated factory HTTP lists products, cells, evolution, and MCP witho
     const mcp = await worker.fetch(new Request("https://control.example/mcp", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }) }), env);
     expect(mcp.status).toBe(200);
     expect(JSON.stringify(await mcp.json())).not.toContain("cluster execute");
+    const sync = await worker.fetch(new Request("https://control.example/runtime/sync", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ kind: "factory-run", origin: "local", runId: "local-run", plan: { planId: "p1", origin: "local", profile: { collaboration: "team", controlPlane: "local", pipeline: "multi_agent", runner: { type: "docker" }, inference: { mode: "managed" }, approval: "human_async", sync: "offline" }, selectedPipeline: "multi_agent", stages: [], skip: [], runner: { type: "docker" }, estimatedDurationSeconds: 1, cost: { catalogVersion: "2026-08-18.seat-v1", plannedStages: [], estimatedInputTokens: 0, estimatedOutputTokens: 0, estimatedDurationSeconds: 1, managedCogsCents: 0, byokSpendCents: 0, platformInvoice: "seats_only", confidence: "low", rangeCents: { low: 0, high: 1 } }, escalationEligible: false, createdAt: "now" } }) }), env);
+    expect(sync.status).toBe(200);
+    expect(await sync.json()).toMatchObject({ accepted: true, origin: "local" });
+    const secretRejected = await worker.fetch(new Request("https://control.example/runtime/sync", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ kind: "factory-run", token: "sk_live_notallowed" }) }), env);
+    expect(secretRejected.status).toBe(400);
+    database._state.memberships.set("user_1:org_1", { organization_id: "org_1", user_id: "user_1", role: "viewer", status: "active" });
+    const viewerPost = await worker.fetch(new Request("https://control.example/factories", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ name: "payments" }) }), env);
+    expect(viewerPost.status).toBe(403);
+    database._state.memberships.set("user_1:org_1", { organization_id: "org_1", user_id: "user_1", role: "owner", status: "active" });
+    database._state.factories.set("fac_x", { factory_id: "fac_x", organization_id: "org_2", name: "other", status: "active" });
+    database._state.runs.set("run_x", { run_id: "run_x", work_order_id: "wo_x", factory_id: "fac_x", definition_digest: "sha256:x", status: "running" });
+    expect((await worker.fetch(new Request("https://control.example/runs/run_x", { headers }), env)).status).toBe(404);
+    database._state.workOrders.set("wo_x", { work_order_id: "wo_x", factory_id: "fac_x", organization_id: "org_2", status: "implementation", current_stage: "implementation" });
+    const crossCancel = await worker.fetch(new Request("https://control.example/work-orders/wo_x/cancel", { method: "POST", headers }), env);
+    expect(crossCancel.status).toBe(404);
   } finally {
     globalThis.fetch = originalFetch;
   }

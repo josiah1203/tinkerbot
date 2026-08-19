@@ -99,6 +99,10 @@ test("PTY spawn is mockable and runMasterTui seeds work and agent tabs", () => {
     fetchWork: () => ({ summary: "attached", verdict: "UNKNOWN" }),
   });
   expect(worked.state.workLog).toBe("attached");
+  expect(processMasterCommand(result.state, "/plan", {
+    ...deps(),
+    localRuntime: () => ({ plan: "Plan from sqlite", cost: "cost", eval: "eval" }),
+  }).state.planLog).toContain("Plan from sqlite");
   expect(processMasterCommand(result.state, "/dashboard", deps()).dashboard).toBe(true);
   expect(processMasterCommand(result.state, "/claude", deps()).spawn).toBe("claude");
   expect(processMasterCommand(result.state, "/factory list", deps()).state.status).toContain("factory list");

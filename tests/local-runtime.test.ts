@@ -15,8 +15,9 @@ import {
   mergeRuntimeProfile,
 } from "../packages/factory/src";
 import { publicCapabilities } from "../packages/control-plane/src/entitlements";
-import { assertNoSecretInPayload, resolveCredentialRef, runLocalFactory, SqliteFactoryStore, stubInferenceProvider, stubSandboxPort } from "../packages/local-runtime/src";
+import { anthropicProvider, assertNoSecretInPayload, LOCAL_DB_SCHEMA_VERSION, replayOutbox, resolveCredentialRef, runLocalFactory, selectLocalSandbox, SQLITE_MAGIC, SqliteFactoryStore, stubInferenceProvider, stubSandboxPort } from "../packages/local-runtime/src";
 import { evalCli, factoryPlanPayload } from "../packages/cli/src/runtime-cli";
+import { localDashboardApi } from "../packages/cli/src/local-dashboard";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -91,6 +92,63 @@ describe("local runtime", () => {
     expect(() => assertNoSecretInPayload(store.receipts[0])).not.toThrow();
     expect(resolveCredentialRef("env:TB_TEST_KEY", { TB_TEST_KEY: "abc" })).toBe("abc");
     expect(() => resolveCredentialRef("sk-raw")).toThrow();
+    expect(store.schemaVersion()).toBe(LOCAL_DB_SCHEMA_VERSION);
+    expect(fs.readFileSync(db).subarray(0, 15).toString("utf8")).toBe(SQLITE_MAGIC);
+  });
+
+  test("migrates JSON local state into SQLite", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tb-migrate-"));
+    const db = path.join(dir, "local.db");
+    fs.writeFileSync(db, `${JSON.stringify({
+      schemaVersion: 13,
+      orders: [],
+      runs: [],
+      stages: [],
+      plans: [{ planId: "plan-json", origin: "local", profile: hostedRuntimeDefaults(), selectedPipeline: "multi_agent", stages: [], skip: [], runner: { type: "docker" }, estimatedDurationSeconds: 1, cost: { catalogVersion: "2026-08-18.seat-v1", plannedStages: [], estimatedInputTokens: 0, estimatedOutputTokens: 0, estimatedDurationSeconds: 1, managedCogsCents: 0, byokSpendCents: 0, platformInvoice: "seats_only", confidence: "low", rangeCents: { low: 0, high: 1 } }, escalationEligible: false, createdAt: "now" }],
+      estimates: [],
+      actuals: [],
+      approvals: [],
+      suites: [],
+      attempts: [],
+      outbox: [],
+    })}\n`);
+    const store = new SqliteFactoryStore(db);
+    expect(store.migratedFromJson).toBe(true);
+    expect(store.plans.get("plan-json")?.planId).toBe("plan-json");
+    expect(fs.existsSync(`${db}.json.bak`)).toBe(true);
+    expect(fs.readFileSync(db).subarray(0, 15).toString("utf8")).toBe(SQLITE_MAGIC);
+  });
+
+  test("stub sandbox is selected in CI and BYOK uses recorded fixtures", async () => {
+    expect(selectLocalSandbox({ env: { VITEST: "1" } }).warning).toMatch(/stub sandbox/);
+    const fetchImpl = async () => ({ ok: true, status: 200, json: async () => ({ content: [{ text: "fixture-ok" }], usage: { input_tokens: 3, output_tokens: 2 } }) });
+    const provider = anthropicProvider("env:ANTHROPIC_API_KEY", { ANTHROPIC_API_KEY: "test-key" }, fetchImpl);
+    const result = await provider.run({ model: "claude-test", messages: [{ role: "user", content: "hi" }] });
+    expect(result.text).toBe("fixture-ok");
+    expect(provider.usage(result).inputTokens).toBe(3);
+  });
+
+  test("outbox replay posts local payloads without secrets", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tb-outbox-"));
+    const store = new SqliteFactoryStore(path.join(dir, "local.db"));
+    await store.enqueueOutbox({ eventId: "evt_1", kind: "factory-run", payloadJson: JSON.stringify({ runId: "r1", origin: "local" }), createdAt: "now" });
+    const posted: unknown[] = [];
+    const result = await replayOutbox(store, async (kind, payload) => {
+      posted.push({ kind, payload });
+      return { ok: true, status: 200 };
+    });
+    expect(result.synced).toBe(1);
+    expect(posted[0]).toMatchObject({ kind: "factory-run" });
+    expect(store.outbox[0]?.syncedAt).toBeTruthy();
+  });
+
+  test("local dashboard adapter serves plan/cost/eval JSON", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tb-dash-"));
+    const store = new SqliteFactoryStore(path.join(dir, "local.db"));
+    const session = localDashboardApi(store, new URL("http://127.0.0.1/auth/session"), "GET");
+    expect(session?.body).toMatchObject({ organizationId: "local", local: true });
+    const runtime = localDashboardApi(store, new URL("http://127.0.0.1/local/runtime"), "GET");
+    expect(runtime?.body).toMatchObject({ billing: "seats_only", upgradesVerdict: false });
   });
 
   test("evals stay advisory", () => {
@@ -117,6 +175,8 @@ describe("cli helpers", () => {
     const payload = factoryPlanPayload(root, "solo", "typo");
     expect(payload.dryRun).toBe(true);
     expect(payload.sideEffects).toBe(false);
+    expect(JSON.stringify(payload.cost)).not.toContain("managedCogsCents");
+    expect(JSON.stringify(payload.cost)).not.toContain("catalogVersion");
   });
 
   test("eval init writes yaml", () => {

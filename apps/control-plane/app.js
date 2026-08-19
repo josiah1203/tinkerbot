@@ -39,6 +39,10 @@ const state = {
   seats: null,
   github: null,
   factoryView: null,
+  plans: [],
+  costs: [],
+  evals: [],
+  evalCompare: { improved: [], regressed: [], unchanged: [], upgradesVerdict: false },
   error: null,
   workError: null,
   factoryError: null,
@@ -78,7 +82,10 @@ async function api(pathname, method = "GET", body) {
 function pathName() { return window.location.pathname || "/"; }
 function searchParams() { return new URLSearchParams(window.location.search); }
 function segments() { return pathName().split("/").filter(Boolean); }
-function signedIn() { return Boolean(state.session?.authenticated); }
+function localAdapter() {
+  return document.querySelector("meta[name=\"tinkerbot-local-adapter\"]")?.content === "1" || window.__TINKERBOT_LOCAL_ADAPTER__ === true;
+}
+function signedIn() { return localAdapter() || Boolean(state.session?.authenticated); }
 
 function navigate(href, replace = false) {
   const url = new URL(href, window.location.origin);
@@ -185,11 +192,11 @@ const CHANGELOG = [
 
 const DOCS = {
   quickstart: { title: "Quickstart", body: "<p><code>tb login</code> stores a hosted session. <code>tb dashboard</code> opens <code>/app</code>. Local <code>tb check</code> remains the verification verdict and does not grant hosted authority.</p>" },
-  factories: { title: "Factories", body: "<p>A factory is a Foreman plus specialist agents defined in <code>.tinkerbot/</code>. Create from <code>/app/factories/new</code> or <code>tb factory new</code>, then sync. Automations start work; Activity groups Triage, Planning, Building, and Reviewing. <code>tb check</code> is the only verdict. Agents never merge. GitLab MR and issue hooks are intake only. Seats are billed, not credits. Hosted harnesses stay Workers AI; Claude Code and Codex harnesses are not supported.</p>" },
+  factories: { title: "Factories", body: "<p>A factory is a Foreman plus specialist agents defined in <code>.tinkerbot/</code>. Create from <code>/app/factories/new</code> or <code>tb factory new</code>, then sync. Automations start work; Activity groups Triage, Planning, Building, and Reviewing. <code>tb check</code> is the only verdict. Agents never merge. GitLab MR and issue hooks are intake only. Seats are billed, not credits. Hosted inference is included on your plan. Claude Code and Codex harnesses are not supported.</p>" },
   cli: { title: "CLI", body: "<p>Hosted commands: factory, work, cell, product, skill, evolution, billing, org seats. Local commands: check, doctor, report, agents. <code>tb tui</code> is a tabbed master terminal on a TTY (<code>pnpm tb tui</code>); <code>tb tui --once</code> is a CI check transcript. Nested Claude/Gemini/Codex/Cursor CLIs use their own OAuth. <code>tb dashboard</code> opens <code>/app</code>.</p>" },
   action: { title: "GitHub Action", body: "<p>Tinkerbot Verify runs on <code>pull_request</code> only. Forks stay write-disabled. Missing ingest is UNKNOWN. Agents cannot rewrite verdicts. Humans merge.</p>" },
-  billing: { title: "Billing", body: "<p>Active human seats are the billing unit. Developer $20, Team $40, Business $60 per month ($200 / $400 / $600 annual). Team includes a 14-day trial with no card. Tokens are internal cost telemetry.</p>" },
-  security: { title: "Security", body: "<p>WorkOS authenticates humans. Entitlements are calculated on the Worker. Evidence is source-minimized. Past-due and unknown billing fail closed for paid mutations.</p>" },
+  billing: { title: "Billing", body: "<p>Active human seats are the billing unit. Developer $20, Team $40, Business $60 per month ($200 / $400 / $600 annual). Team includes a 14-day trial with no card. Hosted inference is included on your plan and is not invoiced per token.</p>" },
+  security: { title: "Security", body: "<p>Tinkerbot sessions authenticate humans. SSO is a Business entitlement. Evidence is source-minimized. Past-due and unknown billing fail closed for paid mutations.</p>" },
 };
 
 function publicPage() {
@@ -232,7 +239,7 @@ function publicPage() {
     return marketingShell(prose(doc?.title ?? "Docs", doc?.body ?? "<p>That page is not in the curated set.</p>"));
   }
   if (path === "/security") {
-    return marketingShell(prose("Security", "<p>WorkOS authenticates humans. Stripe quantity is server-side active human seats. Entitlements are calculated in the Worker. Source and full diffs stay on the customer runner. Hosted evidence is source-minimized. Paid mutations fail closed when billing is unknown or past due.</p>"));
+    return marketingShell(prose("Security", "<p>Tinkerbot sessions authenticate humans. Seat quantity is calculated server-side from active human members. Entitlements are calculated in the control plane. Source and full diffs stay on the customer runner. Hosted evidence is source-minimized. Paid mutations fail closed when billing is unknown or past due.</p>"));
   }
   if (path === "/method") {
     return marketingShell(prose("Method", "<p>Intent becomes a work order. A cell leases a branch. Agents implement. <code>tb check</code> verifies. A human merges. Outcomes are recorded after release. Evidence, not chat, is the record.</p>"));
@@ -261,8 +268,8 @@ function publicPage() {
 function loginPage() {
   return h(
     "<div class=\"auth-page\">",
-    "<section class=\"auth-story\"><div class=\"auth-copy\"><p class=\"eyebrow\">Tinkerbot</p><h1>Log in to the factory.</h1><p>WorkOS authenticates humans. After sign-in you land in Inbox. <code>tb check</code> stays the verification verdict.</p></div></section>",
-    "<section class=\"auth-panel\"><div class=\"auth-card\"><h2>Log in</h2><p>Continue with WorkOS to open the control tower.</p><a class=\"button primary full\" href=\"", esc(workosStart()), "\">Continue with WorkOS</a><p class=\"auth-links\"><a href=\"/\">Back to website</a></p></div></section>",
+    "<section class=\"auth-story\"><div class=\"auth-copy\"><p class=\"eyebrow\">Tinkerbot</p><h1>Log in to the factory.</h1><p>After sign-in you land in Inbox. <code>tb check</code> stays the verification verdict.</p></div></section>",
+    "<section class=\"auth-panel\"><div class=\"auth-card\"><h2>Log in</h2><p>Continue with Google, GitHub, or SSO.</p><a class=\"button primary full\" href=\"", esc(workosStart()), "\">Log in</a><p class=\"auth-links\"><a href=\"/\">Back to website</a></p></div></section>",
     "</div>",
   );
 }
@@ -278,6 +285,9 @@ function sidebar() {
     ["/app/releases", "Releases", "release"],
     ["/app/evolution", "Evolution", "evolution"],
   ];
+  if (localAdapter()) {
+    items.splice(1, 0, ["/app/plan", "Plan", "work"], ["/app/cost", "Cost", "usage"], ["/app/eval", "Eval", "inbox"]);
+  }
   return h(
     "<aside class=\"sidebar\"><div class=\"sidebar-frame\">",
     "<div class=\"sidebar-header\"><div class=\"sidebar-org-row\"><div class=\"menu-wrap\">",
@@ -344,7 +354,7 @@ function factoryPages() {
   }
   if (key.id === "new") {
     return appShell("New factory", h(
-      "<p class=\"muted\">Writes a starter <code>.tinkerbot</code> tree on the control plane. Agents and automations stay git-edited. Hosted inference is Workers AI.</p>",
+      "<p class=\"muted\">Writes a starter <code>.tinkerbot</code> tree on the control plane. Agents and automations stay git-edited. Hosted inference is included on your plan.</p>",
       state.wizardNotice ? h("<p>", esc(state.wizardNotice), "</p>") : "",
       "<form data-factory-create>",
       "<p><label>Name <input name=\"name\" required placeholder=\"payments\" /></label></p>",
@@ -414,11 +424,12 @@ function factoryPageBody(page, view) {
   }
   const metrics = view.metrics ?? {};
   return h(
-    "<p class=\"muted\">", esc(metrics.caption || "Estimated COGS, not billing. tb check remains the verdict. Humans merge."), "</p>",
+    "<p class=\"muted\">", esc(metrics.caption || "Opened and waiting work. Hosted inference included on your plan. tb check remains the verdict. Humans merge."), "</p>",
     "<div class=\"metric-row\">",
     "<div class=\"run-row\"><div class=\"row-main\"><strong>PRs opened (estimate)</strong><span>", esc(metrics.opened ?? 0), "</span></div></div>",
     "<div class=\"run-row\"><div class=\"row-main\"><strong>PRs merged</strong><span>", esc(metrics.merged ?? 0), "</span></div></div>",
-    "<div class=\"run-row\"><div class=\"row-main\"><strong>Estimated COGS (cents)</strong><span>", esc(metrics.estimatedCostCents ?? 0), "</span></div></div>",
+    "<div class=\"run-row\"><div class=\"row-main\"><strong>Blocked work</strong><span>", esc(metrics.blocked ?? 0), "</span></div></div>",
+    "<div class=\"run-row\"><div class=\"row-main\"><strong>Waiting</strong><span>", esc(metrics.waiting ?? 0), "</span></div></div>",
     "<div class=\"run-row\"><div class=\"row-main\"><strong>Autonomy</strong><span>", metrics.autonomyShare == null ? "Needs GitHub App merge history" : esc(metrics.autonomyShare), "</span></div></div>",
     "</div>",
     "<p>Status ", esc(view.factory?.status || ""), ". Alias ", esc(view.factory?.alias || "unset"), ". Skills stay versioned. The Steward cannot silently rewrite factory rules.</p>",
@@ -603,19 +614,19 @@ function settingsPage() {
   }
   if (path === "/app/settings/gitlab") {
     return settingsShell("GitLab", h(
-      "<p>GitLab merge request and issue webhooks start work. Job, pipeline, deployment, and system hooks are rejected. Tinkerbot never merges a GitLab MR.</p>",
-      "<p>Configure <code>GITLAB_WEBHOOK_SECRET</code> on the Worker. Endpoint: <code>", esc((apiBase() || window.location.origin) + "/integrations/gitlab/webhook"), "</code></p>",
+      "<p>Connect GitLab to start work from merge requests and issues. Job, pipeline, deployment, and system hooks are rejected. Tinkerbot never merges a GitLab MR.</p>",
+      "<p>Webhook endpoint: <code>", esc((apiBase() || window.location.origin) + "/integrations/gitlab/webhook"), "</code></p>",
       "<p>Optional GitLab CI OIDC is a peer of GitHub Actions for <code>tb check</code> ingest only.</p>",
     ));
   }
   if (path === "/app/settings/sso") {
-    return settingsShell("SSO", "<p>SSO and SCIM are Business entitlements. Connections are stored on the Worker and used on WorkOS start.</p>");
+    return settingsShell("SSO", "<p>SSO and SCIM are Business entitlements. Connections are stored for your organization and used at log in.</p>");
   }
   if (path === "/app/settings/api") {
     return settingsShell("API", h("<p>Service credentials are hashed tokens, not billable seats. Create and revoke them on the Worker; this page does not mint vendor OAuth.</p><p>MCP endpoint: <code>", esc((apiBase() || window.location.origin) + "/mcp"), "</code></p><p>MCP <code>create_factory</code> writes the same starter tree as this wizard. Agents stay git-edited.</p>"));
   }
   if (path === "/app/settings/export") {
-    return settingsShell("Evidence export", "<p>R2 remains the system of record. Optional S3/GCS fan-out is configured with Worker secrets <code>EVIDENCE_EXPORT_ENDPOINT</code> and <code>EVIDENCE_EXPORT_TOKEN</code>. Export failure does not change a <code>tb check</code> verdict.</p>");
+    return settingsShell("Evidence export", "<p>Evidence stays in your organization. Optional object-storage fan-out is configured by operators. Export failure does not change a <code>tb check</code> verdict.</p>");
   }
   if (path === "/app/settings/notifications") {
     return settingsShell("Notifications", "<p>Slack and Teams incoming webhooks are organization settings. They do not change verification verdicts.</p>");
@@ -644,9 +655,33 @@ function evidencePage(runId) {
 function appPage() {
   const parts = segments();
   const path = pathName();
+  if (path === "/app/plan") {
+    const plans = state.plans ?? [];
+    return appShell("Plan", plans.length
+      ? plans.map((plan) => h("<div class=\"run-row\"><div class=\"row-main\"><strong>", esc(plan.planId), "</strong><span>", esc(plan.selectedPipeline), " · skip ", esc((plan.skip || []).join(",") || "none"), "</span></div></div>")).join("")
+      : "<p>No local execution plans. Run <code>tb factory plan</code> or <code>tb run --local</code>. Verification is never skipped.</p>");
+  }
+  if (path === "/app/cost") {
+    const costs = state.costs ?? [];
+    return appShell("Cost", h(
+      "<p class=\"muted\">Tinkerbot invoices seats only. BYOK spend is billed by your provider, not Tinkerbot.</p>",
+      costs.length ? costs.map((row) => {
+        const estimate = row.estimate ?? {};
+        const byok = estimate.byokSpendCents != null ? ` · BYOK ${estimate.byokSpendCents}¢ (${estimate.byokNote || "billed by your provider"})` : "";
+        return h("<div class=\"run-row\"><div class=\"row-main\"><strong>", esc(row.planId), "</strong><span>", esc(estimate.platformInvoice || "seats_only"), byok, "</span></div></div>");
+      }).join("") : "<p>No cost estimates yet.</p>",
+    ));
+  }
+  if (path === "/app/eval") {
+    const compare = state.evalCompare ?? { improved: [], regressed: [], unchanged: [], upgradesVerdict: false };
+    return appShell("Eval", h(
+      "<p class=\"muted\">Scorers cannot upgrade <code>tb check</code>. upgradesVerdict=", esc(String(compare.upgradesVerdict)), "</p>",
+      "<p>Improved ", esc(String(compare.improved.length)), " · regressed ", esc(String(compare.regressed.length)), " · unchanged ", esc(String(compare.unchanged.length)), "</p>",
+    ));
+  }
   if (path === "/app/settings" || path.startsWith("/app/settings/")) return appShell("Settings", settingsPage());
   if (path === "/app/usage") {
-    return appShell("Usage", h("<p>Token and run counts are fair-use telemetry. They are not invoiced. Billing is per active human seat.</p>", state.usage.length ? `<table class="data-table">${state.usage.map((row) => `<tr><td>${esc(row.kind)}</td><td>${esc(row.tokens)}</td><td>${esc(row.costCents)}¢ estimated COGS</td></tr>`).join("")}</table>` : "<p>No usage events.</p>"));
+    return appShell("Usage", h("<p>Token and run counts are fair-use telemetry. They are not invoiced. Billing is per active human seat.</p>", state.usage.length ? `<table class="data-table">${state.usage.map((row) => `<tr><td>${esc(row.kind)}</td><td>${esc(row.tokens)}</td><td>${esc(row.createdAt || "")}</td></tr>`).join("")}</table>` : "<p>No usage events.</p>"));
   }
   if (path === "/app/products" || parts[1] === "products") {
     const id = parts[2];
@@ -719,9 +754,20 @@ function loadStatus(error) {
 async function load() {
   try {
     const session = await api("/auth/session");
-    state.session = session?.authenticated ? session : null;
+    state.session = session?.authenticated || localAdapter() ? { ...session, authenticated: true, organizationId: session?.organizationId ?? "local" } : null;
   } catch {
-    state.session = null;
+    state.session = localAdapter() ? { authenticated: true, organizationId: "local", user: { email: "local@tinkerbot" } } : null;
+  }
+  if (localAdapter()) {
+    const runtime = await api("/local/runtime").catch(() => ({ plans: [], costs: [], evals: [], evalCompare: { improved: [], regressed: [], unchanged: [], upgradesVerdict: false }, workOrders: [] }));
+    state.plans = runtime.plans ?? [];
+    state.costs = runtime.costs ?? [];
+    state.evals = runtime.evals ?? [];
+    state.evalCompare = runtime.evalCompare ?? { improved: [], regressed: [], unchanged: [], upgradesVerdict: false };
+    state.workOrders = runtime.workOrders ?? [];
+    state.factories = [{ factoryId: "local-factory", name: "local", status: "active" }];
+    render();
+    return;
   }
   if (signedIn()) {
     state.workError = null;

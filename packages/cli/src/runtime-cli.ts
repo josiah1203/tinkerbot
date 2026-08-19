@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   buildExecutionPlan,
+  customerCostView,
   loadFactoryDefinition,
   mergeRuntimeProfile,
   soloRuntimeOverlay,
@@ -13,13 +14,13 @@ import {
 } from "../../factory/src";
 import {
   defaultLocalDbPath,
-  dockerSandboxPort,
-  processSandboxPort,
   providerForProfile,
+  replayOutbox,
   runLocalFactory,
+  selectLocalSandbox,
   SqliteFactoryStore,
-  stubInferenceProvider,
-  stubSandboxPort,
+  localRuntimeView,
+  type LocalRuntimeView,
 } from "../../local-runtime/src";
 
 export function factoryPlanPayload(root: string, profile?: string, text?: string): Record<string, unknown> {
@@ -27,7 +28,8 @@ export function factoryPlanPayload(root: string, profile?: string, text?: string
   const overlay = profile === "solo" ? soloRuntimeOverlay() : undefined;
   const runtime = mergeRuntimeProfile(loaded.definition.runtime, overlay);
   const built = buildExecutionPlan({ sourceType: "manual", untrustedText: text ?? "dry-run plan", profile: runtime, paths: [] });
-  return { dryRun: true, sideEffects: false, plan: built.plan, cost: built.plan.cost, skip: built.plan.skip, stages: built.plan.stages };
+  const cost = customerCostView(built.plan.cost, built.plan.skip);
+  return { dryRun: true, sideEffects: false, plan: { ...built.plan, cost }, cost, skip: built.plan.skip, stages: built.plan.stages };
 }
 
 export function evalCli(root: string, sub: string, positional?: string): Record<string, unknown> {
@@ -72,38 +74,44 @@ export function evalCli(root: string, sub: string, positional?: string): Record<
   throw new Error("Usage: tb eval init|add|run|compare|baseline|export");
 }
 
-export function localDashboardPayload(root: string): Record<string, unknown> {
-  const store = new SqliteFactoryStore(defaultLocalDbPath(root));
-  return {
-    local: true,
-    organizationId: "local",
-    plans: [...store.plans.values()].map((plan) => ({ planId: plan.planId, skip: plan.skip, cost: plan.cost, escalationReason: plan.escalationReason })),
-    evals: store.attempts.map((attempt) => ({ taskId: attempt.taskId, passed: attempt.passed, upgradesVerdict: false })),
-    billing: "seats_only",
-  };
+export function localDashboardPayload(root: string): LocalRuntimeView {
+  return localRuntimeView(new SqliteFactoryStore(defaultLocalDbPath(root)));
 }
 
-export async function executeLocalRun(root: string, input: { profile?: string; allowProcessRunner?: boolean; text?: string }): Promise<Record<string, unknown>> {
+export async function executeLocalRun(root: string, input: {
+  profile?: string;
+  allowProcessRunner?: boolean;
+  text?: string;
+  postSync?: (kind: string, payload: Record<string, unknown>) => Promise<{ ok: boolean }>;
+  warn?: (message: string) => void;
+}): Promise<Record<string, unknown>> {
   const loaded = loadFactoryDefinition(root);
   if (loaded.definition.runtime.runner.type === "process" && !input.allowProcessRunner) {
     throw new Error("process runner requires --allow-process-runner. Docker is the default local runner.");
   }
   const overlay = input.profile === "solo" ? soloRuntimeOverlay() : undefined;
   const store = new SqliteFactoryStore(defaultLocalDbPath(root));
-  const inference = process.env.TINKERBOT_STUB_INFERENCE === "0"
-    ? providerForProfile({ mode: loaded.definition.runtime.inference.mode, provider: loaded.definition.runtime.inference.provider, credentialRef: loaded.definition.runtime.inference.credentialRef })
-    : stubInferenceProvider();
-  const sandbox = input.allowProcessRunner ? processSandboxPort(true) : process.env.TINKERBOT_STUB_SANDBOX === "0" ? dockerSandboxPort() : stubSandboxPort();
+  const inference = providerForProfile({
+    mode: loaded.definition.runtime.inference.mode,
+    provider: loaded.definition.runtime.inference.provider,
+    credentialRef: loaded.definition.runtime.inference.credentialRef,
+  });
+  const selected = selectLocalSandbox({ allowProcessRunner: input.allowProcessRunner });
+  if (selected.warning) input.warn?.(selected.warning);
   const result = await runLocalFactory({
     definition: loaded.definition,
     root,
     store,
     profileOverlay: overlay,
     inference,
-    sandbox,
+    sandbox: selected.sandbox,
     actor: "local-human",
     untrustedText: input.text ?? "local run",
     verificationVerdict: "UNKNOWN",
+    postSync: input.postSync,
   });
+  if (input.postSync && loaded.definition.runtime.sync !== "offline") {
+    await replayOutbox(store, input.postSync);
+  }
   return { ...result, origin: "local", billing: "seats_only", upgradesVerdict: false };
 }

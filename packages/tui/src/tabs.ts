@@ -18,6 +18,9 @@ export interface MasterState {
   lastVerdict?: string;
   checkLog?: string;
   workLog?: string;
+  planLog?: string;
+  costLog?: string;
+  evalLog?: string;
   repo: string;
   base: string;
   head: string;
@@ -63,7 +66,7 @@ Slash (master, not the child CLI):
   /merge and /pass are rejected.
 
 Nested CLIs use their own OAuth. Tinkerbot does not store vendor tokens.
-Hosted factory inference stays Workers AI. YAML harness claude/codex/gemini/oz stay forbidden.
+Hosted factory inference is included on your plan. YAML harness claude/codex/gemini/oz stay forbidden.
 `;
 
 export function createMasterState(input: { repo: string; base: string; head: string; org?: string; workOrderId?: string; agent?: AgentId }): MasterState {
@@ -187,9 +190,9 @@ export function renderTabBody(state: MasterState): string {
     return state.workLog
       ?? `Work ${tab.workOrderId}. Hosted attach is transcript only. Missing ingest is UNKNOWN. Humans merge.`;
   }
-  if (tab.kind === "plan") return "Plan tab. Dry-run stages, skip reasons, and estimates. No WorkOrder is created here.";
-  if (tab.kind === "cost") return "Cost tab. Managed COGS vs BYOK spend vs seat invoice. Scorers cannot change a verdict.";
-  if (tab.kind === "eval") return "Eval tab. Compare personal suite vs baseline. upgradesVerdict stays false.";
+  if (tab.kind === "plan") return state.planLog ?? "Plan tab. Dry-run stages, skip reasons, and estimates. No WorkOrder is created here.";
+  if (tab.kind === "cost") return state.costLog ?? "Cost tab. Tinkerbot invoices seats only. BYOK spend is billed by your provider. Scorers cannot change a verdict.";
+  if (tab.kind === "eval") return state.evalLog ?? "Eval tab. Compare personal suite vs baseline. upgradesVerdict stays false.";
   return [
     `${tab.title} nested agentic terminal`,
     "Spawn the local CLI on PATH. Login stays in the child (`claude auth login`, `gemini`, `codex`, Cursor agent).",

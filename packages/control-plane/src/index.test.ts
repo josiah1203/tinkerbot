@@ -139,6 +139,8 @@ test("server entitlements grant Team trial features, refuse paid caps, and route
   expect(effectivePlanId({ planId: "developer", billingStatus: "deleted" })).toBe("free");
   const team = calculateEntitlements({ planId: "team", billingStatus: "trialing", trialState: "trialing" });
   expect(team.features.team_invitations).toBe(true);
+  expect(publicCapabilities("free").local_execution).toBe("included");
+  expect(publicCapabilities("free").private_execution).toBe("unavailable");
   expect(team.features.sso).toBe(false);
   const expiredTrial = calculateEntitlements({ planId: "team", billingStatus: "trialing", trialState: "expired" });
   expect(expiredTrial.planId).toBe("free");

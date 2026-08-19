@@ -1,5 +1,8 @@
 export { SqliteFactoryStore, defaultLocalDbPath, LOCAL_DB_SCHEMA_VERSION } from "./sqlite-store";
-export { dockerSandboxPort, processSandboxPort, stubSandboxPort, type SandboxPort } from "./sandbox";
+export { SQLITE_MAGIC } from "./sqlite-engine";
+export { dockerSandboxPort, processSandboxPort, stubSandboxPort, selectLocalSandbox, dockerAvailable, type SandboxPort } from "./sandbox";
 export { resolveCredentialRef, assertNoSecretInPayload } from "./credentials";
-export { anthropicProvider, openaiProvider, ollamaProvider, stubInferenceProvider, providerForProfile } from "./providers";
+export { anthropicProvider, openaiProvider, ollamaProvider, stubInferenceProvider, providerForProfile, selectInferenceProvider } from "./providers";
 export { runLocalFactory } from "./orchestrator";
+export { replayOutbox } from "./outbox";
+export { localRuntimeView, formatPlanTab, formatCostTab, formatEvalTab, type LocalRuntimeView } from "./view";

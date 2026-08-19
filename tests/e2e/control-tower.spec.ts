@@ -60,13 +60,13 @@ async function mockControlPlane(page: Page, options: { signedIn?: boolean; evolu
         automations: [{ name: "labeled-issue", agent: "foreman", enabled: true }],
         agents: [{ id: "foreman", agentType: "FOREMAN", model: "@cf/openai/gpt-oss-120b" }],
         definitionFiles: [{ path: ".tinkerbot/factory.yaml", contents: "name: payments" }],
-        metrics: { opened: 2, merged: 1, estimatedCostCents: 0, autonomyShare: null, caption: "Estimated COGS, not billing." },
+        metrics: { opened: 2, merged: 1, blocked: 0, waiting: 1, autonomyShare: null, caption: "Opened and waiting work. Hosted inference included on your plan." },
       });
     }
     return json(route, { factories: [{ factoryId: "fac_1", name: "payments", status: "active" }] });
   });
   await page.route((url) => apiPath(url, "/usage"), (route) => json(route, { usage: [] }));
-  await page.route((url) => apiPath(url, "/billing/summary"), (route) => json(route, { planId: "developer", subscriptionState: "active", activeBillableSeats: 1, pricePerSeatCents: 2000, paidSeatCap: "none", account: { planId: "developer", status: "active" } }));
+  await page.route((url) => apiPath(url, "/billing/summary"), (route) => json(route, { planId: "developer", subscriptionState: "active", activeBillableSeats: 1, pricePerSeatCents: 2000, paidSeatCap: "none" }));
   await page.route((url) => apiPath(url, "/billing/trial/start"), async (route) => {
     posts.push({ path: new URL(route.request().url()).pathname, method: route.request().method() });
     return json(route, { pending: false, trial: { state: "trialing" }, grantedFromRedirect: false });
@@ -98,7 +98,9 @@ test("login is a dedicated auth screen, not the homepage", async ({ page }) => {
   await mockControlPlane(page, { signedIn: false });
   await page.goto("/login");
   await expect(page.getByRole("heading", { name: "Log in", exact: true })).toBeVisible();
-  await expect(page.getByRole("link", { name: "Continue with WorkOS" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Log in", exact: true })).toBeVisible();
+  await expect(page.getByText("Continue with Google, GitHub, or SSO")).toBeVisible();
+  await expect(page.getByText("WorkOS")).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Tinkerbot Factory OS" })).toHaveCount(0);
   await expect(page.locator(".sidebar")).toHaveCount(0);
 });

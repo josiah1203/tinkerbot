@@ -10,7 +10,7 @@ Worker routes:
 - `GET /releases`, `GET /outcomes`
 - `GET /runs/:id`, `GET /runs/:id/events`
 - `GET /usage`, `GET /integrations/github`
-- `POST /actions/oidc/exchange` then `POST /assurance/ingest` with the short-lived run token
+- `POST /actions/oidc/exchange` (RS256 JWKS, installation required) then `POST /assurance/ingest` with the short-lived run token
 - Intake: GitHub, Slack, Linear, Jira, incident, and support webhooks
 - WorkOS `/auth/workos/start|callback`, `/auth/session`, `/auth/signout`
 - Stripe `/billing/summary|checkout|portal`

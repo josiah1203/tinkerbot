@@ -35,6 +35,7 @@ export interface TuiDeps {
   }) => PrProofReport;
   reportExitCode: (report: PrProofReport) => number;
   openDashboard: () => number;
+  localRuntime?: () => { plan: string; cost: string; eval: string };
   fetchWork?: (id: string) => HostedWorkView;
   fetchWorkAsync?: (id: string) => Promise<HostedWorkView>;
   workAction?: (id: string, action: "steer" | "take" | "return" | "approve", note?: string) => { ok: boolean; message: string };
@@ -129,10 +130,19 @@ function applyWorkAction(session: Session, deps: TuiDeps, intent: Extract<Intent
   return appendAssistant(session, result.ok ? result.message : result.message);
 }
 
+function applyLocalRuntimeIntent(session: Session, intent: Intent, deps: TuiDeps): Session | undefined {
+  if (intent.type !== "plan" && intent.type !== "cost" && intent.type !== "eval") return undefined;
+  const view = deps.localRuntime?.();
+  const text = intent.type === "plan" ? view?.plan : intent.type === "cost" ? view?.cost : view?.eval;
+  return appendAssistant(session, text ?? `${intent.type} reads the local SQLite store. Scorers cannot upgrade tb check.`);
+}
+
 export async function dispatchIntent(session: Session, intent: Intent, deps: TuiDeps, options: TuiOptions): Promise<{ session: Session; report?: PrProofReport; exit?: boolean; dashboard?: boolean }> {
   if (intent.type === "none" || intent.type === "help" || intent.type === "clear" || intent.type === "reject") return { session };
   if (intent.type === "exit") return { session, exit: true };
   if (intent.type === "dashboard") return { session: appendAssistant(session, "Opening the browser control tower."), dashboard: true };
+  const local = applyLocalRuntimeIntent(session, intent, deps);
+  if (local) return { session: local };
   if (intent.type === "check") return applyCheck(session, deps, options, "check");
   if (intent.type === "impact" || intent.type === "select-tests") return applyCheck(session, deps, options, "impact");
   if (intent.type === "work") {
@@ -158,6 +168,8 @@ export function dispatchIntentSync(session: Session, intent: Intent, deps: TuiDe
   if (intent.type === "none" || intent.type === "help" || intent.type === "clear" || intent.type === "reject") return { session };
   if (intent.type === "exit") return { session, exit: true };
   if (intent.type === "dashboard") return { session: appendAssistant(session, "Opening the browser control tower."), dashboard: true };
+  const local = applyLocalRuntimeIntent(session, intent, deps);
+  if (local) return { session: local };
   if (intent.type === "check") return applyCheck(session, deps, options, "check");
   if (intent.type === "impact" || intent.type === "select-tests") return applyCheck(session, deps, options, "impact");
   if (intent.type === "work") return { session: applyWork(session, deps, intent.id) };

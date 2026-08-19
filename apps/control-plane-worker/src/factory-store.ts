@@ -72,7 +72,6 @@ export class D1FactoryStore {
     const factory = await this.getFactory(factoryId);
     if (!factory || factory.organizationId !== organizationId) return null;
     const orders = (await this.listWorkOrders(organizationId)).filter((order) => order.factoryId === factoryId);
-    const usage = await this.listUsage(organizationId);
     const latest = await this.getLatestDefinition(factoryId);
     let definition: FactoryDefinition | undefined;
     if (latest) {
@@ -88,7 +87,7 @@ export class D1FactoryStore {
       automations: definition?.automations ?? [],
       agents: definition?.agents ?? [],
       definitionFiles: latest?.files ?? (latest ? [{ path: ".tinkerbot/factory.yaml", contents: latest.yaml }] : []),
-      metrics: factoryDashboardMetrics({ statuses: orders.map((order) => order.status), costCents: usage.map((event) => event.costCents) }),
+      metrics: factoryDashboardMetrics({ statuses: orders.map((order) => order.status) }),
     };
   }
 
@@ -155,6 +154,19 @@ export class D1FactoryStore {
 
   async getRun(runId: string): Promise<Record<string, string> | null> {
     return this.database.prepare("SELECT run_id, work_order_id, factory_id, definition_digest, status, started_at, completed_at, updated_at FROM tinkerbot_factory_runs WHERE run_id = ?1").bind(runId).first<Record<string, string>>();
+  }
+
+  async getRunForOrganization(runId: string, organizationId: string): Promise<Record<string, string> | null> {
+    const run = await this.getRun(runId);
+    if (!run) return null;
+    const factory = await this.getFactory(run.factory_id);
+    if (!factory || factory.organizationId !== organizationId) return null;
+    return run;
+  }
+
+  async consumeOidcReplayKey(key: string, now: string): Promise<"ok" | "replay"> {
+    const result = await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_oidc_jti (jti, consumed_at) VALUES (?1, ?2)").bind(key, now).run();
+    return result.meta?.changes === 0 ? "replay" : "ok";
   }
 
   async listRunStages(runId: string): Promise<Array<{ stage: string; status: string; summary?: string }>> {
@@ -343,6 +355,49 @@ export class D1FactoryStore {
 
   async insertOutcome(input: { outcomeId: string; workOrderId?: string; releaseId?: string; kind: string; association: string; now: string }): Promise<void> {
     await this.database.prepare("INSERT INTO tinkerbot_outcomes (outcome_id, work_order_id, release_id, kind, association, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(input.outcomeId, input.workOrderId ?? null, input.releaseId ?? null, input.kind, input.association, input.now).run();
+  }
+
+  async putExecutionPlan(plan: import("../../../packages/factory/src/runtime").ExecutionPlan): Promise<void> {
+    await this.database.prepare("INSERT INTO tinkerbot_execution_plans (plan_id, work_order_id, run_id, origin, profile_json, plan_json, selected_pipeline, escalation_reason, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(plan_id) DO UPDATE SET plan_json = excluded.plan_json, escalation_reason = excluded.escalation_reason").bind(plan.planId, plan.workOrderId ?? null, null, plan.origin, JSON.stringify(plan.profile), JSON.stringify(plan), plan.selectedPipeline, plan.escalationReason ?? null, plan.createdAt).run();
+  }
+
+  async putCostEstimate(planId: string, estimate: import("../../../packages/factory/src/runtime").CostEstimate): Promise<void> {
+    await this.database.prepare("INSERT INTO tinkerbot_cost_estimates (plan_id, catalog_version, estimate_json, created_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(plan_id) DO UPDATE SET estimate_json = excluded.estimate_json").bind(planId, estimate.catalogVersion, JSON.stringify(estimate), new Date().toISOString()).run();
+  }
+
+  async putCostActual(input: { planId: string; runId: string; usage: import("../../../packages/factory/src/runtime").ProviderUsage; now: string }): Promise<void> {
+    await this.database.prepare("INSERT INTO tinkerbot_cost_actuals (actual_id, plan_id, run_id, stage, provider, model, input_tokens, output_tokens, cached_tokens, retries, latency_ms, managed, catalog_version, runner_origin, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)").bind(crypto.randomUUID(), input.planId, input.runId, input.usage.stage ?? null, input.usage.provider, input.usage.model, input.usage.inputTokens, input.usage.outputTokens, input.usage.cachedTokens, input.usage.retries, input.usage.latencyMs, input.usage.managed ? 1 : 0, input.usage.catalogVersion, input.usage.runnerOrigin, input.now).run();
+  }
+
+  async ingestLocalRuntimePayload(input: { organizationId: string; kind: string; payload: Record<string, unknown>; now: string }): Promise<{ accepted: true; organizationId: string; kind: string }> {
+    const kind = input.kind;
+    const payload = input.payload;
+    if (kind === "execution-plan" || payload.plan) {
+      const plan = (payload.plan ?? payload) as import("../../../packages/factory/src/runtime").ExecutionPlan;
+      if (plan && typeof plan === "object" && typeof plan.planId === "string") await this.putExecutionPlan({ ...plan, origin: "local" });
+      if (plan?.cost) await this.putCostEstimate(plan.planId, plan.cost);
+    }
+    if (kind === "cost-actual" || payload.usage) {
+      const usage = payload.usage as import("../../../packages/factory/src/runtime").ProviderUsage;
+      if (usage && typeof payload.planId === "string" && typeof payload.runId === "string") await this.putCostActual({ planId: payload.planId, runId: payload.runId, usage, now: input.now });
+    }
+    if (kind === "eval-attempt" || payload.attempt) {
+      const attempt = (payload.attempt ?? payload) as import("../../../packages/factory/src/evals").EvalAttempt;
+      if (attempt && typeof attempt.attemptId === "string") await this.insertEvalAttempt(attempt);
+    }
+    if (kind === "eval-suite" || payload.suite) {
+      const suite = (payload.suite ?? payload) as import("../../../packages/factory/src/evals").EvalSuite;
+      if (suite && typeof suite.suiteId === "string") await this.putEvalSuite(suite);
+    }
+    return { accepted: true, organizationId: input.organizationId, kind };
+  }
+
+  async putEvalSuite(suite: import("../../../packages/factory/src/evals").EvalSuite): Promise<void> {
+    await this.database.prepare("INSERT INTO tinkerbot_eval_suites (suite_id, name, yaml, baseline_digest, created_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(suite_id) DO UPDATE SET baseline_digest = excluded.baseline_digest").bind(suite.suiteId, suite.name, JSON.stringify(suite), suite.baselineDigest ?? null, suite.createdAt).run();
+  }
+
+  async insertEvalAttempt(attempt: import("../../../packages/factory/src/evals").EvalAttempt): Promise<void> {
+    await this.database.prepare("INSERT INTO tinkerbot_eval_attempts (attempt_id, suite_id, task_id, output, metrics_json, passed, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)").bind(attempt.attemptId, attempt.suiteId, attempt.taskId, attempt.output, JSON.stringify(attempt.metrics), attempt.passed ? 1 : 0, attempt.createdAt).run();
   }
 
   async listOutcomes(organizationId: string): Promise<Array<Record<string, unknown>>> {

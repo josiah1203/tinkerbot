@@ -30,6 +30,8 @@ import {
   createReleaseCandidate,
   recordDeployment,
   evaluateMergeReadiness,
+  workersAiInferenceProvider,
+  factoryAiFromProvider,
   type ConversationMessage,
   type FactoryAi,
   type FactoryDefinition,
@@ -105,15 +107,18 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
   const calculated = await entitlementsForOrganization(env.DB, organizationId);
   let definition: FactoryDefinition;
   try { definition = parseFactoryDefinition({ version: 1, name: factory.name, repositories: [repository], sources: [{ type: message.sourceType }, { type: "mcp" }, { type: "incident" }, { type: "scheduled" }] }); } catch { return { workOrderId: order.workOrderId, runId, terminal: "unknown" }; }
-  definition = { ...definition, agents: definition.agents.map((agent) => ({ ...agent, model: modelForCostClass(calculated.aiClass, agent.id) })) };
+  const managed = definition.runtime.inference.mode === "managed";
+  if (managed) definition = { ...definition, agents: definition.agents.map((agent) => ({ ...agent, model: modelForCostClass(calculated.aiClass, agent.id) })) };
   order = applyWorkOrderRouting(order, definition);
   await factories.patchWorkOrder(order.workOrderId, { productId: order.productId, lineId: order.lineId, autonomyMode: order.autonomyMode, outputKind: order.outputKind, risk: order.risk, now });
   const specApproved = message.specApproved ?? await factories.hasSpecApproval(order.workOrderId);
+  const inference = env.AI ? workersAiInferenceProvider(gatewayAi(env) as FactoryAi, "hosted") : undefined;
   const result = await executeFactoryRun({
     definition,
     sourceType: message.sourceType as FactorySourceType,
     untrustedText: message.issueOrPullRequest,
-    ai: gatewayAi(env),
+    ai: inference ? factoryAiFromProvider(inference) : gatewayAi(env),
+    inference,
     verificationVerdict: message.verificationVerdict ?? "UNKNOWN",
     specApproved,
     sandboxComplete: message.sandboxComplete,
@@ -121,6 +126,7 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
     verificationIngested: message.verificationIngested,
     workOrderId: order.workOrderId,
     factoryId: factory.factoryId,
+    store: factories,
   });
   for (const stage of result.stages) {
     await factories.insertStage(runId, stage.stage, stage.status, stage.summary, now);
@@ -147,6 +153,24 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
       const costCents = estimatedCostMinor(calculated.aiClass, tokens);
       await factories.insertUsage({ organizationId, factoryId: factory.factoryId, runId, kind: `agent:${stage.stage}`, tokens, costCents, now });
       await factories.insertAiCostEvent({ organizationId, factoryId: factory.factoryId, workOrderId: order.workOrderId, runId, stageId: stage.stage, agentId: stage.stage, modelId: definition.agents.find((agent) => agent.id === stage.stage)?.model ?? modelForCostClass(calculated.aiClass, stage.stage), tokens, costMinor: costCents, now });
+      if (result.plan) {
+        const usage = inference?.usage({ text: stage.summary }) ?? {
+          provider: "workers-ai",
+          model: definition.agents.find((agent) => agent.id === stage.stage)?.model ?? modelForCostClass(calculated.aiClass, stage.stage),
+          inputTokens: tokens,
+          outputTokens: 0,
+          cachedTokens: 0,
+          retries: 0,
+          latencyMs: 0,
+          managed: true,
+          stage: stage.stage,
+          catalogVersion: result.plan.cost.catalogVersion,
+          runnerOrigin: "hosted" as const,
+        };
+        usage.stage = stage.stage;
+        usage.runnerOrigin = "hosted";
+        await factories.putCostActual({ planId: result.plan.planId, runId, usage, now });
+      }
     }
   }
   const messages: ConversationMessage[] = result.stages.map((stage) => ({ role: "assistant", agentId: stage.stage, content: stage.summary, at: now }));
@@ -230,6 +254,12 @@ async function dispatchSandboxIfBound(env: FactoryEnv, input: { workOrderId: str
     return { complete: result.status === "ok", sha: undefined };
   } catch {
     return { complete: false };
+  }
+}
+
+export class Sandbox {
+  async fetch(): Promise<Response> {
+    return new Response(JSON.stringify({ error: "Attach the Cloudflare Sandbox implementation in this account." }), { status: 501, headers: { "content-type": "application/json" } });
   }
 }
 

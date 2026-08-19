@@ -62,6 +62,11 @@ export const ENTITLEMENT_KEYS = [
   "custom_retention",
   "assurance_metadata",
   "team_invitations",
+  "local_execution",
+  "byok_inference",
+  "portable_eval_suites",
+  "offline_assurance",
+  "cloud_sync",
 ] as const;
 
 export type EntitlementKey = (typeof ENTITLEMENT_KEYS)[number];
@@ -126,6 +131,9 @@ function availabilityFor(planId: PlanId, key: EntitlementKey): EntitlementAvaila
   }
   if (key === "advanced_rbac" || key === "custom_roles" || key === "change_sets" || key === "release_assessments" || key === "audit_export" || key === "hosted_api" || key === "service_credentials" || key === "sso" || key === "scim" || key === "external_notifications") {
     return planId === "enterprise" ? "custom" : BUSINESS_PLUS.includes(planId) ? "included" : "unavailable";
+  }
+  if (key === "local_execution" || key === "byok_inference" || key === "portable_eval_suites" || key === "offline_assurance" || key === "cloud_sync") {
+    return planId === "enterprise" ? "custom" : "included";
   }
   if (key === "private_execution" || key === "custom_retention") return planId === "enterprise" ? "custom" : "unavailable";
   return PAID.includes(planId) ? "included" : "unavailable";

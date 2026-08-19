@@ -6,7 +6,7 @@ A Tinkerbot factory is a standing workflow: a Foreman routes each work item thro
 
 ## Definition as code
 
-`tb factory new` and `/app/factories/new` write a starter `.tinkerbot` tree (MCP `create_factory` is the same payload). `tb factory validate` checks the tree. `tb factory sync` uploads it to the control plane.
+`tb factory new` and `/app/factories/new` write a starter `.tinkerbot` tree (MCP `create_factory` is the same payload). `tb factory validate` checks the tree. `tb factory plan` prints a dry-run ExecutionPlan and CostEstimate with no WorkOrder or branch. `tb factory sync` uploads it to the control plane. `tb run --local` starts a local run against SQLite (schema 13) + Docker. The process runner is opt-in (`--allow-process-runner`) and prints a warning. Tests and CI use a stub sandbox unless `TINKERBOT_STUB_SANDBOX=0`. When Docker is missing, the stub sandbox is used and documented on stderr. `tb eval` runs portable personal suites. Scorers never upgrade `tb check`. `tb dashboard --local` serves the control-plane SPA with a local SQLite adapter (`organizationId = local`). Optional outbox replay POSTs to `/runtime/sync` when you are logged in and `sync` is `hosted` or `manual`.
 
 ```text
 .tinkerbot/factory.yaml
@@ -19,7 +19,7 @@ A Tinkerbot factory is a standing workflow: a Foreman routes each work item thro
 .tinkerbot/evolution.yaml
 ```
 
-`factory.yaml` accepts the current `version: 1` shape and Warp-shaped `schemaVersion: v1alpha1` (`alias`, `agentDefaults`, `repositories` as `owner`/`name`, `integrations`). `agentDefaults` may set `model` or `harness`, not both. Allowed harnesses are `tinkerbot-sandbox`, `github_actions`, `none`, and `default`. Claude Code, Codex, Gemini, and Warp `oz` harnesses are rejected.
+`factory.yaml` accepts the current `version: 1` shape, Warp-shaped `schemaVersion: v1alpha1`, and additive `schemaVersion: v1alpha2` with a `runtime` profile (`collaboration`, `controlPlane`, `pipeline`, `runner`, `inference.credentialRef`, `approval`, `sync`). Older schemas parse with hosted defaults. `agentDefaults` may set `model` or `harness`, not both. Allowed harnesses are `tinkerbot-sandbox`, `github_actions`, `none`, and `default`. Claude Code, Codex, Gemini, and Warp `oz` harnesses are rejected. BYOK is local-runner-only; YAML stores credential refs, never raw keys.
 
 Agent Markdown uses YAML frontmatter (`agentType`, `model` or `harness`, `secrets`, `mcpServers`) plus a durable prompt body. Exactly one `FOREMAN` (`MAIN` is an alias) is required when the tree declares agent types. `VERIFY` review notes cannot change `tb check`.
 

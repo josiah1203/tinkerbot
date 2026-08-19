@@ -1,0 +1,15 @@
+defaultMode: approval_gated
+neverMerge: true
+rules:
+  - match: path
+    pattern: "(^|/)(auth|billing|permissions?)(/|\\.|$)"
+    mode: restricted
+  - match: line
+    pattern: "^(security|release|incident|migration)$"
+    mode: restricted
+  - match: path
+    pattern: "(^|/)(docs?|README|CHANGELOG)"
+    mode: policy_autonomous
+  - match: text
+    pattern: "dependabot|bump .+ from"
+    mode: assisted

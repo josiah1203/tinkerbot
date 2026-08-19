@@ -11,7 +11,7 @@ This directory distinguishes the current hosted-product contract from historical
 - [GitHub Action](./github-action.md) and [`github-app/README.md`](../github-app/README.md): the PR-visible integration boundary.
 - [Billing](./billing.md), [authentication](./authentication.md), [security](./security.md), and [Cloudflare runtime](./cloudflare.md): hosted control-plane contracts.
 - [Distribution](./distribution.md): Bun, npm, Homebrew, and curl release artifacts.
-- [Release runbook](./release-runbook.md) and [release readiness](./release-readiness.md): authorized-release gates.
+- [Release runbook](./release-runbook.md), [release readiness](./release-readiness.md), and [hosted provisioning](./hosted-provisioning.md): authorized-release gates and operator checklist.
 - [ADRs](./adr/README.md): binding architecture decisions.
 
 ## Historical records

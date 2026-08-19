@@ -65,6 +65,8 @@ import { runDoctor, renderDoctor } from "./doctor";
 import { clearStoredCredentials, hostedSession, saveStoredCredentials } from "./credentials";
 import { loadFactoryDefinition, validateAgentReceipt, buildFactoryStarter } from "../../factory/src";
 import { evalCli, executeLocalRun, factoryPlanPayload, localDashboardPayload } from "./runtime-cli";
+import { createLocalDashboardServer, localDashboardUrl } from "./local-dashboard";
+import { formatCostTab, formatEvalTab, formatPlanTab } from "../../local-runtime/src";
 import { isInteractiveTty, runTui, TUI_HELP, type TuiDeps, type TuiOptions } from "./tui/index";
 import { isAgentId, listAgentsJson, runMasterTuiInteractive } from "../../tui/src";
 import { planVerificationStreams } from "./tui/streams";
@@ -458,7 +460,7 @@ function versionText(root = process.cwd()): string {
 function help(command?: string): string {
   if (command === "tui") return TUI_HELP;
   if (command === "agents") return "Usage: tb agents\n\nList local agent CLIs on PATH. OAuth stays in the child CLI. Tinkerbot does not store vendor tokens.\n";
-  if (command === "dashboard") return "Usage: tb dashboard [--local]\n\nOpen the authenticated Tinkerbot dashboard, or print local plan/cost/eval state with --local.\n";
+  if (command === "dashboard") return "Usage: tb dashboard [--local] [--port 4174]\n\nOpen the authenticated Tinkerbot dashboard, or serve a local SQLite adapter on 127.0.0.1 with --local (not `tb serve`).\n";
   if (command === "login") return "Usage: tb login --token SESSION [--url https://control.example]\n\nStore a short-lived control-plane session. Browser login opens the public website.\n";
   if (command === "factory") return "Usage: tb factory list|show|validate|sync|mcp|new|plan\n\n`tb factory new` writes a local .tinkerbot starter tree. `tb factory plan` prints a dry-run ExecutionPlan. Then `tb factory sync` for hosted upload.\n";
   if (command === "work") return "Usage: tb work list|show|retry|approve|cancel|take|return [id]\n";
@@ -469,7 +471,7 @@ function help(command?: string): string {
   if (command === "run") return "Usage: tb run show|logs <id>\n       tb run --local [--profile solo] [--allow-process-runner]\n";
   if (command === "eval") return "Usage: tb eval init|add|run|compare|baseline|export\n\nPortable personal evals. Scorers are advisory and never upgrade tb check.\n";
   if (command === "org") return "Usage: tb org list|switch|seats [organization-id]\n";
-  if (command === "billing") return "Usage: tb billing summary|catalog|portal\n\nHosted billing reads the server catalog and seat quantity. Portal opens the Stripe customer portal URL.\n";
+  if (command === "billing") return "Usage: tb billing summary|catalog|portal\n\nHosted billing reads the server catalog and seat quantity. Portal opens your Tinkerbot billing portal.\n";
   if (command === "receipt") return "Usage: tb receipt validate --input FILE\n\nValidate an agent execution receipt. A valid receipt never upgrades a failed or unknown verdict.\n";
   if (command === "serve") return "Usage: tb serve is retired. Use the hosted dashboard or `tb dashboard --local`.\n";
   if (command === undefined) return "Tinkerbot — factory operating system and deterministic verification\n\nHosted: login, logout, whoami, org list|switch|seats, billing summary|catalog|portal, dashboard, factory, work, cell, product, skill, evolution, run, verify\nLocal runtime: tb run --local, tb factory plan, tb eval, tb dashboard --local\nCore: tui, agents, check, test-integrity, impact, contracts, fixtures, select-tests, artifacts, history, report, doctor\nAssurance: proof create|verify|replay; repo inspect|map; change contract validate|assess; release assess; outcome record; evidence\n\nUse tb <command> --help for command details.\n";
@@ -900,10 +902,7 @@ export function runCli(argv = process.argv.slice(2)): number {
     if (options.help || options.command === "help" || options.command === "-h") { process.stdout.write(help(options.command === "help" ? undefined : options.command)); return EXIT_CODES.PASS; }
     if (options.command === "version") { process.stdout.write(versionText()); return EXIT_CODES.PASS; }
     if (options.command === "dashboard") {
-      if (options.local) {
-        process.stdout.write(`${JSON.stringify(localDashboardPayload(getRepoRoot(process.cwd())), null, 2)}\n`);
-        return EXIT_CODES.PASS;
-      }
+      if (options.local) return localDashboardCommand(options);
       return dashboardCommand();
     }
     if (options.command === "tui") return tuiCommand(options);
@@ -1053,6 +1052,30 @@ function shouldOpenDashboardBrowser(): boolean {
   return process.env.TINKERBOT_OPEN_BROWSER === "1" || Boolean(process.stdout.isTTY && process.stdin.isTTY);
 }
 
+function localRuntimeTuiView(root: string): { plan: string; cost: string; eval: string } {
+  const view = localDashboardPayload(root);
+  return { plan: formatPlanTab(view), cost: formatCostTab(view), eval: formatEvalTab(view) };
+}
+
+function localDashboardCommand(options: CliOptions): number {
+  const root = getRepoRoot(process.cwd());
+  const host = options.host ?? "127.0.0.1";
+  const port = options.port ?? 4174;
+  const url = localDashboardUrl(host, port);
+  process.stdout.write(`${url}\n`);
+  process.stdout.write(`${JSON.stringify(localDashboardPayload(root), null, 2)}\n`);
+  const skipListen = process.env.VITEST || process.env.CI === "true" || process.env.TINKERBOT_DASHBOARD_LISTEN === "0";
+  if (skipListen && process.env.TINKERBOT_DASHBOARD_LISTEN !== "1") return EXIT_CODES.PASS;
+  const server = createLocalDashboardServer({ root, host, port, directory: options.directory });
+  server.listen(port, host, () => {
+    process.stdout.write(`Local dashboard adapter (SQLite, organizationId=local): ${url}\n`);
+  });
+  if (shouldOpenDashboardBrowser()) {
+    try { execFileSync(process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open", process.platform === "win32" ? ["/c", "start", "", url] : [url], { stdio: "ignore" }); } catch { /* URL is printed */ }
+  }
+  return EXIT_CODES.PASS;
+}
+
 function dashboardCommand(): number {
   const url = hostedSession().url;
   if (!url || !/^https:\/\//.test(url)) {
@@ -1093,6 +1116,7 @@ function makeTuiDeps(): TuiDeps {
       }
     },
     openDashboard: dashboardCommand,
+    localRuntime: () => localRuntimeTuiView(process.cwd()),
     stdout: process.stdout,
     stderr: process.stderr,
     stdin: process.stdin,
@@ -1123,6 +1147,7 @@ export async function dispatchTui(options: TuiOptions, deps: TuiDeps, interactiv
         return { repo: header.repo, base: header.base, head: header.head };
       },
       openDashboard: deps.openDashboard,
+      localRuntime: deps.localRuntime ?? (() => localRuntimeTuiView(deps.cwd)),
       createReport: (input) => deps.createReport({ cwd: input.cwd, command: "check", base: options.base, head: options.head, runBaseTests: options.baseTests }),
       fetchWork: deps.fetchWork ? (id) => {
         const view = deps.fetchWork!(id);
@@ -1286,7 +1311,24 @@ export async function mainAsync(argv = process.argv.slice(2)): Promise<number> {
   try {
     if (argv[0] === "run" && argv.includes("--local")) {
       const options = parseArgs(argv);
-      const payload = await executeLocalRun(getRepoRoot(process.cwd()), { profile: options.profile, allowProcessRunner: options.allowProcessRunner, text: options.positional });
+      const session = hostedSession();
+      const postSync = session.url && session.token
+        ? async (kind: string, body: Record<string, unknown>) => {
+          try {
+            const response = await hostedRequest("/runtime/sync", "POST", body.kind ? body : { kind, ...body });
+            return { ok: response.status >= 200 && response.status < 300 };
+          } catch {
+            return { ok: false };
+          }
+        }
+        : undefined;
+      const payload = await executeLocalRun(getRepoRoot(process.cwd()), {
+        profile: options.profile,
+        allowProcessRunner: options.allowProcessRunner,
+        text: options.positional,
+        warn: (message) => process.stderr.write(`${message}\n`),
+        postSync,
+      });
       process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
       return EXIT_CODES.PASS;
     }

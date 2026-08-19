@@ -12,14 +12,17 @@ function oauthCookieHeader(response: Response): string {
   return `tinkerbot_oauth_state=${encodeURIComponent(cookieFrom(response, "tinkerbot_oauth_state"))}; tinkerbot_pkce=${encodeURIComponent(cookieFrom(response, "tinkerbot_pkce"))}`;
 }
 
-test("Cloudflare Worker exposes non-secret provider status and keeps local verification independent", async () => {
+test("Cloudflare Worker health is a public liveness signal without provider oracles", async () => {
   const response = await worker.fetch(new Request("https://control.example/health"), { ENVIRONMENT: "staging", WORKER_NAME: "tinkerbot-staging" });
   expect(response.status).toBe(200);
-  const body = await response.json() as { service: string; environment: string; providers: Array<{ provider: string; state: string; missing: string[] }> };
+  const body = await response.json() as { service: string; status: string };
   expect(body.service).toBe("tinkerbot-control-plane");
-  expect(body.environment).toBe("staging");
-  expect(body.providers.find((provider) => provider.provider === "workos")?.state).toBe("unavailable");
-  expect(JSON.stringify(body)).not.toContain("secret");
+  expect(body.status).toBe("degraded");
+  expect(JSON.stringify(body)).not.toContain("STRIPE");
+  expect(JSON.stringify(body)).not.toContain("WORKOS");
+  expect(JSON.stringify(body)).not.toMatch(/secret/i);
+  const status = await worker.fetch(new Request("https://control.example/config/status"), { ENVIRONMENT: "staging", WORKER_NAME: "tinkerbot-staging" });
+  expect(status.status).toBeGreaterThanOrEqual(401);
 });
 
 test("tenant RBAC capabilities are explicit and least-privilege", () => {
@@ -32,6 +35,11 @@ test("tenant RBAC capabilities are explicit and least-privilege", () => {
   expect(roleHasCapability("reviewer", "assurance:read")).toBe(true);
   expect(roleHasCapability("reviewer", "assurance:write")).toBe(false);
   expect(roleHasCapability("viewer", "billing:read")).toBe(false);
+  expect(roleHasCapability("viewer", "factory:write")).toBe(false);
+  expect(roleHasCapability("viewer", "work:operate")).toBe(false);
+  expect(roleHasCapability("viewer", "ops:read")).toBe(false);
+  expect(roleHasCapability("maintainer", "factory:write")).toBe(true);
+  expect(roleHasCapability("owner", "ops:read")).toBe(true);
 });
 
 test("Cloudflare Worker accepts only signed GitHub installation webhooks and persists them replay-safely", async () => {

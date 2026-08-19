@@ -5,6 +5,7 @@ import { factoryAiFromProvider, type InferenceProvider } from "../../factory/src
 import { SqliteFactoryStore } from "./sqlite-store";
 import { stubSandboxPort, type SandboxPort } from "./sandbox";
 import { assertNoSecretInPayload } from "./credentials";
+import { replayOutbox } from "./outbox";
 
 export interface LocalRunInput {
   definition: FactoryDefinition;
@@ -19,6 +20,7 @@ export interface LocalRunInput {
   verificationVerdict?: string;
   verificationIngested?: boolean;
   specApproved?: boolean;
+  postSync?: (kind: string, payload: Record<string, unknown>) => Promise<{ ok: boolean }>;
 }
 
 export async function runLocalFactory(input: LocalRunInput): Promise<{ workOrderId: string; runId: string; terminal: string; planId?: string; stages: Array<{ stage: string; status: string; summary: string }>; cost?: unknown }> {
@@ -92,7 +94,23 @@ export async function runLocalFactory(input: LocalRunInput): Promise<{ workOrder
     assertNoSecretInPayload(receipt);
     await input.store.insertAgentReceipt({ runId, agentId: "composite", receipt, digest: `sha256:${crypto.createHash("sha256").update(JSON.stringify(receipt)).digest("hex")}`, signed: true, now });
     if (definition.runtime.sync !== "offline") {
-      await input.store.enqueueOutbox({ eventId: crypto.randomUUID(), kind: "factory-run", payloadJson: JSON.stringify({ runId, workOrderId: order.workOrderId, terminal: result.terminal }), createdAt: now });
+      await input.store.enqueueOutbox({
+        eventId: crypto.randomUUID(),
+        kind: "factory-run",
+        payloadJson: JSON.stringify({
+          origin: "local",
+          runId,
+          workOrderId: order.workOrderId,
+          terminal: result.terminal,
+          plan: result.plan,
+          cost: result.plan?.cost,
+          stages: result.stages,
+        }),
+        createdAt: now,
+      });
+      if (input.postSync && (definition.runtime.sync === "hosted" || definition.runtime.sync === "manual")) {
+        await replayOutbox(input.store, input.postSync, now);
+      }
     }
     await input.store.applyTransition(order.workOrderId, result.terminal, `local:${runId}`, "local-human");
     return { workOrderId: order.workOrderId, runId, terminal: result.terminal, planId: result.plan?.planId, stages: result.stages, cost: result.plan?.cost };

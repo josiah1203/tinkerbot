@@ -49,6 +49,39 @@ export interface CostEstimate {
   rangeCents: { low: number; high: number };
 }
 
+export interface CustomerCostView {
+  platformInvoice: "seats_only";
+  plannedStages: string[];
+  estimatedDurationSeconds: number;
+  provider?: string;
+  model?: string;
+  skipReasons?: string[];
+  byokSpendCents?: number;
+  byokNote?: string;
+}
+
+export function customerProviderLabel(provider?: string): string | undefined {
+  if (!provider) return undefined;
+  const value = provider.toLowerCase();
+  if (value.includes("workers") || value.includes("cloudflare") || value === "managed") return "Tinkerbot hosted inference";
+  return provider;
+}
+
+export function customerCostView(estimate: CostEstimate, skip: string[] = []): CustomerCostView {
+  const provider = customerProviderLabel(estimate.provider);
+  const byok = (estimate.byokSpendCents ?? 0) > 0;
+  const billedBy = estimate.provider && !customerProviderLabel(estimate.provider)?.startsWith("Tinkerbot") ? estimate.provider : provider;
+  return {
+    platformInvoice: "seats_only",
+    plannedStages: estimate.plannedStages,
+    estimatedDurationSeconds: estimate.estimatedDurationSeconds,
+    provider,
+    model: estimate.model,
+    skipReasons: skip.length ? skip : undefined,
+    ...(byok ? { byokSpendCents: estimate.byokSpendCents, byokNote: `Billed by ${billedBy}; not on your Tinkerbot invoice.` } : {}),
+  };
+}
+
 export interface ProviderUsage {
   provider: string;
   model: string;

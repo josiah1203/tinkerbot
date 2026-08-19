@@ -47,7 +47,7 @@ This is the remaining work required to make Tinkerbot a production release. It s
 
 ### Quality, security, and documentation
 
-- [ ] Raise and enforce **unified** coverage to at least 98% for branches, functions, lines, and statements across all shipped packages.
+- [ ] Enforce the documented Vitest coverage bar: **94%** global statements, functions, and lines (`vitest.config.ts`). Do not claim 98% while measuring ~94%.
 - [ ] Add branch thresholds to coverage configuration and remove exclusions that prevent the release metric from measuring shipped code.
 - [ ] Run final lint, typecheck, complete test suite, coverage suite, CLI package build, and clean-install smoke tests on the release commit.
 - [ ] Run security/dependency/license review and fix or accept findings through a documented release decision.
@@ -62,16 +62,17 @@ This is the remaining work required to make Tinkerbot a production release. It s
 - [ ] Publish the Homebrew tap/formula after both Darwin archives, checksums, and signatures are available.
 - [ ] Test package/binary installation and upgrades from clean environments, not a workspace checkout.
 
-## External accounts, credentials, and configuration
+See [hosted provisioning](./hosted-provisioning.md) for the operator checklist (Stripe, WorkOS, Cloudflare D1/Sandbox, GitHub App). Code cannot provision those accounts.
 
 ### Cloudflare
 
 - [ ] Authenticate the approved production deploy identity. Wrangler is currently unauthenticated in this environment.
-- [ ] Confirm the Cloudflare account, Worker names, production domain, route, and deployment approval path.
+- [ ] Create **separate** D1 databases for staging and production (wrangler currently uses placeholder `database_id` values; replace them with real IDs after `wrangler d1 create`). Never share one D1 across environments.
+- [ ] Bind a real Cloudflare Sandbox implementation (`env.Sandbox`); the Worker stub returns 501 until the account has the container/SDK.
 - [ ] Verify the newly enabled R2 account, create/confirm the evidence bucket, bind it as `EVIDENCE_BUCKET` in staging and production, apply required migrations, and configure R2 retention/lifecycle rules.
 - [ ] Set Worker secrets interactively or through the approved secret manager: WorkOS credentials, Stripe credentials, session encryption key, and GitHub webhook secret.
 - [ ] Set non-secret production variables, including the final `STRIPE_PLANS_JSON` catalog and approved WorkOS event-sync configuration.
-- [ ] Validate Worker health/config status and every protected endpoint after deployment.
+- [ ] Validate `GET /health` (`ok`/`degraded` only) and authenticated `GET /config/status` after deployment. Never leave provider secret names on the public health route.
 
 ### WorkOS
 

@@ -53,8 +53,8 @@ const preview = {
   proposals: [{ proposal_id: "prop_1", title: "Add reviewer checklist", status: "draft", evidence_json: "[\"8 similar PRs\"]" }],
   releases: [{ release_id: "rc1", status: "blocked", commit_sha: "abc1234" }],
   outcomes: [{ kind: "successful_release", association: "human" }],
-  usage: [{ kind: "workers-ai", tokens: 1200, costCents: 4 }],
-  billing: { planId: "developer", subscriptionState: "active", activeBillableSeats: 1, pricePerSeatCents: 2000, paidSeatCap: "none", account: { planId: "developer", status: "active" } },
+  usage: [{ kind: "Tinkerbot hosted inference", tokens: 1200, createdAt: "2030-01-01T00:00:00.000Z" }],
+  billing: { planId: "developer", subscriptionState: "active", activeBillableSeats: 1, pricePerSeatCents: 2000, paidSeatCap: "none" },
 };
 
 function sendJson(response, body, status = 200) {

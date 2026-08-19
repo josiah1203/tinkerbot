@@ -23,8 +23,8 @@ import {
 import { admitWebhook, githubEventKind, githubInstallationAccount, inlineReviewComments, mintInstallationToken, publishCheckRun, publishInlineComments, mapCheckAnnotations } from "../../../packages/github/src";
 import { admitGitlabWebhook } from "../../../packages/gitlab/src";
 import { D1FactoryStore } from "./factory-store";
-import { ForemanDurableObject, handleFactoryMcpRequest, intakeFromIntegration, runFactoryTurn, classifyWorkOrderGroup, githubSecurityIntake, sweepFactoryOs } from "./factory-runtime";
-import { createWorkOrder, decodeJwtPayload, validateOidcClaims } from "../../../packages/factory/src";
+import { ForemanDurableObject, Sandbox, handleFactoryMcpRequest, intakeFromIntegration, runFactoryTurn, classifyWorkOrderGroup, githubSecurityIntake, sweepFactoryOs } from "./factory-runtime";
+import { createWorkOrder, verifyOidcJwt, oidcReplayKey, containsRawCredentials, customerProviderLabel } from "../../../packages/factory/src";
 import { createChangeSet, assessChangeSet, assessReleaseSafety, createReleaseManifest } from "../../../packages/assurance/src";
 import { calculateEntitlements, type EntitlementKey } from "../../../packages/control-plane/src";
 import {
@@ -42,7 +42,7 @@ import {
   syncStripeQuantity,
   type CheckoutMapping,
 } from "./billing";
-export { ForemanDurableObject };
+export { ForemanDurableObject, Sandbox };
 
 interface Env extends Record<string, unknown> {
   ENVIRONMENT?: string;
@@ -176,13 +176,13 @@ interface AuthorizationFailure {
 
 const INVITATION_ROLES: TenantRole[] = ["maintainer", "reviewer", "viewer"];
 
-type TenantCapability = "tenant:read" | "billing:read" | "billing:manage" | "invitations:read" | "invitations:create" | "assurance:read" | "assurance:write" | "assurance:delete";
+type TenantCapability = "tenant:read" | "factory:write" | "work:operate" | "ops:read" | "billing:read" | "billing:manage" | "invitations:read" | "invitations:create" | "assurance:read" | "assurance:write" | "assurance:delete";
 
 const ROLE_CAPABILITIES: Record<TenantRole, readonly TenantCapability[]> = {
-  owner: ["tenant:read", "billing:read", "billing:manage", "invitations:read", "invitations:create", "assurance:read", "assurance:write", "assurance:delete"],
-  admin: ["tenant:read", "billing:read", "billing:manage", "invitations:read", "invitations:create", "assurance:read", "assurance:write", "assurance:delete"],
+  owner: ["tenant:read", "factory:write", "work:operate", "ops:read", "billing:read", "billing:manage", "invitations:read", "invitations:create", "assurance:read", "assurance:write", "assurance:delete"],
+  admin: ["tenant:read", "factory:write", "work:operate", "ops:read", "billing:read", "billing:manage", "invitations:read", "invitations:create", "assurance:read", "assurance:write", "assurance:delete"],
   billing_administrator: ["tenant:read", "billing:read", "billing:manage"],
-  maintainer: ["tenant:read", "assurance:read", "assurance:write"],
+  maintainer: ["tenant:read", "factory:write", "work:operate", "assurance:read", "assurance:write"],
   reviewer: ["tenant:read", "assurance:read"],
   viewer: ["tenant:read", "assurance:read"],
 };
@@ -204,6 +204,15 @@ async function authorizeTenantSession(current: { id: string; session: HostedSess
 
 function publicAccess(access: AuthorizedSession): Record<string, unknown> {
   return { authorized: true, organizationId: access.membership.organizationId, role: access.membership.role, entitlements: access.entitlements };
+}
+
+function publicUsageKind(kind: string): string {
+  if (kind === "workers-ai" || kind.startsWith("workers-ai") || kind.toLowerCase().includes("workers-ai")) return "Tinkerbot hosted inference";
+  return customerProviderLabel(kind) ?? kind;
+}
+
+function publicUsage(rows: Array<{ kind: string; tokens: number; costCents: number; createdAt: string }>): Array<{ kind: string; tokens: number; createdAt: string }> {
+  return rows.map((row) => ({ kind: publicUsageKind(row.kind), tokens: row.tokens, createdAt: row.createdAt }));
 }
 
 async function boundedRequestText(request: Request, maxBytes: number): Promise<string> {
@@ -601,17 +610,16 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     const token = typeof body?.token === "string" ? body.token : "";
     const repository = typeof body?.repository === "string" ? body.repository : "";
     const sha = typeof body?.sha === "string" ? body.sha : undefined;
-    const claims = decodeJwtPayload(token);
     const audience = env.ACTION_OIDC_AUDIENCE ?? "tinkerbot";
-    if (!claims) return json({ error: "OIDC token is invalid.", code: "invalid_oidc" }, 401);
-    const checked = validateOidcClaims(claims, { audience, repository, sha });
-    if (!checked.ok) return json({ error: "OIDC claims were rejected.", code: checked.reason }, 401);
+    const verified = await verifyOidcJwt(token, { audience, repository, sha });
+    if (!verified.ok) return json({ error: "OIDC token is invalid.", code: verified.reason }, 401);
+    const replay = await factories.consumeOidcReplayKey(oidcReplayKey(token, verified.claims), new Date().toISOString());
+    if (replay === "replay") return json({ error: "OIDC token was already used.", code: "replay" }, 401);
     const installation = await env.DB.prepare("SELECT organization_id FROM tinkerbot_github_repositories r JOIN tinkerbot_github_installations i ON i.installation_id = r.installation_id WHERE lower(r.full_name) = lower(?1) LIMIT 1").bind(repository).first<{ organization_id: string }>();
-    if (installation?.organization_id) {
-      const calculated = await entitlementsForOrganization(env.DB, installation.organization_id);
-      const denied = entitlementDenied(calculated, "verification", true);
-      if (denied) return json({ ...denied, checkRun: "unknown" }, 403);
-    }
+    if (!installation?.organization_id) return json({ error: "GitHub App installation is required.", code: "installation_required" }, 401);
+    const calculated = await entitlementsForOrganization(env.DB, installation.organization_id);
+    const denied = entitlementDenied(calculated, "verification", true);
+    if (denied) return json({ ...denied, checkRun: "unknown" }, 403);
     const runId = typeof body?.runId === "string" ? body.runId : crypto.randomUUID();
     const runToken = crypto.randomUUID().replace(/-/g, "");
     const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
@@ -633,11 +641,21 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
   if (url.pathname === "/usage" && request.method === "GET") {
     const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
     if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
-    return json({ authorized: true, billingUnit: "active_seat", billed: false, fairUse: true, usage: await factories.listUsage(access.membership.organizationId) });
+    return json({ authorized: true, billingUnit: "active_seat", billed: false, fairUse: true, usage: publicUsage(await factories.listUsage(access.membership.organizationId)) });
+  }
+  if (url.pathname === "/runtime/sync" && request.method === "POST") {
+    if (!originAllowed(request, env)) return json({ error: "Cross-origin runtime sync rejected.", code: "csrf_origin_rejected" }, 403);
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "factory:write");
+    if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
+    const body = await jsonBody(request) ?? {};
+    if (containsRawCredentials(body)) return json({ error: "Secrets must not appear in synced local payloads.", code: "secret_rejected" }, 400);
+    const kind = typeof body.kind === "string" ? body.kind : "factory-run";
+    const ingested = await factories.ingestLocalRuntimePayload({ organizationId: access.membership.organizationId, kind, payload: body, now: new Date().toISOString() });
+    return json({ ...ingested, origin: "local", identity: "hosted-session" });
   }
   if (factoryMatch && (request.method === "GET" || request.method === "POST" || request.method === "PATCH")) {
     if (request.method !== "GET" && !originAllowed(request, env)) return json({ error: "Cross-origin factory mutation rejected.", code: "csrf_origin_rejected" }, 403);
-    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), request.method === "GET" ? "tenant:read" : "factory:write");
     if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
     if (request.method !== "GET") {
       const calculated = await calculatedAccess(env, access);
@@ -660,7 +678,7 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     return json({ factory: saved }, request.method === "POST" ? 201 : 200);
   }
   if (workMatch) {
-    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), request.method === "GET" ? "tenant:read" : "work:operate");
     if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
     if (request.method === "GET" && !workMatch[1]) {
       const workOrders = await factories.listWorkOrders(access.membership.organizationId);
@@ -688,6 +706,8 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     }
     if (request.method === "POST" && workMatch[1] && workMatch[2]) {
       if (!originAllowed(request, env)) return json({ error: "Cross-origin work-order mutation rejected.", code: "csrf_origin_rejected" }, 403);
+      const scoped = await factories.getWorkOrder(workMatch[1]);
+      if (!scoped || scoped.organizationId !== access.membership.organizationId) return json({ error: "Work order not found.", code: "not_found" }, 404);
       if (workMatch[2] === "steer") {
         const body = await jsonBody(request);
         const note = typeof body?.note === "string" ? body.note : "";
@@ -716,8 +736,10 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
           return json({ workOrder: updated, specApproved: true });
         }
       }
+      const current = await factories.getWorkOrder(workMatch[1]);
+      if (!current || current.organizationId !== access.membership.organizationId) return json({ error: "Work order not found.", code: "not_found" }, 404);
       const toState = workMatch[2] === "approve" ? "ready" : workMatch[2] === "cancel" ? "cancelled" : "intake";
-      const result = await factories.applyTransition(workMatch[1], toState, `${workMatch[2]}:${crypto.randomUUID()}`, access.current.session.user.id);
+      const result = await factories.applyTransition(current.workOrderId, toState, `${workMatch[2]}:${crypto.randomUUID()}`, access.current.session.user.id);
       if (!result.ok) return json({ error: "Work-order transition was rejected.", code: result.code }, result.code === "not_found" ? 404 : 409);
       return json({ workOrder: result.order });
     }
@@ -725,7 +747,7 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
   if (runMatch && request.method === "GET") {
     const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
     if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
-    const run = await factories.getRun(runMatch[1]);
+    const run = await factories.getRunForOrganization(runMatch[1], access.membership.organizationId);
     if (!run) return json({ error: "Run not found.", code: "not_found" }, 404);
     const stages = await factories.listRunStages(runMatch[1]);
     return json({ run, stages, events: stages });
@@ -901,13 +923,22 @@ export default {
     const url = new URL(request.url);
     try {
       const config = await hostedProviderConfig(env);
-      if (url.pathname === "/health" || url.pathname === "/config/status") {
+      if (url.pathname === "/health" && request.method === "GET") {
+        const statuses = providerStatuses(config);
+        const degraded = !env.DB || statuses.some((item) => item.state !== "configured");
+        return json({ status: degraded ? "degraded" : "ok", service: "tinkerbot-control-plane" });
+      }
+      if (url.pathname === "/config/status" && request.method === "GET") {
+        const store = sessionStore(env, config);
+        if (!store || !env.DB) return json({ error: "Operator status requires an authenticated session store.", code: "session_store_not_configured" }, 501);
+        const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "ops:read");
+        if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
         return json({ service: "tinkerbot-control-plane", environment: config.environment, providers: providerStatuses(config), resources: { d1: Boolean(env.DB), r2: Boolean(env.EVIDENCE_BUCKET), evidenceExport: Boolean(env.EVIDENCE_EXPORT_ENDPOINT), stripePlanCount: config.stripe.plans.length, workosEventSync: env.WORKOS_EVENTS_SYNC_ENABLED === "true", aiGateway: env.AI_GATEWAY_ID ?? "tinkerbot-factory" }, localVerification: "independent" });
       }
       if (url.pathname === "/mcp" && request.method === "POST") {
         const store = sessionStore(env, config);
         if (!store || !env.DB) return json({ error: "Factory MCP requires a hosted session.", code: "session_store_not_configured" }, 501);
-        const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
+        const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "factory:write");
         if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
         return handleFactoryMcpRequest(request, env, access.current.session.user.id, access.membership.organizationId);
       }
@@ -1301,7 +1332,6 @@ export default {
           paymentState: account?.status ?? "free",
           entitlements: calculated.features,
           limited: calculated.limited,
-          account,
         });
       }
       if (url.pathname === "/org/seats" && request.method === "GET") {

@@ -1,6 +1,6 @@
 # Architecture
 
-Tinkerbot is a software production operating system. Cloudflare hosts the control plane, orchestration, AI, storage, usage, and dashboard. GitHub remains source control and merge authority. GitHub Actions are work cells for `tb check`. The deterministic engine is the quality laboratory woven through every stage.
+Tinkerbot is a software production operating system. Cloudflare hosts the control plane when `controlPlane: hosted`. A local control plane (`packages/local-runtime`, `organizationId = local`) can run the same WorkOrder contracts offline. GitHub remains source control and merge authority. GitHub Actions are work cells for `tb check`. The deterministic engine is the quality laboratory woven through every stage.
 
 ```text
 Organization → Portfolio → Product → Factory

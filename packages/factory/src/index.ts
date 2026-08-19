@@ -52,6 +52,7 @@ export * from "./store";
 export * from "./inference";
 export * from "./approval";
 export * from "./evals";
+export * from "./oidc";
 export { executeFactoryRun } from "./execute";
 import { assertCredentialRef, hostedRuntimeDefaults, parseRuntimeProfile, type RuntimeProfile } from "./runtime";
 
@@ -512,7 +513,7 @@ export function runForeman(definition: FactoryDefinition, sourceType: WorkOrder[
 
 async function invokeAgent(ai: FactoryAi | undefined, agent: FactoryAgentDefinition | undefined, instruction: string, untrusted: string): Promise<AgentStageResult> {
   if (!agent || agent.provider === "none") return { status: "skipped", summary: "Stage skipped by definition." };
-  if (!ai) return { status: "unknown", summary: "Workers AI is unavailable." };
+  if (!ai) return { status: "unknown", summary: "Hosted inference is unavailable." };
   try {
     const result = await ai.run(agent.model, { messages: [{ role: "system", content: instruction }, { role: "user", content: sanitizeUntrustedPromptInput(untrusted) }] }, workersAiGatewayOptions({ stage: agent.id }));
     const text = typeof result.response === "string" ? result.response.trim() : "";
@@ -554,45 +555,6 @@ export function verifySignedRecord(record: SignedRecord, secret: string): boolea
 
 export function publicationDedupeKey(runId: string, fingerprint: string, commitSha: string): string {
   return `${runId}:${fingerprint}:${commitSha}`;
-}
-
-export interface GitHubOidcClaims {
-  iss: string;
-  aud: string | string[];
-  sub?: string;
-  repository?: string;
-  project_path?: string;
-  workflow?: string;
-  ref?: string;
-  sha?: string;
-  run_id?: string;
-}
-
-const GITHUB_ACTIONS_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
-const GITLAB_OIDC_ISSUERS = ["https://gitlab.com", "https://gitlab.com/oidc"];
-
-export function validateOidcClaims(claims: GitHubOidcClaims, expected: { audience: string; repository: string; sha?: string; workflow?: string }): { ok: true } | { ok: false; reason: string } {
-  const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
-  const gitlab = GITLAB_OIDC_ISSUERS.includes(claims.iss) || /^https:\/\/[^/]*gitlab[^/]*$/.test(claims.iss);
-  if (claims.iss !== GITHUB_ACTIONS_OIDC_ISSUER && !gitlab) return { ok: false, reason: "invalid_issuer" };
-  if (!audiences.includes(expected.audience)) return { ok: false, reason: "invalid_audience" };
-  const repository = gitlab ? (claims.project_path ?? claims.repository) : claims.repository;
-  if (repository !== expected.repository) return { ok: false, reason: "invalid_repository" };
-  if (expected.sha && claims.sha && claims.sha !== expected.sha) return { ok: false, reason: "invalid_sha" };
-  if (expected.workflow && claims.workflow && claims.workflow !== expected.workflow) return { ok: false, reason: "invalid_workflow" };
-  return { ok: true };
-}
-
-export function decodeJwtPayload(token: string): GitHubOidcClaims | undefined {
-  const parts = token.split(".");
-  if (parts.length !== 3) return undefined;
-  try {
-    const json = Buffer.from(parts[1].replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
-    const parsed = JSON.parse(json) as GitHubOidcClaims;
-    return parsed && typeof parsed === "object" ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 export function validateAgentReceipt(value: unknown): { valid: boolean; missing: string[]; unknowns: string[]; signed: boolean } {

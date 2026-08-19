@@ -86,6 +86,9 @@ export type Intent =
   | { type: "return" }
   | { type: "approve" }
   | { type: "dashboard" }
+  | { type: "plan" }
+  | { type: "cost" }
+  | { type: "eval" }
   | { type: "clear" }
   | { type: "help" }
   | { type: "exit" }

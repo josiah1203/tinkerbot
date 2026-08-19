@@ -59,7 +59,8 @@ export interface FactoryRunnerDefinition {
 export interface FactoryDashboardMetrics {
   opened: number;
   merged: number;
-  estimatedCostCents: number;
+  blocked: number;
+  waiting: number;
   autonomyShare: number | null;
   caption: string;
 }
@@ -100,11 +101,11 @@ export function assertAllowedHarness(value: unknown, context: string): string | 
   if (value == null) return undefined;
   if (typeof value === "object" && !Array.isArray(value)) {
     const type = String((value as { type?: unknown }).type ?? "");
-    if ((FORBIDDEN_HARNESS_TYPES as readonly string[]).includes(type)) throw new Error(`${context} harness '${type}' is not supported. Use tinkerbot-sandbox or github_actions via Workers AI.`);
+    if ((FORBIDDEN_HARNESS_TYPES as readonly string[]).includes(type)) throw new Error(`${context} harness '${type}' is not supported. Use tinkerbot-sandbox or github_actions.`);
     throw new Error(`${context} harness type is invalid.`);
   }
   if (typeof value !== "string") throw new Error(`${context} harness is invalid.`);
-  if ((FORBIDDEN_HARNESS_TYPES as readonly string[]).includes(value)) throw new Error(`${context} harness '${value}' is not supported. Use tinkerbot-sandbox or github_actions via Workers AI.`);
+  if ((FORBIDDEN_HARNESS_TYPES as readonly string[]).includes(value)) throw new Error(`${context} harness '${value}' is not supported. Use tinkerbot-sandbox or github_actions.`);
   if (!(ALLOWED_HARNESSES as readonly string[]).includes(value) && value !== "workers-ai") throw new Error(`${context} harness '${value}' is not supported.`);
   return value === "workers-ai" ? "default" : value;
 }
@@ -303,16 +304,18 @@ export function automationMatches(automation: FactoryAutomationDefinition, event
   });
 }
 
-export function factoryDashboardMetrics(input: { statuses: string[]; costCents: number[] }): FactoryDashboardMetrics {
+export function factoryDashboardMetrics(input: { statuses: string[] }): FactoryDashboardMetrics {
   const opened = input.statuses.filter((status) => ["implementation", "review", "verification", "approval", "ready", "merged", "released"].includes(status)).length;
   const merged = input.statuses.filter((status) => status === "merged" || status === "released").length;
-  const estimatedCostCents = input.costCents.reduce((sum, value) => sum + value, 0);
+  const blocked = input.statuses.filter((status) => status === "blocked").length;
+  const waiting = input.statuses.filter((status) => ["specification", "approval", "ready"].includes(status)).length;
   return {
     opened,
     merged,
-    estimatedCostCents,
+    blocked,
+    waiting,
     autonomyShare: null,
-    caption: "Estimated COGS, not billing. Autonomy requires GitHub App merge history after install. Scorers cannot upgrade tb check.",
+    caption: "Opened, merged, blocked, and waiting work. Hosted inference is included on your plan. Autonomy requires GitHub App merge history after install. Scorers cannot upgrade tb check.",
   };
 }
 

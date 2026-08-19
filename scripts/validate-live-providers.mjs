@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 
 const workerUrl = process.env.TINKERBOT_WORKER_URL?.trim();
+const opsSession = process.env.TINKERBOT_OPS_SESSION?.trim();
 const workosApiKey = process.env.WORKOS_API_KEY?.trim();
 const workosWebhookUrl = process.env.WORKOS_WEBHOOK_URL?.trim();
 const replayStart = process.env.WORKOS_EVENTS_RANGE_START?.trim();
@@ -39,6 +40,7 @@ const checks = [];
 const missing = [];
 for (const [name, value] of [
   ["TINKERBOT_WORKER_URL", workerUrl],
+  ["TINKERBOT_OPS_SESSION", opsSession],
   ["WORKOS_API_KEY", workosApiKey],
   ["WORKOS_WEBHOOK_URL", workosWebhookUrl],
   ["WORKOS_EVENTS_RANGE_START", replayStart],
@@ -86,13 +88,13 @@ function parsePlans() {
   const prices = [];
   for (const plan of value) {
     if (!plan || typeof plan !== "object" || typeof plan.id !== "string" || !plan.id) throw new Error("Every Stripe plan must have an id.");
-    for (const key of ["privateRepositoryLimit", "memberLimit", "retentionDays"]) {
-      if (!Number.isSafeInteger(plan[key]) || plan[key] < 0) throw new Error(`Stripe plan ${plan.id} has an invalid ${key}.`);
+    for (const key of ["memberLimit", "seatLimit", "privateRepositoryLimit", "repositoryLimit", "additionalRepositoryPrice", "perRepositoryPrice", "perRunPrice", "perTokenPrice", "factoryLimit"]) {
+      if (Object.prototype.hasOwnProperty.call(plan, key)) throw new Error(`Stripe plan ${plan.id} must not include ${key}. Seat-only catalogs omit paid caps.`);
     }
-    if (!plan.features || typeof plan.features !== "object" || Array.isArray(plan.features) || Object.values(plan.features).some((value) => typeof value !== "boolean")) throw new Error(`Stripe plan ${plan.id} must contain an explicit boolean features map.`);
+    if (!["developer", "team", "business"].includes(plan.id)) throw new Error(`Stripe plan ${plan.id} is not in the seat catalog.`);
     for (const key of ["monthlyPriceId", "annualPriceId"]) {
       if (plan[key] !== undefined) {
-        if (typeof plan[key] !== "string" || !plan[key]) throw new Error(`Stripe plan ${plan.id} has an invalid ${key}.`);
+        if (typeof plan[key] !== "string" || !plan[key] || String(plan[key]).includes("REPLACE")) throw new Error(`Stripe plan ${plan.id} has an invalid ${key}.`);
         prices.push({ planId: plan.id, priceId: plan[key] });
       }
     }
@@ -111,7 +113,7 @@ async function run() {
   await (async () => {
     try {
       const url = new URL("/config/status", workerUrl);
-      const body = await jsonFetch(url, { headers: { accept: "application/json" } }, "Worker config status");
+      const body = await jsonFetch(url, { headers: { accept: "application/json", authorization: `Bearer ${opsSession}`, cookie: `tinkerbot_session=${encodeURIComponent(opsSession)}` } }, "Worker config status");
       const providers = Object.fromEntries((Array.isArray(body.providers) ? body.providers : []).map((item) => [item.provider, item]));
       const unavailable = ["workos", "stripe", "cloudflare"].filter((provider) => providers[provider]?.state !== "configured");
       const resources = body.resources && typeof body.resources === "object" ? body.resources : {};

@@ -25,7 +25,7 @@ Hosted factory YAML still rejects harness types `claude`, `claude-code`, `codex`
 
 ## Master slash
 
-Always Tinkerbot, never the child: `/tab`, `/check`, `/work <id>`, `/claude`, `/gemini`, `/codex`, `/cursor`, `/shell`, `/factory list|show`, `/dashboard`, `/help`, `/exit`. Forbidden on the master: `/merge`, `/pass`, `/fail`, `/approve-verdict`.
+Always Tinkerbot, never the child: `/tab`, `/check`, `/work <id>`, `/claude`, `/gemini`, `/codex`, `/cursor`, `/shell`, `/factory list|show`, `/plan`, `/cost`, `/eval`, `/dashboard`, `/help`, `/exit`. `/plan` `/cost` `/eval` read the local SQLite store. Forbidden on the master: `/merge`, `/pass`, `/fail`, `/approve-verdict`.
 
 ## Node `--once` streams
 

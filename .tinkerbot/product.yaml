@@ -1,0 +1,23 @@
+name: tinkerbot
+portfolio: software-production
+owners:
+  - maintainer
+environments:
+  - preview
+  - staging
+  - production
+riskClass: high
+customerFacing: true
+services:
+  - id: control-plane
+    repository: josiah1203/tinkerbot
+    path: apps/control-plane-worker
+    owners:
+      - maintainer
+    apis:
+      - /work-orders
+      - /factories
+    constraints:
+      - tb-check-is-verdict-authority
+      - humans-merge
+      - no-pull-request-target

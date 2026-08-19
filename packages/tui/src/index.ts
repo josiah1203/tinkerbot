@@ -21,6 +21,7 @@ export interface MasterTuiDeps {
   stdin?: NodeJS.ReadableStream;
   createReport?: (input: { cwd: string }) => { verdict: string; limitations?: string[] };
   fetchWork?: (id: string) => { summary?: string; verdict?: string };
+  localRuntime?: () => { plan?: string; cost?: string; eval?: string };
 }
 
 export function isAgentId(value: string | undefined): value is AgentId {
@@ -55,6 +56,15 @@ export function processMasterCommand(state: MasterState, line: string, deps: Mas
       lastVerdict: view.verdict ?? next.lastVerdict,
       workLog: view.summary ?? `Work ${intent.id}. Agent text is not PASS.`,
     };
+  }
+  if (intent.type === "plan" && deps.localRuntime) {
+    next = { ...next, planLog: deps.localRuntime().plan, status: "Local execution plan. tb check is the verdict." };
+  }
+  if (intent.type === "cost" && deps.localRuntime) {
+    next = { ...next, costLog: deps.localRuntime().cost, status: "Estimate vs actual. Seat billing unchanged." };
+  }
+  if (intent.type === "eval" && deps.localRuntime) {
+    next = { ...next, evalLog: deps.localRuntime().eval, status: "Eval scorers cannot upgrade tb check." };
   }
   if (intent.type === "dashboard") return { state: next, dashboard: true };
   if (intent.type === "open-agent") return { state: next, spawn: intent.id };

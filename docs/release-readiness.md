@@ -7,7 +7,7 @@ The factory source tree is not a production release until Cloudflare, WorkOS, St
 | Factory domain + CLI | implemented | hosted URL and session issuance |
 | Dashboard | Worker APIs + SPA | production assets domain |
 | GitHub App publisher | implemented | App registration, private key, webhook URL |
-| Action OIDC | implemented | `id-token: write` on customer workflows |
+| Action OIDC | JWKS RS256 + installation required | App install + customer `id-token: write` |
 | Billing | seat catalog, trial, grace | real Stripe Price IDs |
 | CI matrix | ubuntu/macOS/Windows | live green run |
 | Artifact signing | `"signed": false` | keys + workflow |
