@@ -227,7 +227,15 @@ export function makeTempWorktree(root: string, revision: string): { directory: s
     attached = true;
     const sharedNodeModules = path.join(root, "node_modules");
     const worktreeNodeModules = path.join(directory, "node_modules");
-    if (fs.existsSync(sharedNodeModules) && !fs.existsSync(worktreeNodeModules)) fs.symlinkSync(sharedNodeModules, worktreeNodeModules, "dir");
+    if (fs.existsSync(sharedNodeModules) && !fs.existsSync(worktreeNodeModules)) {
+      try {
+        fs.symlinkSync(sharedNodeModules, worktreeNodeModules, "dir");
+      } catch {
+        // Symlinks are an optional acceleration for local dependencies. Some
+        // Windows runners deny link creation; the isolated worktree remains
+        // valid without sharing node_modules.
+      }
+    }
     let cleaned = false;
     return {
       directory,

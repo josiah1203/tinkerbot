@@ -235,7 +235,8 @@ test("git adapters cover revisions, file reads, renames, quoted paths, worktrees
   fs.mkdirSync(path.join(fixture.root, "node_modules"));
   const worktree = makeTempWorktree(fixture.root, fixture.head);
   expect(fs.existsSync(path.join(worktree.directory, "src/core.ts"))).toBe(true);
-  expect(fs.lstatSync(path.join(worktree.directory, "node_modules")).isSymbolicLink()).toBe(true);
+  const sharedModules = path.join(worktree.directory, "node_modules");
+  if (fs.existsSync(sharedModules)) expect(fs.lstatSync(sharedModules).isSymbolicLink()).toBe(true);
   worktree.cleanup();
   worktree.cleanup();
   expect(() => makeTempWorktree(fixture.root, "missing-revision")).toThrow(/temporary worktree/);
