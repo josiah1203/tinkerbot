@@ -35,6 +35,9 @@ const headers = {
   "referrer-policy": "no-referrer",
   "x-content-type-options": "nosniff",
   "x-frame-options": "DENY",
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, HEAD, POST, OPTIONS",
+  "access-control-allow-headers": "accept, content-type",
 };
 
 const preview = {
@@ -45,6 +48,7 @@ const preview = {
     { workOrderId: "wo-ready", factoryId: "fac_1", issueOrPullRequest: "Add refund audit trail", repositoryId: "acme/payments", lineId: "feature", status: "ready", currentStage: "verification", group: "ready", outputKind: "pr", autonomyMode: "approval_gated", intent: "Add an immutable audit trail for refund decisions.", actor: { id: "agent_reviewer", name: "Reviewer", kind: "agent" }, verificationVerdict: "pass", reviewDecision: "approved", releaseDecision: "awaiting_authorization", outcomeStatus: "pending", updatedAt: "8 min ago", latestRunId: "run-wo-ready", cost: { computeCents: 8, platformCents: 1, inferenceCents: 3, providerCents: 0, ownershipLabel: "Measured Tinkerbot-managed spend." } },
     { workOrderId: "wo-approval", factoryId: "fac_1", issueOrPullRequest: "Spec for refunds", repositoryId: "acme/payments", lineId: "feature", status: "specification", currentStage: "specification", group: "awaiting_review", outputKind: "spec", autonomyMode: "approval_gated", intent: "Define the refund workflow and acceptance criteria.", actor: { id: "agent_foreman", name: "Foreman", kind: "agent" }, verificationVerdict: "pass", reviewDecision: "awaiting_human", releaseDecision: "not_eligible", outcomeStatus: "pending", updatedAt: "43 min ago" },
     { workOrderId: "wo-blocked", factoryId: "fac_1", issueOrPullRequest: "Unmapped repository", repositoryId: "acme/unknown", lineId: "feature", status: "blocked", currentStage: "foreman", group: "blocked", outputKind: "pr", autonomyMode: "restricted", intent: "Route the requested change to a repository.", actor: { id: "agent_foreman", name: "Foreman", kind: "agent" }, verificationVerdict: "blocked", reviewDecision: "not_required", releaseDecision: "not_eligible", outcomeStatus: "unknown", unresolvedUnknownCount: 1, blockedReason: "No repository mapping or authorized environment is available.", updatedAt: "1 hr ago" },
+    { workOrderId: "wo-unknown", factoryId: "fac_1", issueOrPullRequest: "Preview environment signal missing", repositoryId: "acme/payments", lineId: "verification", status: "unknown", currentStage: "verification", group: "unknown", outputKind: "pr", autonomyMode: "restricted", intent: "Confirm the preview environment before release review.", actor: { id: "system", name: "Factory system", kind: "system" }, verificationVerdict: "unknown", reviewDecision: "awaiting_human", releaseDecision: "not_eligible", outcomeStatus: "unknown", unresolvedUnknownCount: 2, blockedReason: "The preview environment has not reported a trustworthy result.", updatedAt: "2 hr ago" },
     { workOrderId: "wo-done", factoryId: "fac_1", issueOrPullRequest: "Docs typo", repositoryId: "acme/payments", lineId: "bugfix", status: "released", currentStage: "complete", group: "released", outputKind: "pr", autonomyMode: "policy_autonomous", intent: "Correct the checkout documentation typo.", actor: { id: "user_1", name: "Alex Morgan", kind: "human" }, verificationVerdict: "pass", reviewDecision: "approved", releaseDecision: "released", outcomeStatus: "accepted", updatedAt: "Yesterday", latestRunId: "run-done" },
   ],
   factories: [{ factoryId: "fac_1", name: "payments", status: "active" }],
@@ -425,6 +429,11 @@ async function requestBody(request) {
 }
 
 createServer(async (request, response) => {
+  if (request.method === "OPTIONS") {
+    response.writeHead(204, headers);
+    response.end();
+    return;
+  }
   const mocked = previewApi(request, await requestBody(request));
   if (mocked?.redirect) {
     response.writeHead(302, { ...headers, location: mocked.redirect });

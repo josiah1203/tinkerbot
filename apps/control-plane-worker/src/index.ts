@@ -610,6 +610,9 @@ export class FactoryRunWorkflow {
 }
 
 async function handleFactoryHttp(request: Request, env: Env, url: URL, config: Awaited<ReturnType<typeof hostedProviderConfig>>): Promise<Response | undefined> {
+  const accept = request.headers.get("accept") ?? "";
+  const isDocumentRequest = (request.method === "GET" || request.method === "HEAD") && accept.includes("text/html") && !accept.includes("application/json");
+  if (isDocumentRequest && ["/factories", "/work-orders", "/runs", "/environments", "/integrations", "/secrets"].some((prefix) => url.pathname === prefix || url.pathname.startsWith(`${prefix}/`))) return undefined;
   if (!env.DB) return undefined;
   const factories = new D1FactoryStore(env.DB);
   if (url.pathname === "/actions/oidc/exchange" && request.method === "POST") {
@@ -642,8 +645,28 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     const rows = typeof statement.all === "function" ? (await statement.all<{ installation_id: number; account_login?: string; status: string; updated_at: string }>()).results ?? [] : [];
     return json({ authorized: true, installations: rows });
   }
+  if (url.pathname === "/search" && request.method === "GET") {
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
+    if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
+    const query = (url.searchParams.get("q") ?? "").trim().toLowerCase();
+    if (query.length < 2) return json({ results: [] });
+    const results: Array<{ kind: string; title: string; meta: string; href: string }> = [];
+    const factoriesList = await factories.listFactories(access.membership.organizationId);
+    for (const factory of factoriesList) if (`${factory.factoryId} ${factory.name}`.toLowerCase().includes(query)) results.push({ kind: "Factory", title: factory.name, meta: factory.factoryId, href: `/factories/${encodeURIComponent(factory.factoryId)}` });
+    const workOrders = await factories.listWorkOrderViews(access.membership.organizationId);
+    for (const order of workOrders) if (`${order.id} ${order.title} ${order.repository?.name ?? ""}`.toLowerCase().includes(query)) results.push({ kind: "Work order", title: order.title, meta: `${order.id} · ${order.repository?.name ?? "Unassigned repository"}`, href: `/factories/${encodeURIComponent(order.factoryId)}/work-orders/${encodeURIComponent(order.id)}` });
+    const runs = (await Promise.all(factoriesList.map((factory) => factories.listFactoryRuns(factory.factoryId)))).flat();
+    for (const run of runs) if (`${run.run_id} ${run.work_order_id}`.toLowerCase().includes(query)) results.push({ kind: "Run", title: run.run_id, meta: run.work_order_id, href: `/runs/${encodeURIComponent(run.run_id)}` });
+    const integrations = await factories.listIntegrations(access.membership.organizationId);
+    for (const integration of integrations) if (`${integration.id} ${integration.name}`.toLowerCase().includes(query)) results.push({ kind: "MCP or app", title: integration.name, meta: integration.status, href: `/integrations/${encodeURIComponent(integration.id)}` });
+    const secrets = await factories.listSecretMetadata(access.membership.organizationId);
+    for (const secret of secrets) if (`${secret.id} ${secret.name}`.toLowerCase().includes(query)) results.push({ kind: "Secret metadata", title: secret.name, meta: "Value hidden", href: `/secrets/${encodeURIComponent(secret.id)}` });
+    return json({ results: results.slice(0, 20) });
+  }
   const factoryMatch = url.pathname.match(/^\/factories(?:\/([^/]+))?$/);
+  const factoryResourceMatch = url.pathname.match(/^\/factories\/([^/]+)\/([^/]+)(?:\/([^/]+))?$/);
   const workGraphMatch = url.pathname.match(/^\/work-orders\/([^/]+)\/graph$/);
+  const workDecisionMatch = url.pathname.match(/^\/work-orders\/([^/]+)\/decisions$/);
   const workMatch = url.pathname.match(/^\/work-orders(?:\/([^/]+))?(?:\/(retry|approve|cancel|steer|take|return))?$/);
   const runMatch = url.pathname.match(/^\/runs\/([^/]+)(?:\/(events))?$/);
   if (url.pathname === "/usage" && request.method === "GET") {
@@ -669,13 +692,46 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     const order = await factories.getWorkOrder(workOrderId);
     if (!order || order.organizationId !== access.membership.organizationId) return json({ error: "Work order not found.", code: "not_found" }, 404);
     const events = await factories.listFactoryEvents(workOrderId, access.membership.organizationId);
+    const view = await factories.getWorkOrderView(workOrderId, access.membership.organizationId);
     return json({
-      workOrder: { ...order, group: classifyWorkOrderGroup(order.status) },
+      workOrder: { ...order, ...view, group: view?.group ?? classifyWorkOrderGroup(order.status) },
       graph: projectFactoryEvents(events),
       economics: calculateFactoryEconomics(events),
       events,
       sourceOfTruth: "append_only_factory_graph",
     });
+  }
+  if (workDecisionMatch && request.method === "POST") {
+    if (!originAllowed(request, env)) return json({ error: "Cross-origin work-order decision rejected.", code: "csrf_origin_rejected" }, 403);
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "work:operate");
+    if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
+    const order = await factories.getWorkOrder(workDecisionMatch[1]);
+    if (!order || order.organizationId !== access.membership.organizationId) return json({ error: "Work order not found.", code: "not_found" }, 404);
+    const view = await factories.getWorkOrderView(order.workOrderId, access.membership.organizationId);
+    if (!view) return json({ error: "Work order not found.", code: "not_found" }, 404);
+    const body = await jsonBody(request) ?? {};
+    const type = body?.type === "review" ? "review" : body?.type === "release_authorization" ? "release" : undefined;
+    const decision = body?.decision === "approved" || body?.decision === "rejected" || body?.decision === "changes_requested" ? body.decision : undefined;
+    if (!type || !decision) return json({ error: "type and decision must be a supported typed decision.", code: "invalid_decision" }, 400);
+    const actor = access.current.session.user.id;
+    if (type === "review") {
+      if (view.reviewDecision !== "awaiting_human") return json({ error: "This work order is not awaiting human review.", code: "review_not_available" }, 409);
+      const independence = sameActorApprovalBlocked({ actorId: actor, cellHolderId: order.heldBy, lineId: order.lineId, autonomyMode: order.autonomyMode });
+      if (independence.blocked) return json({ error: "The producer cannot approve this restricted work order.", code: independence.reason }, 403);
+      await factories.recordTypedDecision({ workOrderId: order.workOrderId, organizationId: access.membership.organizationId, actor, type, decision, now: new Date().toISOString() });
+      const updated = await factories.getWorkOrderView(order.workOrderId, access.membership.organizationId);
+      return json({ workOrder: updated, availableActions: updated?.availableActions ?? [] });
+    }
+    if (decision !== "approved") return json({ error: "Release authorization must be approved or omitted; use review for a rejected change.", code: "invalid_release_decision" }, 400);
+    if (body?.evidenceAcknowledged !== true) return json({ error: "Evidence acknowledgement is required before release authorization.", code: "evidence_acknowledgement_required" }, 409);
+    if (view.verificationVerdict !== "pass" || view.reviewDecision !== "approved" || view.releaseDecision !== "awaiting_authorization") return json({ error: "Release authorization requires a passing deterministic verdict, human review, and release policy eligibility.", code: "release_gate_blocked" }, 409);
+    const transition = order.status === "ready" ? await factories.applyTransition(order.workOrderId, "merged", `release-merge:${crypto.randomUUID()}`, actor) : { ok: true as const, order };
+    if (!transition.ok) return json({ error: "The release candidate could not be assembled.", code: transition.code }, 409);
+    const released = transition.order.status === "merged" ? await factories.applyTransition(order.workOrderId, "released", `release:${crypto.randomUUID()}`, actor) : transition;
+    if (!released.ok) return json({ error: "Release transition was rejected.", code: released.code }, 409);
+    await factories.recordTypedDecision({ workOrderId: order.workOrderId, organizationId: access.membership.organizationId, actor, type, decision, now: new Date().toISOString() });
+    const updated = await factories.getWorkOrderView(order.workOrderId, access.membership.organizationId);
+    return json({ workOrder: updated, availableActions: updated?.availableActions ?? [] });
   }
   if (factoryMatch && (request.method === "GET" || request.method === "POST" || request.method === "PATCH")) {
     if (request.method !== "GET" && !originAllowed(request, env)) return json({ error: "Cross-origin factory mutation rejected.", code: "csrf_origin_rejected" }, 403);
@@ -701,19 +757,101 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     const saved = await factories.putFactory({ factoryId, organizationId: access.membership.organizationId, name: name || factoryId, yaml, files });
     return json({ factory: saved }, request.method === "POST" ? 201 : 200);
   }
+  if (factoryResourceMatch && request.method === "GET") {
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
+    if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
+    const [, factoryId, resource, entityId] = factoryResourceMatch;
+    const view = await factories.factoryOperatorView(factoryId, access.membership.organizationId);
+    if (!view) return json({ error: "Factory not found.", code: "not_found" }, 404);
+    let items: Array<Record<string, unknown>>;
+    if (resource === "work-orders") items = view.workOrders as unknown as Array<Record<string, unknown>>;
+    else if (resource === "activity") items = view.activity as unknown as Array<Record<string, unknown>>;
+    else if (resource === "runs") items = view.runs as unknown as Array<Record<string, unknown>>;
+    else if (resource === "evidence") items = await factories.listFactoryEvidence(factoryId, access.membership.organizationId);
+    else if (resource === "agents") items = view.agents.map((agent) => ({ id: agent.id, name: agent.id, role: agent.agentType ?? agent.description ?? "Specialist", state: "active", health: "Healthy", lastRun: "—", cost: "—" }));
+    else if (resource === "automations") items = view.automations.map((automation) => ({ id: `${factoryId}:${automation.name}`, name: automation.name, trigger: JSON.stringify(automation.triggers), enabled: automation.enabled, owner: automation.agent ?? "Factory", lastExecution: "—", nextExecution: "On event", result: "configured" }));
+    else if (resource === "policies") items = [{ id: `policy:${factoryId}`, name: "Factory policy", status: "active", owner: "Factory", updatedAt: view.factory.status }];
+    else if (resource === "repositories") items = [...new Set(view.workOrders.map((order) => order.repository?.name).filter((name): name is string => Boolean(name)))].map((name) => ({ id: name, name, status: "connected", owner: "Factory", updatedAt: view.factory.status }));
+    else if (resource === "releases") items = (await factories.listReleaseCandidates(factoryId)) as Array<Record<string, unknown>>;
+    else if (resource === "costs") items = [{ id: `cost:${factoryId}`, name: "Factory economics", status: "measured", owner: "Tinkerbot", updatedAt: view.factory.status, ...view.costs }];
+    else return json({ error: "Factory resource not found.", code: "not_found" }, 404);
+    if (entityId) {
+      const item = items.find((candidate) => String(candidate.id ?? candidate.workOrderId ?? candidate.run_id ?? candidate.runId ?? candidate.evidenceId ?? candidate.release_id) === entityId);
+      return item ? json({ item }) : json({ error: "Factory record not found.", code: "not_found" }, 404);
+    }
+    return json({ items });
+  }
+  if (["/runs", "/environments", "/integrations", "/secrets"].includes(url.pathname) && request.method === "GET") {
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
+    if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
+    if (url.pathname === "/runs") {
+      const listedFactories = await factories.listFactories(access.membership.organizationId);
+      return json({ items: (await Promise.all(listedFactories.map((factory) => factories.listFactoryRuns(factory.factoryId)))).flat() });
+    }
+    if (url.pathname === "/environments") return json({ items: await factories.listEnvironments(access.membership.organizationId) });
+    if (url.pathname === "/integrations") return json({ items: await factories.listIntegrations(access.membership.organizationId) });
+    return json({ items: await factories.listSecretMetadata(access.membership.organizationId) });
+  }
+  const workspaceDetailMatch = url.pathname.match(/^\/(environments|integrations|secrets)\/([^/]+)$/);
+  if (workspaceDetailMatch && request.method === "GET") {
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
+    if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
+    const [, resource, entityId] = workspaceDetailMatch;
+    const items = resource === "environments" ? await factories.listEnvironments(access.membership.organizationId) : resource === "integrations" ? await factories.listIntegrations(access.membership.organizationId) : await factories.listSecretMetadata(access.membership.organizationId);
+    const item = items.find((candidate) => candidate.id === entityId);
+    return item ? json({ item }) : json({ error: `${resource} record not found.`, code: "not_found" }, 404);
+  }
+  if (url.pathname === "/integrations" && request.method === "POST") {
+    if (!originAllowed(request, env)) return json({ error: "Cross-origin integration mutation rejected.", code: "csrf_origin_rejected" }, 403);
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "factory:write");
+    if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
+    const body = await jsonBody(request) ?? {};
+    if (containsRawCredentials(body)) return json({ error: "Integration credentials must be stored through a secret reference, not in the integration payload.", code: "secret_rejected" }, 400);
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const kind = typeof body.kind === "string" ? body.kind.trim() : "";
+    if (!name || !kind) return json({ error: "Integration name and kind are required.", code: "invalid_request" }, 400);
+    const integration = await factories.createIntegrationMetadata({ organizationId: access.membership.organizationId, name, kind, now: new Date().toISOString() });
+    return json({ integration }, 201);
+  }
+  if (url.pathname === "/secrets" && request.method === "POST") {
+    if (!originAllowed(request, env)) return json({ error: "Cross-origin secret mutation rejected.", code: "csrf_origin_rejected" }, 403);
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "factory:write");
+    if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
+    const body = await jsonBody(request) ?? {};
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const value = typeof body.value === "string" ? body.value : "";
+    if (!name || !value) return json({ error: "Secret name and value are required.", code: "invalid_request" }, 400);
+    const secret = await factories.createSecretMetadata({ organizationId: access.membership.organizationId, name, owner: access.membership.organizationId, now: new Date().toISOString() });
+    return json({ secret, valueAccepted: true, storage: "metadata_only_external_provider_required" }, 201);
+  }
   if (workMatch) {
     const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), request.method === "GET" ? "tenant:read" : "work:operate");
     if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
     if (request.method === "GET" && !workMatch[1]) {
-      const workOrders = await factories.listWorkOrders(access.membership.organizationId);
-      return json({ workOrders: workOrders.map((order) => ({ ...order, group: classifyWorkOrderGroup(order.status), lane: order.currentStage })) });
+      const factoryId = url.searchParams.get("factoryId") ?? undefined;
+      const query = (url.searchParams.get("q") ?? "").trim().toLowerCase();
+      const group = url.searchParams.get("group") ?? undefined;
+      const stage = url.searchParams.get("stage") ?? undefined;
+      const risk = url.searchParams.get("risk") ?? undefined;
+      const workOrders = (await factories.listWorkOrderViews(access.membership.organizationId, factoryId)).filter((order) => (!query || `${order.id} ${order.title} ${order.repository?.name ?? ""}`.toLowerCase().includes(query)) && (!group || order.group === group) && (!stage || order.stage === stage) && (!risk || order.risk === risk));
+      // Keep the pre-read-model `group` values stable for existing API clients while
+      // exposing the normalized control-plane value explicitly. The UI normalizer
+      // understands both representations, so this is a backwards-compatible seam.
+      return json({ workOrders: workOrders.map((order) => ({
+        ...order,
+        group: classifyWorkOrderGroup(order.status as Parameters<typeof classifyWorkOrderGroup>[0]),
+        viewGroup: order.group,
+        lane: order.stage,
+      })) });
     }
     if (request.method === "GET" && workMatch[1]) {
       const order = await factories.getWorkOrder(workMatch[1]);
       if (!order || order.organizationId !== access.membership.organizationId) return json({ error: "Work order not found.", code: "not_found" }, 404);
+      const view = await factories.getWorkOrderView(order.workOrderId, access.membership.organizationId);
       const run = await factories.getRunByWorkOrder(order.workOrderId);
       const stages = run ? await factories.listRunStages(run.run_id) : [];
-      return json({ workOrder: { ...order, group: classifyWorkOrderGroup(order.status) }, run, stages });
+      const events = await factories.listFactoryEvents(order.workOrderId, access.membership.organizationId);
+      return json({ workOrder: { ...order, ...view, group: view?.group ?? classifyWorkOrderGroup(order.status) }, run, stages, events, availableActions: view?.availableActions ?? [] });
     }
     if (request.method === "POST" && !workMatch[1]) {
       if (!originAllowed(request, env)) return json({ error: "Cross-origin work-order mutation rejected.", code: "csrf_origin_rejected" }, 403);
@@ -726,7 +864,8 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
       const order = createWorkOrder({ factoryId, organizationId: access.membership.organizationId, sourceType: "manual", sourceId: `manual:${crypto.randomUUID()}`, repositoryId, intent: typeof body?.intent === "string" ? body.intent : undefined, policyVersion: "default", definitionVersion: factory.definitionDigest ?? "unknown", definitionDigest: factory.definitionDigest ?? "unknown", actor: access.current.session.user.id });
       await factories.insertWorkOrder(order);
       await handleFactoryQueueMessage(env, { deliveryId: `manual:${order.workOrderId}`, organizationId: order.organizationId, factoryId, repository: repositoryId, sourceType: "manual", sourceId: order.sourceId, actor: order.actor });
-      return json({ workOrder: order }, 201);
+      const view = await factories.getWorkOrderView(order.workOrderId, access.membership.organizationId);
+      return json({ workOrder: view ?? order, availableActions: view?.availableActions ?? [] }, 201);
     }
     if (request.method === "POST" && workMatch[1] && workMatch[2]) {
       if (!originAllowed(request, env)) return json({ error: "Cross-origin work-order mutation rejected.", code: "csrf_origin_rejected" }, 403);

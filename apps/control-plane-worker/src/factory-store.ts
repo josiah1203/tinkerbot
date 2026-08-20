@@ -17,8 +17,21 @@ import {
   type FactoryEvent,
   type FactoryProjection,
   type FactoryDefinition,
+  type ActionCapability,
+  type WorkOrderView,
+  type WorkOrderGroupView,
+  normalizeOutcomeStatus,
+  normalizeReleaseDecision,
+  normalizeReviewDecision,
+  normalizeVerificationVerdict,
+  stageView,
+  groupView,
   validateFactoryDefinition,
 } from "../../../packages/factory/src";
+
+type WorkspaceEnvironment = { id: string; name: string; status: string; owner?: string; updatedAt: string; factoryId?: string };
+type WorkspaceIntegration = { id: string; name: string; kind: string; status: string; owner?: string; updatedAt: string; scopes?: string };
+type WorkspaceSecretMetadata = { id: string; name: string; status: string; owner?: string; updatedAt: string; references?: string };
 
 export class D1FactoryStore {
   constructor(private readonly database: D1DatabaseLike) {}
@@ -77,6 +90,8 @@ export class D1FactoryStore {
     definitionFiles: Array<{ path: string; contents: string }>;
     metrics: ReturnType<typeof factoryDashboardMetrics>;
     graph: Record<string, FactoryProjection>;
+    workOrders: WorkOrderView[];
+    costs: { totalCents: number; acceptedChanges: number; medianDurationSeconds?: number; ownershipLabel: string };
   } | null> {
     const factory = await this.getFactory(factoryId);
     if (!factory || factory.organizationId !== organizationId) return null;
@@ -87,6 +102,11 @@ export class D1FactoryStore {
       definition = parseFactoryDefinition(latest.yaml);
       if (latest.files.length) definition = applyFactoryTree(definition, latest.files);
     }
+    const workOrders = await Promise.all(orders.map((order) => this.getWorkOrderView(order.workOrderId, organizationId)));
+    const normalizedOrders = workOrders.filter((order): order is WorkOrderView => Boolean(order));
+    const dashboardMetrics = factoryDashboardMetrics({ statuses: orders.map((order) => order.status) });
+    const counts = normalizedOrders.reduce((result, order) => { result[order.group] += 1; return result; }, { blocked: 0, awaiting_review: 0, in_progress: 0, ready: 0, released: 0, unknown: 0 } as Record<WorkOrderGroupView, number>);
+    const usage = await this.listFactoryUsage(factoryId, organizationId);
     return {
       factory: { ...factory, alias: definition?.alias, schemaVersion: definition?.schemaVersion },
       activity: orders.map((order) => ({ ...order, column: classifyActivityColumn(order.status) })),
@@ -96,8 +116,71 @@ export class D1FactoryStore {
       automations: definition?.automations ?? [],
       agents: definition?.agents ?? [],
       definitionFiles: latest?.files ?? (latest ? [{ path: ".tinkerbot/factory.yaml", contents: latest.yaml }] : []),
-      metrics: factoryDashboardMetrics({ statuses: orders.map((order) => order.status) }),
+      metrics: { ...dashboardMetrics, inProgress: counts.in_progress, awaitingReview: counts.awaiting_review, released: counts.released },
       graph: Object.fromEntries(await Promise.all(orders.map(async (order) => [order.workOrderId, await this.reconstructFactoryGraph(order.workOrderId, organizationId)]))),
+      workOrders: normalizedOrders,
+      costs: { totalCents: usage.reduce((total, item) => total + item.costCents, 0), acceptedChanges: counts.released, medianDurationSeconds: undefined, ownershipLabel: "Measured platform and provider spend are reported separately." },
+    };
+  }
+
+  async listWorkOrderViews(organizationId: string, factoryId?: string): Promise<WorkOrderView[]> {
+    const orders = await this.listWorkOrders(organizationId);
+    const views = await Promise.all(orders.filter((order) => !factoryId || order.factoryId === factoryId).map((order) => this.getWorkOrderView(order.workOrderId, organizationId)));
+    return views.filter((view): view is WorkOrderView => Boolean(view));
+  }
+
+  async getWorkOrderView(workOrderId: string, organizationId: string): Promise<WorkOrderView | null> {
+    const order = await this.getWorkOrder(workOrderId);
+    if (!order || order.organizationId !== organizationId) return null;
+    const events = await this.listFactoryEvents(workOrderId, organizationId);
+    const latest = <T extends { occurredAt: string }>(items: T[]): T | undefined => items.slice().sort((a, b) => a.occurredAt.localeCompare(b.occurredAt)).at(-1);
+    const verificationEvent = latest(events.filter((event) => event.type === "verification.completed"));
+    const reviewEvent = latest(events.filter((event) => ["review.completed", "approval.recorded"].includes(event.type) && event.actorType === "human"));
+    const releaseEvent = latest(events.filter((event) => ["release.completed", "release.authorized"].includes(event.type) && event.actorType === "human"));
+    const verification = normalizeVerificationVerdict(verificationEvent?.payload && typeof verificationEvent.payload === "object" ? (verificationEvent.payload as Record<string, unknown>).verdict : order.verificationVerdict, order.currentStage ? "not_run" : "unknown");
+    const reviewPayload = reviewEvent?.payload && typeof reviewEvent.payload === "object" ? reviewEvent.payload as Record<string, unknown> : undefined;
+    const review = reviewEvent ? normalizeReviewDecision(reviewPayload?.decision, "awaiting_human") : normalizeReviewDecision(order.reviewAssessment, "awaiting_human");
+    const releasePayload = releaseEvent?.payload && typeof releaseEvent.payload === "object" ? releaseEvent.payload as Record<string, unknown> : undefined;
+    const release = normalizeReleaseDecision(releaseEvent ? releasePayload?.decision : order.releaseDecision, { verification, review, released: Boolean(releaseEvent) || order.status === "released" });
+    const outcome = normalizeOutcomeStatus(order.status === "released" ? "accepted" : order.status === "failed" ? "failed" : undefined, "pending");
+    const run = await this.getRunByWorkOrder(order.workOrderId);
+    const unresolvedUnknownCount = verification === "unknown" || verification === "not_run" && ["verification", "release"].includes(stageView(order.currentStage)) ? 1 : 0;
+    const group = groupView({ status: order.status, verification, review, release, outcome });
+    const canRetry = ["failed", "blocked"].includes(order.status);
+    const canReview = review === "awaiting_human" && verification !== "fail" && verification !== "blocked";
+    const canRelease = verification === "pass" && review === "approved" && release === "awaiting_authorization";
+    const availableActions: ActionCapability[] = [
+      { id: order.heldBy ? "return" : "take", label: order.heldBy ? "Return cell" : "Take cell", allowed: true },
+      { id: "steer", label: "Add operator note", allowed: true },
+      { id: "retry", label: "Retry run", allowed: canRetry, reason: canRetry ? undefined : "Retry is available after a failed or blocked run." },
+      { id: "review", label: "Record review", allowed: canReview, reason: canReview ? undefined : "Review is only available when the work is awaiting human review." },
+      { id: "authorize_release", label: "Authorize release", allowed: canRelease, reason: canRelease ? undefined : "Deterministic verification, human review, and release policy must be resolved first." },
+    ];
+    const actorKind: "agent" | "human" | "system" = order.sourceType === "manual" ? "human" : order.actor.toLowerCase().startsWith("agent") || order.actor.toLowerCase().includes("bot") ? "agent" : "system";
+    return {
+      id: order.workOrderId,
+      workOrderId: order.workOrderId,
+      title: order.issueOrPullRequest ?? order.intent ?? order.workOrderId,
+      factoryId: order.factoryId,
+      status: order.status,
+      repository: order.repositoryId ? { id: order.repositoryId, name: order.repositoryId } : undefined,
+      stage: stageView(order.currentStage),
+      actor: { id: order.actor, name: order.actor, kind: actorKind },
+      risk: order.risk ?? "unknown",
+      updatedAt: order.updatedAt,
+      verificationVerdict: verification,
+      reviewDecision: review,
+      releaseDecision: release,
+      outcomeStatus: outcome,
+      unresolvedUnknownCount,
+      latestRunId: run?.run_id,
+      group,
+      availableActions,
+      intent: order.intent,
+      acceptanceCriteria: order.acceptanceCriteria,
+      sourceType: order.sourceType,
+      sourceId: order.sourceId,
+      blockedReason: order.status === "blocked" ? "A required factory gate or authorized execution surface is unresolved." : order.status === "failed" ? "The latest deterministic verification failed." : undefined,
     };
   }
 
@@ -106,6 +189,53 @@ export class D1FactoryStore {
     if (typeof statement.all !== "function") return [];
     const result = await statement.all<Record<string, string>>();
     return result.results ?? [];
+  }
+
+  async listFactoryUsage(factoryId: string, organizationId: string): Promise<Array<{ kind: string; tokens: number; costCents: number; createdAt: string }>> {
+    const statement = this.database.prepare("SELECT kind, tokens, cost_cents, created_at FROM tinkerbot_usage_events WHERE factory_id = ?1 AND organization_id = ?2 ORDER BY created_at DESC").bind(factoryId, organizationId);
+    if (typeof statement.all !== "function") return [];
+    const result = await statement.all<{ kind: string; tokens: number; cost_cents: number; created_at: string }>();
+    return (result.results ?? []).map((row) => ({ kind: row.kind, tokens: row.tokens, costCents: row.cost_cents, createdAt: row.created_at }));
+  }
+
+  async listFactoryEvidence(factoryId: string, organizationId: string): Promise<Array<Record<string, unknown>>> {
+    const statement = this.database.prepare("SELECT e.evidence_id, e.run_id, e.kind, e.object_key, e.digest, e.signed, e.created_at, r.work_order_id, r.factory_id FROM tinkerbot_evidence_records e JOIN tinkerbot_factory_runs r ON r.run_id = e.run_id JOIN tinkerbot_factories f ON f.factory_id = r.factory_id WHERE r.factory_id = ?1 AND f.organization_id = ?2 ORDER BY e.created_at DESC").bind(factoryId, organizationId);
+    if (typeof statement.all !== "function") return [];
+    const result = await statement.all<Record<string, unknown>>();
+    return (result.results ?? []).map((row) => ({ id: row.evidence_id, evidenceId: row.evidence_id, name: `${String(row.kind)} evidence`, workOrderId: row.work_order_id, factoryId: row.factory_id, type: row.kind, producer: "Factory run", provenance: row.signed ? "signed" : "recorded", recordedAt: row.created_at }));
+  }
+
+  async listEnvironments(organizationId: string): Promise<WorkspaceEnvironment[]> {
+    const statement = this.database.prepare("SELECT environment_id, name, status, owner, factory_id, updated_at FROM tinkerbot_environments WHERE organization_id = ?1 ORDER BY updated_at DESC").bind(organizationId);
+    if (typeof statement.all !== "function") return [];
+    const result = await statement.all<{ environment_id: string; name: string; status: string; owner?: string | null; factory_id?: string | null; updated_at: string }>();
+    return (result.results ?? []).map((row) => ({ id: row.environment_id, name: row.name, status: row.status, owner: row.owner ?? undefined, factoryId: row.factory_id ?? undefined, updatedAt: row.updated_at }));
+  }
+
+  async listIntegrations(organizationId: string): Promise<WorkspaceIntegration[]> {
+    const statement = this.database.prepare("SELECT integration_id, name, kind, status, owner, scopes, updated_at FROM tinkerbot_integrations WHERE organization_id = ?1 ORDER BY updated_at DESC").bind(organizationId);
+    if (typeof statement.all !== "function") return [];
+    const result = await statement.all<{ integration_id: string; name: string; kind: string; status: string; owner?: string | null; scopes?: string | null; updated_at: string }>();
+    return (result.results ?? []).map((row) => ({ id: row.integration_id, name: row.name, kind: row.kind, status: row.status, owner: row.owner ?? undefined, scopes: row.scopes ?? undefined, updatedAt: row.updated_at }));
+  }
+
+  async listSecretMetadata(organizationId: string): Promise<WorkspaceSecretMetadata[]> {
+    const statement = this.database.prepare("SELECT secret_id, name, status, owner, references_text, updated_at FROM tinkerbot_secret_metadata WHERE organization_id = ?1 ORDER BY updated_at DESC").bind(organizationId);
+    if (typeof statement.all !== "function") return [];
+    const result = await statement.all<{ secret_id: string; name: string; status: string; owner?: string | null; references_text?: string | null; updated_at: string }>();
+    return (result.results ?? []).map((row) => ({ id: row.secret_id, name: row.name, status: row.status, owner: row.owner ?? undefined, references: row.references_text ?? undefined, updatedAt: row.updated_at }));
+  }
+
+  async createSecretMetadata(input: { organizationId: string; name: string; owner: string; now: string }): Promise<WorkspaceSecretMetadata> {
+    const id = crypto.randomUUID();
+    await this.database.prepare("INSERT INTO tinkerbot_secret_metadata (secret_id, organization_id, name, status, owner, references_text, updated_at) VALUES (?1, ?2, ?3, 'managed', ?4, 'External secret provider required', ?5)").bind(id, input.organizationId, input.name, input.owner, input.now).run();
+    return { id, name: input.name, status: "managed", owner: input.owner, references: "External secret provider required", updatedAt: input.now };
+  }
+
+  async createIntegrationMetadata(input: { organizationId: string; name: string; kind: string; now: string }): Promise<WorkspaceIntegration> {
+    const id = crypto.randomUUID();
+    await this.database.prepare("INSERT INTO tinkerbot_integrations (integration_id, organization_id, name, kind, status, owner, scopes, updated_at) VALUES (?1, ?2, ?3, ?4, 'pending', 'Workspace', 'Awaiting configuration', ?5)").bind(id, input.organizationId, input.name, input.kind, input.now).run();
+    return { id, name: input.name, kind: input.kind, status: "pending", owner: "Workspace", scopes: "Awaiting configuration", updatedAt: input.now };
   }
 
   async listScorers(factoryId: string): Promise<Array<Record<string, unknown>>> {
@@ -232,8 +362,8 @@ export class D1FactoryStore {
     await this.database.prepare("INSERT INTO tinkerbot_agent_receipts (receipt_id, agent_run_id, digest, signed, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(crypto.randomUUID(), agentRunId, input.digest, input.signed ? 1 : 0, JSON.stringify(input.receipt), input.now).run();
   }
 
-  async insertEvidence(input: { runId: string; kind: string; objectKey: string; digest: string; now: string }): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_evidence_records (evidence_id, run_id, kind, object_key, digest, signed, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)").bind(crypto.randomUUID(), input.runId, input.kind, input.objectKey, input.digest, input.now).run();
+  async insertEvidence(input: { runId: string; kind: string; objectKey: string; digest: string; signed?: boolean; now: string }): Promise<void> {
+    await this.database.prepare("INSERT INTO tinkerbot_evidence_records (evidence_id, run_id, kind, object_key, digest, signed, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)").bind(crypto.randomUUID(), input.runId, input.kind, input.objectKey, input.digest, input.signed ? 1 : 0, input.now).run();
   }
 
   async putSeatLedger(organizationId: string, periodStart: string, activeSeats: number, now: string): Promise<void> {
@@ -329,6 +459,48 @@ export class D1FactoryStore {
     const current = await this.getWorkOrder(workOrderId);
     if (!current) return;
     await this.database.prepare("UPDATE tinkerbot_work_orders SET product_id = ?1, line_id = ?2, cell_id = ?3, owner = ?4, risk = ?5, autonomy_mode = ?6, output_kind = ?7, held_by = ?8, intent = ?9, acceptance_criteria = ?10, updated_at = ?11, verification_verdict = ?12, review_assessment = ?13, release_decision = ?14 WHERE work_order_id = ?15").bind(patch.productId ?? current.productId ?? null, patch.lineId ?? current.lineId ?? null, patch.cellId ?? current.cellId ?? null, patch.owner ?? current.owner ?? null, patch.risk ?? current.risk ?? null, patch.autonomyMode ?? current.autonomyMode ?? null, patch.outputKind ?? current.outputKind ?? null, patch.heldBy === undefined ? current.heldBy ?? null : patch.heldBy, patch.intent ?? current.intent ?? null, patch.acceptanceCriteria ?? current.acceptanceCriteria ?? null, patch.now, patch.verificationVerdict ?? current.verificationVerdict ?? "UNKNOWN", patch.reviewAssessment ?? current.reviewAssessment ?? "NEEDS_HUMAN_REVIEW", patch.releaseDecision ?? current.releaseDecision ?? "BLOCKED", workOrderId).run();
+  }
+
+  async recordTypedDecision(input: { workOrderId: string; organizationId: string; actor: string; type: "review" | "release"; decision: "approved" | "rejected" | "changes_requested"; now: string }): Promise<void> {
+    const order = await this.getWorkOrder(input.workOrderId);
+    if (!order || order.organizationId !== input.organizationId) return;
+    if (input.type === "review") {
+      await this.patchWorkOrder(input.workOrderId, { reviewAssessment: input.decision === "approved" ? "CLEAR" : input.decision === "changes_requested" ? "REVISE" : "NEEDS_HUMAN_REVIEW", now: input.now });
+      await this.appendFactoryEvent({
+        eventId: `review_${input.workOrderId}_${crypto.randomUUID()}`,
+        type: "review.completed",
+        aggregateId: input.workOrderId,
+        aggregateType: "work_order",
+        organizationId: input.organizationId,
+        factoryId: order.factoryId,
+        actorId: input.actor,
+        actorType: "human",
+        occurredAt: input.now,
+        correlationId: input.workOrderId,
+        schemaVersion: 1,
+        policyVersion: order.policyVersion,
+        provenance: "HUMAN_VERIFIED",
+        payload: { workOrderId: input.workOrderId, decision: input.decision === "approved" ? "APPROVE" : input.decision === "changes_requested" ? "REQUEST_CHANGES" : "ESCALATE" },
+      });
+      return;
+    }
+    await this.patchWorkOrder(input.workOrderId, { releaseDecision: input.decision === "approved" ? "READY" : "BLOCKED", now: input.now });
+    await this.appendFactoryEvent({
+      eventId: `release_${input.workOrderId}_${crypto.randomUUID()}`,
+      type: "release.completed",
+      aggregateId: input.workOrderId,
+      aggregateType: "work_order",
+      organizationId: input.organizationId,
+      factoryId: order.factoryId,
+      actorId: input.actor,
+      actorType: "human",
+      occurredAt: input.now,
+      correlationId: input.workOrderId,
+      schemaVersion: 1,
+      policyVersion: order.policyVersion,
+      provenance: "HUMAN_VERIFIED",
+      payload: { workOrderId: input.workOrderId, decision: input.decision === "approved" ? "RELEASE" : "HOLD" },
+    });
   }
 
   async upsertWorkCell(cell: { cellId: string; factoryId: string; workOrderId?: string; kind: string; repository: string; branch: string; status: string; leasedBy?: string; heldBy?: string; credentialScope: string; cleanupAt: string; now: string; productionAccess?: string; observability?: string; allowedTools?: string[] }): Promise<void> {

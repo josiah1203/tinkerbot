@@ -64,6 +64,7 @@ export * from "./production";
 export * from "./assurance";
 export * from "./outcomes";
 export * from "./lifecycle";
+export * from "./control-plane-view";
 export * from "./harness";
 export { executeFactoryRun } from "./execute";
 import { assertCredentialRef, hostedRuntimeDefaults, parseRuntimeProfile, type RuntimeProfile } from "./runtime";
