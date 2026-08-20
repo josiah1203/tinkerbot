@@ -143,6 +143,8 @@ test("slash parser rejects merge and pass and treats check as the session verb",
   expect(parseIntent("fix the tests")).toMatchObject({ type: "reject" });
   expect(parseIntent("/work")).toMatchObject({ type: "reject" });
   expect(parseIntent("/work wo_1")).toEqual({ type: "work", id: "wo_1" });
+  expect(parseIntent("/graph wo_1")).toEqual({ type: "graph", id: "wo_1" });
+  expect(parseIntent("/graph")).toMatchObject({ type: "reject" });
   expect(suggestSlash("/c").map((item) => item.name)).toContain("/check");
   expect(suggestSlash("check")).toEqual([]);
   expect(helpText()).toContain("/check");
@@ -242,6 +244,14 @@ test("work attach keeps agent PASS as UNKNOWN without ingest", () => {
   const result = dispatchIntentSync(session, { type: "work", id: "wo_1" }, io, { baseTests: true });
   expect(result.session.lastVerdict).toBe("UNKNOWN");
   expect(stripAnsi(renderSession(result.session))).toMatch(/not a verdict|UNKNOWN/);
+});
+
+test("TUI graph inspection stays a read-only local projection", () => {
+  const io = deps({ localGraph: (id) => JSON.stringify({ aggregateId: id, sourceOfTruth: "append_only_factory_graph", graph: { verificationVerdict: "PASS" } }) });
+  const session = submitLine({ ...createSession({ repo: "acme/api", base: "origin/main", head: "HEAD", version: "0.1.0" }), input: "/graph wo_1" }).session;
+  const result = dispatchIntentSync(session, { type: "graph", id: "wo_1" }, io, { baseTests: true });
+  expect(stripAnsi(renderSession(result.session))).toContain("append_only_factory_graph");
+  expect(stripAnsi(renderSession(result.session))).toContain("wo_1");
 });
 
 test("CLI splits tui from dashboard and documents the session", () => {

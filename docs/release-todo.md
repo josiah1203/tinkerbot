@@ -26,14 +26,14 @@ This is the remaining work required to make Tinkerbot a production release. It s
 - [ ] Test database migrations and rollback/forward-recovery on production-shaped data.
 - [ ] Establish backup, restoration, and incident-response procedures for hosted metadata.
 
-### GitHub App and GitHub Action
+### Optional GitHub adapter and GitHub Action
 
-- [ ] Register the GitHub App using the Worker routes in `github-app/manifest.json` (homepage, callback, setup, webhook `/integrations/github/webhook`).
-- [ ] Complete App authentication/token-minting configuration and restrict permissions to the minimum required scope.
-- [ ] Test GitHub installation, uninstall, permission change, webhook retry, signature rejection, and replay rejection.
-- [ ] Add repository synchronization and installation state to the hosted app.
+- [ ] If the optional GitHub adapter is in launch scope, register the GitHub App using the Worker routes in `github-app/manifest.json` (homepage, callback, setup, webhook `/integrations/github/webhook`).
+- [ ] If enabled, complete App authentication/token-minting configuration and restrict permissions to the minimum required scope.
+- [ ] If enabled, test GitHub installation, uninstall, permission change, webhook retry, signature rejection, and replay rejection.
+- [ ] If enabled, add repository synchronization and installation state to the hosted app.
 - [ ] Configure customer workflows with `id-token: write` so the Action exchanges GitHub OIDC for a run token; do not paste a developer WorkOS session UUID.
-- [ ] Run the Action in a real test repository for App-owned Checks, inline comments, retries, failures, and forked PR behavior (Action publish is fallback only).
+- [ ] If enabled, run the Action in a real test repository for App-owned Checks, inline comments, retries, failures, and forked PR behavior (Action publish is fallback only).
 - [ ] Publish and pin the versioned Action release (`v0.x.y` and major tag) only after live validation.
 
 ### CLI and dashboard
@@ -62,7 +62,7 @@ This is the remaining work required to make Tinkerbot a production release. It s
 - [ ] Publish the Homebrew tap/formula after both Darwin archives, checksums, and signatures are available.
 - [ ] Test package/binary installation and upgrades from clean environments, not a workspace checkout.
 
-See [hosted provisioning](./hosted-provisioning.md) for the operator checklist (Stripe, WorkOS, Cloudflare D1/Sandbox, GitHub App). Code cannot provision those accounts.
+See [hosted provisioning](./hosted-provisioning.md) for the operator checklist (Stripe, WorkOS, Cloudflare D1/Sandbox, and optional GitHub adapter). Code cannot provision those accounts.
 
 ### Cloudflare
 
@@ -70,7 +70,7 @@ See [hosted provisioning](./hosted-provisioning.md) for the operator checklist (
 - [ ] Create **separate** D1 databases for staging and production (wrangler currently uses placeholder `database_id` values; replace them with real IDs after `wrangler d1 create`). Never share one D1 across environments.
 - [ ] Bind a real Cloudflare Sandbox implementation (`env.Sandbox`); the Worker stub returns 501 until the account has the container/SDK.
 - [ ] Verify the newly enabled R2 account, create/confirm the evidence bucket, bind it as `EVIDENCE_BUCKET` in staging and production, apply required migrations, and configure R2 retention/lifecycle rules.
-- [ ] Set Worker secrets interactively or through the approved secret manager: WorkOS credentials, Stripe credentials, session encryption key, and GitHub webhook secret.
+- [ ] Set Worker core secrets interactively or through the approved secret manager: WorkOS credentials, Stripe credentials, and session encryption key. Add GitHub webhook/App secrets only if that optional adapter is enabled.
 - [ ] Set non-secret production variables, including the final `STRIPE_PLANS_JSON` catalog and approved WorkOS event-sync configuration.
 - [ ] Validate `GET /health` (`ok`/`degraded` only) and authenticated `GET /config/status` after deployment. Never leave provider secret names on the public health route.
 
@@ -90,13 +90,13 @@ See [hosted provisioning](./hosted-provisioning.md) for the operator checklist (
 - [ ] Store the rotated Stripe secret key and webhook signing secret in Cloudflare.
 - [ ] Register the production Stripe webhook and test checkout completion, subscription updates, cancellation/reactivation, payment failures, duplicate delivery, and replay protection.
 
-### GitHub
+### Optional GitHub adapter
 
-- [ ] Register the production GitHub App with its final name, public homepage, callback URL, webhook URL, permissions, and events.
-- [ ] Securely store the App ID, private key/token-minting material, and rotated webhook secret using the approved secret mechanism.
-- [ ] Install the App in a dedicated production-like test organization and test repository.
+- [ ] If the optional adapter is in scope, register the production GitHub App with its final name, public homepage, callback URL, webhook URL, permissions, and events.
+- [ ] If enabled, securely store the App ID, private key/token-minting material, and rotated webhook secret using the approved secret mechanism.
+- [ ] If enabled, install the App in a dedicated production-like test organization and test repository.
 - [ ] Create production Action secrets/variables and branch-protection expectations for the customer-facing workflow.
-- [ ] Confirm Marketplace/public-distribution requirements if either the App or Action will be publicly listed.
+- [ ] Confirm Marketplace/public-distribution requirements if either the optional App or Action will be publicly listed.
 
 ### Registry, signing, download host, and Homebrew
 
@@ -109,7 +109,7 @@ See [hosted provisioning](./hosted-provisioning.md) for the operator checklist (
 
 - [ ] Freeze a release candidate commit and verify a clean working tree.
 - [ ] Obtain green GitHub CI on that exact commit.
-- [ ] Deploy to staging and run the full cross-surface acceptance suite: dashboard, Worker, WorkOS, Stripe, GitHub App, GitHub Action, and CLI.
+- [ ] Deploy to staging and run the full cross-surface acceptance suite: dashboard, Worker, WorkOS, Stripe, CLI, and any optional adapters selected for launch (including GitHub Action/App if enabled).
 - [ ] Verify that no source code, full diffs, credentials, or raw secrets can enter hosted assurance ingestion, logs, artifacts, or comments.
 - [ ] Exercise failure paths: unavailable providers, invalid/replayed webhooks, unauthorized org access, expired sessions, failed billing, Action retry, and rollback.
 - [ ] Produce and sign release artifacts; verify them independently on clean machines.

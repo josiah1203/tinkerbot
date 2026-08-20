@@ -16,9 +16,11 @@ import {
   type FactoryAgentType,
   type FactoryAutomationDefinition,
   type FactoryCredentialStrategy,
+  type FactoryHarnessDefinition,
   type FactoryRunnerDefinition,
   type FactorySchemaVersion,
 } from "./definition";
+import { assertHarnessWorkerHost, defaultHarnessDefinition, isExternalHarness, parseHarnessDefinitions, validateHarnessBindings } from "./harness";
 export * from "./definition";
 import {
   autonomyAllowsSkip,
@@ -61,6 +63,8 @@ export * from "./orchestration";
 export * from "./production";
 export * from "./assurance";
 export * from "./outcomes";
+export * from "./lifecycle";
+export * from "./harness";
 export { executeFactoryRun } from "./execute";
 import { assertCredentialRef, hostedRuntimeDefaults, parseRuntimeProfile, type RuntimeProfile } from "./runtime";
 import type { AcceptanceCriterionLink, Waiver } from "./authority";
@@ -135,6 +139,9 @@ export interface FactoryAgentDefinition {
   timeoutSeconds: number;
   agentType?: FactoryAgentType;
   description?: string;
+  workerHost?: string;
+  secretRefs?: string[];
+  mcpServers?: string[];
 }
 
 export interface FactoryStageDefinition {
@@ -160,7 +167,8 @@ export interface FactoryDefinition {
   policies: { pack: string; blocking: boolean };
   tools: string[];
   mcpServers: string[];
-  runner: { type: "github_actions" | "tinkerbot-sandbox"; workflow?: string; image?: string };
+  runner: { type: "github_actions" | "tinkerbot-sandbox" | "self_hosted"; workflow?: string; image?: string; workerHost?: string };
+  harnesses: Record<string, FactoryHarnessDefinition>;
   runners: FactoryRunnerDefinition[];
   automations: FactoryAutomationDefinition[];
   agentInstructions: Record<string, string>;
@@ -355,6 +363,7 @@ export function parseFactoryDefinition(input: unknown): FactoryDefinition {
   const repositories = parseRepositories(raw.repositories);
   if (!repositories.length || repositories.some((item) => !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(item))) throw new Error("Factory definition requires owner/repository entries.");
   const integrations = parseIntegrations(raw.integrations);
+  const harnesses = parseHarnessDefinitions(raw.harnesses);
   const defaultSources: Array<{ type: FactorySourceType }> = schemaVersion === "v1alpha1"
     ? [{ type: "github_pull_request" }, { type: "github_issue" }, { type: "manual" }, { type: "mcp" }, ...integrations.map((item) => ({ type: item.type as FactorySourceType }))]
     : [{ type: "github_pull_request" }, { type: "github_issue" }, { type: "manual" }, { type: "mcp" }];
@@ -367,6 +376,9 @@ export function parseFactoryDefinition(input: unknown): FactoryDefinition {
   });
   const agentDefaults = parseAgentDefaults(raw.agentDefaults);
   if (schemaVersion === "v1alpha1" && !raw.agentDefaults) throw new Error("v1alpha1 factory.yaml requires agentDefaults.");
+  if (agentDefaults.harness && isExternalHarness(agentDefaults.harness) && !harnesses[agentDefaults.harness]) {
+    harnesses[agentDefaults.harness] = defaultHarnessDefinition(agentDefaults.harness);
+  }
   const agentsRaw = Array.isArray(raw.agents) ? raw.agents : [];
   const agents: FactoryAgentDefinition[] = agentsRaw.map((item, index) => {
     const record = item && typeof item === "object" ? item as Record<string, unknown> : {};
@@ -374,8 +386,9 @@ export function parseFactoryDefinition(input: unknown): FactoryDefinition {
     const id = typeof record.id === "string" ? record.id : `agent-${index}`;
     const provider = record.provider === "gateway" || record.provider === "none" ? record.provider : "workers-ai";
     const harness = assertAllowedHarness(record.harness, `Agent ${id}`) ?? (id === "implement" || id === "implementation" ? "tinkerbot-sandbox" : agentDefaults.harness ?? "default");
+    if (isExternalHarness(harness) && !harnesses[harness]) harnesses[harness] = defaultHarnessDefinition(harness);
     const modelRaw = typeof record.model === "string" ? record.model : agentDefaults.model;
-    return { id, model: modelRaw === "auto" || !modelRaw ? defaultModelForAgent(id) : modelRaw, provider, harness, timeoutSeconds: Number(record.timeoutSeconds ?? 60), agentType: typeof record.agentType === "string" ? record.agentType.toUpperCase() as FactoryAgentType : undefined, description: typeof record.description === "string" ? record.description : undefined };
+    return { id, model: modelRaw === "auto" || !modelRaw ? defaultModelForAgent(id) : modelRaw, provider, harness, timeoutSeconds: Number(record.timeoutSeconds ?? 60), agentType: typeof record.agentType === "string" ? record.agentType.toUpperCase() as FactoryAgentType : undefined, description: typeof record.description === "string" ? record.description : undefined, workerHost: typeof record.workerHost === "string" ? record.workerHost : agentDefaults.workerHost, secretRefs: asStringArray(record.secrets), mcpServers: mcpServerNames(record.mcpServers) };
   });
   const defaultStages: FactoryStageDefinition[] = FACTORY_STAGES.map((id) => ({ id, agent: ["foreman", "triage", "specification", "review", "implement"].includes(id) || id === "implementation" ? (id === "implementation" ? "implement" : id) : undefined, required: id === "verification" || id === "foreman", approvalRequired: id === "specification" || id === "release" }));
   const stages = Array.isArray(raw.stages) && raw.stages.length
@@ -391,8 +404,9 @@ export function parseFactoryDefinition(input: unknown): FactoryDefinition {
   const timeouts = raw.timeouts && typeof raw.timeouts === "object" ? raw.timeouts as Record<string, unknown> : {};
   const budgets = raw.budgets && typeof raw.budgets === "object" ? raw.budgets as Record<string, unknown> : {};
   const approvals = raw.approvals && typeof raw.approvals === "object" ? raw.approvals as Record<string, unknown> : {};
-  const runnerType = runner.type === "tinkerbot-sandbox" || agentDefaults.workerHost === "warp" ? "tinkerbot-sandbox" : "github_actions";
-  const runtime = parseRuntimeProfile(raw.runtime, hostedRuntimeDefaults(runnerType));
+  const runnerWorkerHost = assertHarnessWorkerHost(runner.workerHost, "runner");
+  const runnerType = runner.type === "self_hosted" || runnerWorkerHost?.startsWith("self_hosted") || agentDefaults.workerHost?.startsWith("self_hosted") ? "self_hosted" : runner.type === "tinkerbot-sandbox" || agentDefaults.workerHost === "warp" ? "tinkerbot-sandbox" : "github_actions";
+  const runtime = parseRuntimeProfile(raw.runtime, { ...hostedRuntimeDefaults(runnerType), workerHost: runnerWorkerHost ?? agentDefaults.workerHost });
   return {
     version: 1,
     schemaVersion,
@@ -413,7 +427,9 @@ export function parseFactoryDefinition(input: unknown): FactoryDefinition {
       type: runnerType,
       workflow: typeof runner.workflow === "string" ? runner.workflow : "tinkerbot.yml",
       image: typeof runner.image === "string" ? runner.image : "cloudflare/sandbox:next",
+      workerHost: runnerWorkerHost,
     },
+    harnesses,
     runners: [],
     automations: [],
     agentInstructions: raw.agentInstructions && typeof raw.agentInstructions === "object" && !Array.isArray(raw.agentInstructions) ? Object.fromEntries(Object.entries(raw.agentInstructions as Record<string, unknown>).filter((entry): entry is [string, string] => typeof entry[1] === "string")) : {},
@@ -443,6 +459,7 @@ export function validateFactoryDefinition(definition: FactoryDefinition, options
   const foremen = definition.agents.filter((agent) => agent.agentType === "FOREMAN");
   if (options?.requireForeman && foremen.length !== 1) errors.push("exactly one FOREMAN agent is required");
   if (foremen.length > 1) errors.push("exactly one FOREMAN agent is required");
+  errors.push(...validateHarnessBindings({ agents: definition.agents, harnesses: definition.harnesses, controlPlane: definition.runtime.controlPlane, runnerType: definition.runtime.runner.type, runtimeWorkerHost: definition.runtime.workerHost }));
   return errors;
 }
 

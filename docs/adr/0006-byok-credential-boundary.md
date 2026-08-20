@@ -10,7 +10,7 @@ Local inference should use Anthropic, OpenAI-compatible, Ollama, or Workers AI a
 
 ## Decision
 
-Factory YAML may hold only `credentialRef` values (`env:VAR` or `keychain://…`). BYOK is local-runner-only in this release. Hosted BYOK (tenant vault, egress, retention) is a separate security project. Vendor CLI harnesses (Claude Code, Codex, Gemini, `oz`) remain rejected; API adapters are not harnesses.
+Factory YAML may hold only `credentialRef` values (`env:VAR` or `keychain://…`). BYOK is local by default; a hosted control plane may use BYOK/local inference only through an explicitly registered `self_hosted` worker. Hosted Workers never receive or resolve customer provider keys. Vendor CLI harnesses (Claude Code, Codex, Gemini, `oz`) are customer-owned harnesses, not managed API adapters; they run only with an explicit local opt-in or self-hosted handoff.
 
 ## Consequences
 

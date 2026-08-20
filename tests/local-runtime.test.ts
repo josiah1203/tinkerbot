@@ -8,6 +8,7 @@ import {
   MemoryFactoryStore,
   parseEvalSuite,
   parseFactoryDefinition,
+  validateFactoryDefinition,
   runEvalSuite,
   scoreEvalOutput,
   soloRuntimeOverlay,
@@ -16,7 +17,7 @@ import {
   type FactoryEvent,
 } from "../packages/factory/src";
 import { publicCapabilities } from "../packages/control-plane/src/entitlements";
-import { anthropicProvider, assertNoSecretInPayload, LOCAL_DB_SCHEMA_VERSION, replayOutbox, resolveCredentialRef, runLocalFactory, selectInferenceProvider, selectLocalSandbox, SQLITE_MAGIC, SqliteFactoryStore, stubInferenceProvider, stubSandboxPort } from "../packages/local-runtime/src";
+import { anthropicProvider, assertNoSecretInPayload, LOCAL_DB_SCHEMA_VERSION, replayOutbox, resolveCredentialRef, runExternalHarness, runLocalFactory, selectInferenceProvider, selectLocalSandbox, SQLITE_MAGIC, SqliteFactoryStore, stubInferenceProvider, stubSandboxPort } from "../packages/local-runtime/src";
 import { evalCli, evalCliAsync, factoryPlanPayload } from "../packages/cli/src/runtime-cli";
 import { localDashboardApi } from "../packages/cli/src/local-dashboard";
 import fs from "node:fs";
@@ -35,7 +36,16 @@ describe("runtime contracts", () => {
     expect(v2.runtime.collaboration).toBe("solo");
     expect(v2.runtime.inference.credentialRef).toBe("env:ANTHROPIC_API_KEY");
     expect(() => parseFactoryDefinition(`schemaVersion: v1alpha2\nname: pay\nrepositories: [acme/pay]\nruntime:\n  inference:\n    mode: byok\n    credentialRef: sk-live-not-a-ref-value\n`)).toThrow(/credentialRef/);
-    expect(() => parseFactoryDefinition(`schemaVersion: v1alpha2\nname: pay\nrepositories: [acme/pay]\nagentDefaults:\n  harness: claude-code\n`)).toThrow(/harness/);
+    const external = parseFactoryDefinition(`schemaVersion: v1alpha2\nname: pay\nrepositories: [acme/pay]\ncontrolPlane: local\nagentDefaults:\n  harness: claude-code\n`);
+    expect(external.agentDefaults?.harness).toBe("claude-code");
+    expect(external.harnesses["claude-code"]).toMatchObject({ command: "claude" });
+    const selfHosted = parseFactoryDefinition(`schemaVersion: v1alpha2\nname: pay\nrepositories: [acme/pay]\nruntime:\n  controlPlane: hosted\n  runner:\n    type: self_hosted\n    workerHost: self_hosted:runner-1\n  inference:\n    mode: byok\n    provider: openai\n    credentialRef: env:OPENAI_API_KEY\nagents:\n  - id: implementation\n    harness: codex\n`);
+    expect(selfHosted.runtime).toMatchObject({ controlPlane: "hosted", runner: { type: "self_hosted" }, workerHost: "self_hosted:runner-1", inference: { mode: "byok" } });
+    expect(validateFactoryDefinition(selfHosted)).toEqual([]);
+    const hostedExternal = parseFactoryDefinition(`schemaVersion: v1alpha2\nname: pay\nrepositories: [acme/pay]\nagents:\n  - id: implementation\n    harness: codex\n`);
+    expect(validateFactoryDefinition(hostedExternal).some((error) => /self_hosted|local control plane/.test(error))).toBe(true);
+    expect(() => parseFactoryDefinition(`schemaVersion: v1alpha2\nname: pay\nrepositories: [acme/pay]\nruntime:\n  controlPlane: hosted\n  runner:\n    type: docker\n`)).toThrow(/Hosted control planes cannot run/);
+    expect(() => parseFactoryDefinition(`schemaVersion: v1alpha2\nname: pay\nrepositories: [acme/pay]\nharnesses:\n  default:\n    command: evil\n`)).toThrow(/cannot be redefined/);
   });
 
   test("planner is deterministic and never skips verification", () => {
@@ -98,17 +108,35 @@ describe("local runtime", () => {
       inference: stubInferenceProvider(),
       sandbox: stubSandboxPort(),
       specApproved: true,
+      sandboxComplete: true,
       verificationVerdict: "PASS",
       verificationIngested: true,
       untrustedText: "typo in readme",
     });
     expect(result.runId).toBeTruthy();
     expect(store.receipts.length).toBeGreaterThan(0);
+    const persistedReceipt = store.receipts[0] as { signed?: boolean; receipt?: { integrity?: { signed?: boolean } } };
+    expect(persistedReceipt.signed).toBe(false);
+    expect(persistedReceipt.receipt?.integrity?.signed).toBe(false);
     expect(() => assertNoSecretInPayload(store.receipts[0])).not.toThrow();
     expect(resolveCredentialRef("env:TB_TEST_KEY", { TB_TEST_KEY: "abc" })).toBe("abc");
     expect(() => resolveCredentialRef("sk-raw")).toThrow();
     expect(store.schemaVersion()).toBe(LOCAL_DB_SCHEMA_VERSION);
     expect(fs.readFileSync(db).subarray(0, 15).toString("utf8")).toBe(SQLITE_MAGIC);
+    const graphEvents = await store.listFactoryEvents(result.workOrderId);
+    expect(graphEvents.map((event) => event.type)).toEqual(expect.arrayContaining(["work_order.created", "worker.session_started", "worker.claim_emitted", "change.proposed", "evidence.receipt_created", "worker.session_completed", "task.decomposed", "verification.completed"]));
+    expect((await store.reconstructFactoryGraph(result.workOrderId)).verificationVerdict).toBe("PASS");
+  });
+
+  test("local runs do not claim implementation when no worker completed the sandbox", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tb-local-pending-"));
+    const store = new SqliteFactoryStore(path.join(dir, "local.db"));
+    const definition = parseFactoryDefinition(yaml);
+    definition.runtime = mergeRuntimeProfile(definition.runtime, soloRuntimeOverlay());
+    const result = await runLocalFactory({ definition, root: dir, store, inference: stubInferenceProvider(), sandbox: stubSandboxPort(), specApproved: true, verificationVerdict: "UNKNOWN", untrustedText: "implement login" });
+    expect(result.terminal).toBe("implementation");
+    expect(result.stages.some((stage) => /Queued Cloudflare Sandbox/.test(stage.summary))).toBe(true);
+    expect(store.receipts).toHaveLength(0);
   });
 
   test("migrates JSON local state into SQLite", async () => {
@@ -143,6 +171,32 @@ describe("local runtime", () => {
     expect(provider.usage(result).inputTokens).toBe(3);
   });
 
+  test("external harnesses receive a bounded protocol request and never echo credentials", async () => {
+    const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "tb-harness-"));
+    let observed: { argv: string[]; options?: { env?: Record<string, string>; stdin?: string } } | undefined;
+    const result = await runExternalHarness({
+      harness: { id: "codex", command: "codex-wrapper", args: ["--request", "${requestFile}", "--worktree", "${worktree}"], protocol: "stdio-json", env: { CODEX_API_KEY: "env:TB_HARNESS_SECRET" }, timeoutSeconds: 30 },
+      worktree,
+      repository: "acme/payments",
+      workOrderId: "wo_harness",
+      prompt: "Implement the approved change.",
+      model: "codex-test",
+      env: { TB_HARNESS_SECRET: "customer-secret-value" },
+      exec: async (argv, options) => {
+        observed = { argv, options };
+        const requestPath = argv[argv.indexOf("--request") + 1]!;
+        expect(JSON.parse(fs.readFileSync(requestPath, "utf8"))).toMatchObject({ protocolVersion: 1, harness: "codex", authority: { mayMerge: false, mayRelease: false, mayWriteVerificationVerdict: false } });
+        return { stdout: "completed customer-secret-value", stderr: "", exitCode: 0 };
+      },
+    });
+    expect(result.status).toBe("ok");
+    expect(result.summary).not.toContain("customer-secret-value");
+    expect(observed?.options?.env).toEqual({ CODEX_API_KEY: "customer-secret-value" });
+    expect(observed?.options?.stdin).toContain('"protocolVersion":1');
+    expect(fs.readdirSync(worktree)).toHaveLength(0);
+    fs.rmSync(worktree, { recursive: true, force: true });
+  });
+
   test("outbox replay posts local payloads without secrets", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tb-outbox-"));
     const store = new SqliteFactoryStore(path.join(dir, "local.db"));
@@ -166,6 +220,64 @@ describe("local runtime", () => {
     expect(runtime?.body).toMatchObject({ billing: "seats_only", upgradesVerdict: false });
     const exceptions = localDashboardApi(store, new URL("http://127.0.0.1/exceptions"), "GET");
     expect(exceptions?.body).toMatchObject({ kanban: false, attentionFirst: true });
+  });
+
+  test("reopening a pre-graph SQLite store backfills a canonical creation event", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tb-graph-backfill-"));
+    const db = path.join(dir, "local.db");
+    const order = {
+      workOrderId: "wo_backfill",
+      factoryId: "local-factory",
+      organizationId: "local",
+      sourceType: "manual" as const,
+      sourceId: "legacy:1",
+      repositoryId: "local/repo",
+      policyVersion: "default",
+      definitionVersion: "v1",
+      definitionDigest: "sha256:legacy",
+      currentStage: "foreman" as const,
+      status: "intake" as const,
+      actor: "local-human",
+      createdAt: "2026-08-20T00:00:00.000Z",
+      updatedAt: "2026-08-20T00:00:00.000Z",
+      verificationVerdict: "UNKNOWN" as const,
+      reviewAssessment: "NEEDS_HUMAN_REVIEW" as const,
+      releaseDecision: "BLOCKED" as const,
+    };
+    const first = new SqliteFactoryStore(db);
+    await first.insertWorkOrder(order);
+    const reopened = new SqliteFactoryStore(db);
+    expect(await reopened.listFactoryEvents(order.workOrderId)).toMatchObject([{ type: "work_order.created", aggregateId: order.workOrderId }]);
+  });
+
+  test("local dashboard exposes the append-only work-order graph projection", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tb-dash-graph-"));
+    const store = new SqliteFactoryStore(path.join(dir, "local.db"));
+    const order = {
+      workOrderId: "wo_dashboard_graph",
+      factoryId: "local-factory",
+      organizationId: "local",
+      sourceType: "manual" as const,
+      sourceId: "local:graph",
+      repositoryId: "local/repo",
+      policyVersion: "default",
+      definitionVersion: "v1",
+      definitionDigest: "sha256:test",
+      currentStage: "verification" as const,
+      status: "verification" as const,
+      actor: "local-human",
+      createdAt: "2026-08-20T00:00:00.000Z",
+      updatedAt: "2026-08-20T00:00:00.000Z",
+      verificationVerdict: "UNKNOWN" as const,
+      reviewAssessment: "NEEDS_HUMAN_REVIEW" as const,
+      releaseDecision: "BLOCKED" as const,
+    };
+    await store.insertWorkOrder(order);
+    await store.appendFactoryEvent({ eventId: "dash-verify", type: "verification.completed", aggregateId: order.workOrderId, aggregateType: "work_order", organizationId: "local", factoryId: "local-factory", actorId: "deterministic-verifier", actorType: "system", occurredAt: "2026-08-20T00:01:00.000Z", correlationId: order.workOrderId, schemaVersion: 1, provenance: "DETERMINISTICALLY_VERIFIED", payload: { verdict: "PASS" } });
+    const response = localDashboardApi(store, new URL(`http://127.0.0.1/work-orders/${order.workOrderId}/graph`), "GET");
+    expect(response?.status).toBe(200);
+    expect(response?.body).toMatchObject({ sourceOfTruth: "append_only_factory_graph", graph: { verificationVerdict: "PASS" } });
+    expect((response?.body as { events: unknown[] }).events).toHaveLength(1);
   });
 
   test("missing BYOK does not fall back to workers-ai", () => {

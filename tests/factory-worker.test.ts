@@ -383,6 +383,9 @@ test("control-tower work orders expose group, take/return write human decisions,
     const body = await listed.json() as { workOrders: Array<{ group?: string; column?: string; status: string }> };
     expect(body.workOrders[0]?.group).toBe("needs_attention");
     expect(body.workOrders[0]?.column).toBeUndefined();
+    const graph = await worker.fetch(new Request("https://control.example/work-orders/wo_1/graph", { headers: { cookie } }), env);
+    expect(graph.status).toBe(200);
+    expect(await graph.json()).toMatchObject({ sourceOfTruth: "append_only_factory_graph", graph: { eventCount: 0 } });
     const csrf = await worker.fetch(new Request("https://control.example/work-orders/wo_1/take", { method: "POST", headers: { origin: "https://attacker.example", cookie, "content-type": "application/json" }, body: "{}" }), env);
     expect(csrf.status).toBe(403);
     const take = await worker.fetch(new Request("https://control.example/work-orders/wo_1/take", { method: "POST", headers: { origin: "https://control.example", cookie, "content-type": "application/json" }, body: "{}" }), env);
@@ -483,6 +486,48 @@ test("runFactoryTurn records stages, waits for spec approval, and keeps PASS fro
   const systemDb = memoryFactoryDb({ factories: [{ factory_id: "fac_sys", organization_id: "system", name: "system", status: "active", updated_at: "2030-01-01T00:00:00.000Z" }] });
   const swept = await sweepFactoryOs({ DB: systemDb });
   expect(swept.maintenance).toBeGreaterThan(0);
+});
+
+test("runFactoryTurn queues self-hosted harness work without invoking the managed sandbox", async () => {
+  const database = factorySeed();
+  await new D1FactoryStore(database).putFactory({
+    factoryId: "fac_1",
+    organizationId: "org_1",
+    name: "payments",
+    yaml: `schemaVersion: v1alpha2
+name: payments
+repositories: [acme/payments]
+sources: [{ type: github_issue }]
+runtime:
+  controlPlane: hosted
+  runner:
+    type: self_hosted
+    workerHost: self_hosted:runner-1
+  inference:
+    mode: byok
+    provider: openai
+    credentialRef: env:OPENAI_API_KEY
+agents:
+  - id: implementation
+    harness: codex
+`,
+  });
+  const dispatched: unknown[] = [];
+  const result = await runFactoryTurn({ DB: database, SELF_HOSTED_WORK: { send: async (payload) => void dispatched.push(payload) } }, {
+    deliveryId: "self-hosted-1",
+    organizationId: "org_1",
+    factoryId: "fac_1",
+    repository: "acme/payments",
+    sourceType: "github_issue",
+    sourceId: "42",
+    issueOrPullRequest: "implement refunds",
+    actor: "factory-agent",
+    specApproved: true,
+  });
+  expect(result).toMatchObject({ wait: "self_hosted_harness", terminal: "implementation" });
+  expect(dispatched).toHaveLength(1);
+  expect(dispatched[0]).toMatchObject({ executionBoundary: "self_hosted", harness: "codex", authority: { mayMerge: false, mayRelease: false, mayWriteVerificationVerdict: false } });
+  expect(JSON.stringify(dispatched[0])).not.toContain("OPENAI_API_KEY");
 });
 
 test("Foreman Durable Object, MCP, queue, and Slack challenge stay on the factory intake path", async () => {

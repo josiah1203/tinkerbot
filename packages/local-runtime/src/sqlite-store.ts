@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import { MemoryFactoryStore, type FactoryStore, type OutboxEvent, type InlineApprovalRecord } from "../../factory/src/store";
 import type { CostEstimate, ExecutionPlan, ProviderUsage } from "../../factory/src/runtime";
 import type { EvalAttempt, EvalSuite } from "../../factory/src/evals";
-import { projectFactoryEvents, type AftercareRecord, type FactoryCommand, type FactoryEvent, type FactoryProjection, type WorkOrder, type WorkOrderState } from "../../factory/src";
+import { assertFactoryEventAuthority, graphEventForWorkOrderTransition, projectFactoryEvents, type AftercareRecord, type FactoryCommand, type FactoryEvent, type FactoryProjection, type WorkOrder, type WorkOrderState } from "../../factory/src";
 import { openSqliteDatabase, SQLITE_MAGIC, type SqliteDatabase } from "./sqlite-engine";
 
 export const LOCAL_DB_SCHEMA_VERSION = 16;
@@ -274,6 +274,7 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
     this.migratedFromJson = Boolean(jsonPending);
     if (jsonPending) this.importJson(jsonPending);
     else this.loadSql();
+    if (!jsonPending) this.backfillLegacyGraph();
     this.database.prepare("INSERT INTO tinkerbot_metadata (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run("schema_version", String(LOCAL_DB_SCHEMA_VERSION));
   }
 
@@ -282,9 +283,49 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
     return Number(row?.value ?? LOCAL_DB_SCHEMA_VERSION);
   }
 
+  /**
+   * Synchronous command-side persistence for the non-async `tb` CLI. The
+   * underlying SQLite adapter is synchronous; keeping this path explicit
+   * prevents `tb work new`/`tb intent` from returning before their canonical
+   * Factory Graph events are durable.
+   */
+  appendFactoryEventSync(event: FactoryEvent): void {
+    assertFactoryEventAuthority(event);
+    const result = this.database.prepare("INSERT OR IGNORE INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, policy_version, provenance, external_references_json, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+      event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
+    ) as { changes?: number };
+    if (result.changes !== 1) return;
+    const outbox: OutboxEvent = { eventId: event.eventId, kind: "factory-graph-event", payloadJson: JSON.stringify({ event }), createdAt: event.occurredAt };
+    this.database.prepare("INSERT OR IGNORE INTO tinkerbot_sync_outbox (event_id, kind, payload_json, created_at, synced_at) VALUES (?, ?, ?, ?, NULL)").run(outbox.eventId, outbox.kind, outbox.payloadJson, outbox.createdAt);
+    if (!this.outbox.some((item) => item.eventId === outbox.eventId)) this.outbox.push(outbox);
+  }
+
+  /** Persist a work order and its creation event atomically from the CLI. */
+  insertWorkOrderSync(order: WorkOrder, event: FactoryEvent): void {
+    this.database.prepare(`INSERT INTO tinkerbot_work_orders (
+      work_order_id, factory_id, organization_id, source_type, source_id, repository_id, issue_or_pull_request, intent, acceptance_criteria,
+      policy_version, definition_version, definition_digest, current_stage, status, actor, created_at, updated_at, product_id, line_id, cell_id,
+      owner, risk, autonomy_mode, output_kind, policy_json, dependencies_json, held_by, origin, execution_plan_id,
+      verification_verdict, review_assessment, release_decision, waiver_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(work_order_id) DO UPDATE SET status = excluded.status, current_stage = excluded.current_stage, updated_at = excluded.updated_at,
+      verification_verdict = excluded.verification_verdict, review_assessment = excluded.review_assessment, release_decision = excluded.release_decision`).run(
+      order.workOrderId, order.factoryId, order.organizationId, order.sourceType, order.sourceId, order.repositoryId, order.issueOrPullRequest ?? null, order.intent ?? null, order.acceptanceCriteria ?? null,
+      order.policyVersion, order.definitionVersion, order.definitionDigest, order.currentStage, order.status, order.actor, order.createdAt, order.updatedAt, order.productId ?? null, order.lineId ?? null, order.cellId ?? null,
+      order.owner ?? null, order.risk ?? null, order.autonomyMode ?? null, order.outputKind ?? null, order.policyJson ?? null, order.dependenciesJson ?? null, order.heldBy ?? null, order.origin ?? "local", order.executionPlanId ?? null,
+      order.verificationVerdict ?? "UNKNOWN", order.reviewAssessment ?? "NEEDS_HUMAN_REVIEW", order.releaseDecision ?? "BLOCKED", order.waiver ? JSON.stringify(order.waiver) : null,
+    );
+    this.orders.set(order.workOrderId, order);
+    this.appendFactoryEventSync(event);
+  }
+
   private importJson(raw: string): void {
     const parsed = JSON.parse(raw) as JsonPersistedState;
-    for (const order of parsed.orders ?? []) void this.insertWorkOrder(order);
+    for (const order of parsed.orders ?? []) this.insertWorkOrderSync(order, {
+      eventId: `evt_${order.workOrderId}`, type: "work_order.created", aggregateId: order.workOrderId, aggregateType: "work_order", organizationId: order.organizationId, factoryId: order.factoryId,
+      actorId: order.actor, actorType: order.sourceType === "manual" ? "human" : "integration", occurredAt: order.createdAt, correlationId: order.workOrderId, schemaVersion: 1, policyVersion: order.policyVersion, provenance: "ATTESTED",
+      payload: { workOrderId: order.workOrderId, intent: order.intent, sourceType: order.sourceType, sourceId: order.sourceId },
+    });
     for (const [id, run] of parsed.runs ?? []) {
       void this.insertRun({
         runId: run.run_id ?? id,
@@ -387,6 +428,33 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
     }
     for (const row of this.database.prepare("SELECT payload_json FROM tinkerbot_agent_receipts").all()) {
       this.receipts.push(JSON.parse(String(row.payload_json)));
+    }
+  }
+
+  /** Backfill the canonical graph once when opening a pre-graph local database. */
+  private backfillLegacyGraph(): void {
+    const orders = this.database.prepare("SELECT work_order_id, factory_id, organization_id, source_type, source_id, intent, policy_version, actor, created_at FROM tinkerbot_work_orders").all() as Array<Record<string, unknown>>;
+    for (const row of orders) {
+      const workOrderId = String(row.work_order_id);
+      this.appendFactoryEventSync({
+        eventId: `evt_${workOrderId}`, type: "work_order.created", aggregateId: workOrderId, aggregateType: "work_order", organizationId: String(row.organization_id), factoryId: String(row.factory_id),
+        actorId: String(row.actor), actorType: row.source_type === "manual" ? "human" : "integration", occurredAt: String(row.created_at), correlationId: workOrderId, schemaVersion: 1, policyVersion: String(row.policy_version), provenance: "ATTESTED",
+        payload: { workOrderId, intent: row.intent ? String(row.intent) : undefined, sourceType: String(row.source_type), sourceId: String(row.source_id) },
+      });
+    }
+    const transitions = this.database.prepare("SELECT e.event_id, e.work_order_id, e.from_state, e.to_state, e.cause_id, e.actor, e.created_at, w.factory_id, w.organization_id, w.policy_version FROM tinkerbot_work_order_events e JOIN tinkerbot_work_orders w ON w.work_order_id = e.work_order_id ORDER BY e.created_at, e.event_id").all() as Array<Record<string, unknown>>;
+    for (const row of transitions) {
+      const event = graphEventForWorkOrderTransition({ workOrderId: String(row.work_order_id), factoryId: String(row.factory_id), organizationId: String(row.organization_id), actor: String(row.actor), policyVersion: String(row.policy_version), fromState: String(row.from_state), toState: String(row.to_state), causeId: String(row.cause_id), createdAt: String(row.created_at) });
+      if (event) this.appendFactoryEventSync(event);
+    }
+    const approvals = this.database.prepare("SELECT approval_id, work_order_id, requester, approver, actor_kind, decision, created_at FROM tinkerbot_inline_approvals WHERE actor_kind <> 'agent'").all() as Array<Record<string, unknown>>;
+    for (const row of approvals) {
+      const order = orders.find((item) => String(item.work_order_id) === String(row.work_order_id));
+      if (!order) continue;
+      this.appendFactoryEventSync({
+        eventId: `approval_${row.work_order_id}_${row.decision}_${row.approval_id}`, type: "approval.recorded", aggregateId: String(row.work_order_id), aggregateType: "work_order", organizationId: String(order.organization_id), factoryId: String(order.factory_id),
+        actorId: String(row.approver), actorType: "human", occurredAt: String(row.created_at), correlationId: String(row.work_order_id), schemaVersion: 1, policyVersion: String(order.policy_version), provenance: "HUMAN_VERIFIED", payload: { decision: String(row.decision), workOrderId: String(row.work_order_id), approvalId: String(row.approval_id), requester: String(row.requester) },
+      });
     }
   }
 

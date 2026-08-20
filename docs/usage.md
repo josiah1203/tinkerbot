@@ -12,7 +12,9 @@ pnpm tui
 tb agents
 ```
 
-`tb tui` is a tabbed master terminal on a TTY (`pnpm tui`). `tb tui --once` is the CI transcript. Nested CLIs use their own OAuth. `select-tests` remains a recommendation; the configured suite is the merge gate.
+`tb tui` is a Claude Code-style kit shell on a TTY (`pnpm tui`). `tb tui --once` is the CI transcript. Nested CLIs use their own OAuth. `select-tests` remains a recommendation; the configured suite is the merge gate.
+
+Local external harness execution is opt-in: `tb run --local --allow-external-harness`. Set `TINKERBOT_RECEIPT_SIGNING_KEY_REF` to an `env:VAR` or `keychain://…` reference if locally emitted receipts need an HMAC integrity record; without it, receipts are explicitly marked unsigned rather than claiming a platform signature.
 
 ## Advisory and blocking behavior
 

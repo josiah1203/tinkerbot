@@ -67,11 +67,11 @@ import { runDoctor, renderDoctor } from "./doctor";
 import { clearStoredCredentials, hostedSession, saveStoredCredentials } from "./credentials";
 import { loadFactoryDefinition, validateAgentReceipt, buildFactoryStarter } from "../../factory/src";
 import { evalCli, evalCliAsync, executeLocalRun, factoryPlanPayload, localDashboardPayload } from "./runtime-cli";
-import { cellCheckPayload, factoryCheckPayload, factoryInitPayload, localFactoryGraphStatusPayload, localIntentPayload, localWorkNewPayload, outcomeCheckPayload } from "./factory-os";
+import { cellCheckPayload, factoryCheckPayload, factoryInitPayload, localFactoryGraphStatusPayload, localIntentPayload, localOutcomePayload, localWorkApprovalPayload, localWorkNewPayload, outcomeCheckPayload } from "./factory-os";
 import { createLocalDashboardServer, localDashboardUrl } from "./local-dashboard";
 import { formatCostTab, formatEvalTab, formatPlanTab } from "../../local-runtime/src";
 import { isInteractiveTty, runTui, TUI_HELP, type TuiDeps, type TuiOptions } from "./tui/index";
-import { isAgentId, listAgentsJson, runMasterTuiInteractive } from "../../tui/src";
+import { isAgentId, listAgentsJson, runKitWorkstationInteractive } from "../../tui/src";
 import { planVerificationStreams } from "./tui/streams";
 import type { StageEvent } from "./tui/types";
 
@@ -130,6 +130,11 @@ interface CliOptions {
   local?: boolean;
   profile?: string;
   allowProcessRunner?: boolean;
+  allowExternalHarness?: boolean;
+  intentMode?: "micro" | "standard" | "strategic";
+  workOrderId?: string;
+  outcomeStatus?: "POSITIVE" | "NEUTRAL" | "NEGATIVE" | "UNKNOWN";
+  outcomeMature?: boolean;
 }
 
 function valueAfter(rest: string[], index: number, flag: string): string {
@@ -204,7 +209,20 @@ function parseArgs(argv: string[]): CliOptions {
     else if (token === "--agent") options.agent = valueAfter(rest, index++, token);
     else if (token === "--local") options.local = true;
     else if (token === "--profile") options.profile = valueAfter(rest, index++, token);
+    else if (token === "--intent-mode") {
+      const mode = valueAfter(rest, index++, token);
+      if (mode !== "micro" && mode !== "standard" && mode !== "strategic") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "--intent-mode must be micro, standard, or strategic");
+      options.intentMode = mode;
+    }
+    else if (token === "--work-order") options.workOrderId = valueAfter(rest, index++, token);
+    else if (token === "--outcome-status") {
+      const status = valueAfter(rest, index++, token).toUpperCase();
+      if (status !== "POSITIVE" && status !== "NEUTRAL" && status !== "NEGATIVE" && status !== "UNKNOWN") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "--outcome-status must be POSITIVE, NEUTRAL, NEGATIVE, or UNKNOWN");
+      options.outcomeStatus = status;
+    }
+    else if (token === "--mature") options.outcomeMature = true;
     else if (token === "--allow-process-runner") options.allowProcessRunner = true;
+    else if (token === "--allow-external-harness") options.allowExternalHarness = true;
     else if (token.startsWith("--")) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown option: ${token}`);
     else if (["intent", "policy", "history", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "org", "github", "factory", "work", "run", "receipt", "cell", "product", "skill", "evolution", "billing", "tui", "eval"].includes(command) && !options.positional) options.positional = token;
     else throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unexpected argument: ${token}`);
@@ -227,7 +245,7 @@ function parseArgs(argv: string[]): CliOptions {
   if (command === "billing" && options.subcommand && !["summary", "catalog", "portal"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown billing command: ${options.subcommand}`);
   if (command === "github" && options.subcommand && options.subcommand !== "run") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown github command: ${options.subcommand}`);
   if (command === "factory" && options.subcommand && !["list", "show", "status", "validate", "sync", "mcp", "new", "plan", "init", "check"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown factory command: ${options.subcommand}`);
-  if (command === "work" && options.subcommand && !["list", "show", "retry", "approve", "cancel", "take", "return", "new"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown work command: ${options.subcommand}`);
+  if (command === "work" && options.subcommand && !["list", "show", "graph", "retry", "approve", "cancel", "take", "return", "new"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown work command: ${options.subcommand}`);
   if (command === "run" && options.subcommand && !["show", "logs"].includes(options.subcommand) && !options.local) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown run command: ${options.subcommand}`);
   if (command === "eval" && options.subcommand && !["init", "add", "run", "compare", "baseline", "export"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown eval command: ${options.subcommand}`);
   if (command === "cell" && options.subcommand && !["list", "show", "check"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown cell command: ${options.subcommand}`);
@@ -466,13 +484,15 @@ function help(command?: string): string {
   if (command === "agents") return "Usage: tb agents\n\nList local agent CLIs on PATH. OAuth stays in the child CLI. Tinkerbot does not store vendor tokens.\n";
   if (command === "dashboard") return "Usage: tb dashboard [--local] [--port 4174]\n\nOpen the authenticated Tinkerbot dashboard, or serve a local SQLite adapter on 127.0.0.1 with --local (not `tb serve`).\n";
   if (command === "login") return "Usage: tb login --token SESSION [--url https://control.example]\n\nStore a short-lived control-plane session. Browser login opens the public website.\n";
+  if (command === "intent") return "Usage: tb intent [--intent-mode micro|standard|strategic] \"description\"\n\nPersist a provider-independent intent contract in the local Factory Graph. Strategic intents include baseline, target, measurement, owner, and kill criteria.\n";
   if (command === "factory") return "Usage: tb factory list|show|validate|check|sync|mcp|new|init|plan\n\n`tb factory init` inspects the repo and writes a conservative .tinkerbot tree (no LLM). `tb factory check` compiles an immutable FactoryPlan. `tb factory new` writes a named starter. `tb factory validate` parses only.\n";
-  if (command === "work") return "Usage: tb work list|show|new|retry|approve|cancel|take|return [id]\n\n`tb work new` creates a local WorkOrder without an LLM.\n";
+  if (command === "work") return "Usage: tb work list|show|graph|new|retry|approve|cancel|take|return [id]\n\n`tb work new` creates a local WorkOrder without an LLM. `tb work graph <id>` reads the append-only Factory Graph; `tb work approve <id>` records a human approval event locally.\n";
+  if (command === "outcome") return "Usage: tb outcome record|export|check [--input FILE] [--work-order ID --outcome-status POSITIVE|NEUTRAL|NEGATIVE|UNKNOWN --mature]\n\nWithout --work-order, outcome records remain compatible with the assurance JSONL format. With it, the observation is also written to the local append-only Factory Graph.\n";
   if (command === "cell") return "Usage: tb cell list|show|check\n\n`tb cell check` reproduces lease/branch/credential scope. It is not tb check.\n";
   if (command === "product") return "Usage: tb product list|show [id]\n";
   if (command === "skill") return "Usage: tb skill list|show [id]\n";
   if (command === "evolution") return "Usage: tb evolution list|show|approve [id]\n";
-  if (command === "run") return "Usage: tb run show|logs <id>\n       tb run --local [--profile solo] [--allow-process-runner]\n";
+  if (command === "run") return "Usage: tb run show|logs <id>\n       tb run --local [--profile solo] [--allow-process-runner] [--allow-external-harness]\n";
   if (command === "eval") return "Usage: tb eval init|add|run|compare|baseline|export\n\nPortable personal evals. Scorers are advisory and never upgrade tb check.\n";
   if (command === "org") return "Usage: tb org list|switch|seats [organization-id]\n";
   if (command === "billing") return "Usage: tb billing summary|catalog|portal\n\nHosted billing reads the server catalog and seat quantity. Portal opens your Tinkerbot billing portal.\n";
@@ -802,6 +822,18 @@ function outcomeCommand(options: CliOptions): number {
     return outcomes.length ? EXIT_CODES.PASS : EXIT_CODES.UNKNOWN;
   }
   const value = readInputValue(root, options.input) as Partial<RuntimeOutcome>;
+  const graphWorkOrderId = options.workOrderId ?? (typeof (value as Record<string, unknown>).workOrderId === "string" ? String((value as Record<string, unknown>).workOrderId) : undefined);
+  if (graphWorkOrderId) {
+    const rawStatus = options.outcomeStatus ?? (typeof (value as Record<string, unknown>).status === "string" ? String((value as Record<string, unknown>).status).toUpperCase() : "UNKNOWN");
+    const status = ["POSITIVE", "NEUTRAL", "NEGATIVE", "UNKNOWN"].includes(rawStatus) ? rawStatus as "POSITIVE" | "NEUTRAL" | "NEGATIVE" | "UNKNOWN" : undefined;
+    if (!status) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "Graph outcome recording requires status POSITIVE, NEUTRAL, NEGATIVE, or UNKNOWN.");
+    const mature = options.outcomeMature ?? (value as Record<string, unknown>).mature === true;
+    let graph: Record<string, unknown>;
+    try { graph = localOutcomePayload(root, graphWorkOrderId, status, mature, { sourceOutcomeId: (value as Record<string, unknown>).id, observedAt: (value as Record<string, unknown>).observedAt }); }
+    catch (error) { throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error)); }
+    writeOutput(root, options, `${JSON.stringify(graph, null, 2)}\n`);
+    return EXIT_CODES.PASS;
+  }
   const outcome = value.kind === "runtime-outcome" ? value as RuntimeOutcome : createRuntimeOutcome({ outcomeType: value.outcomeType!, observedAt: value.observedAt ?? new Date().toISOString(), repository: value.repository, changeRecordRefs: value.changeRecordRefs, association: value.association, facts: value.facts, externalSignal: value.externalSignal, retention: value.retention });
   appendRuntimeOutcome(root, outcome);
   writeOutput(root, options, options.format === "terminal" ? `Outcome recorded\nID: ${outcome.id}\nType: ${outcome.outcomeType}\nAssociation: ${outcome.association.type}\n` : `${JSON.stringify(outcome, null, 2)}\n`);
@@ -913,7 +945,7 @@ export function runCli(argv = process.argv.slice(2)): number {
     if (options.command === "tui") return tuiCommand(options);
     if (options.command === "login") return loginCommand(options);
     if (options.command === "intent") {
-      try { process.stdout.write(`${JSON.stringify(localIntentPayload(options.positional), null, 2)}\n`); return EXIT_CODES.PASS; }
+      try { process.stdout.write(`${JSON.stringify(localIntentPayload(getRepoRoot(process.cwd()), options.positional, options.intentMode ?? "micro"), null, 2)}\n`); return EXIT_CODES.PASS; }
       catch (error) { throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error)); }
     }
     if (options.command === "factory" && options.subcommand === "validate") return factoryValidateCommand();
@@ -950,6 +982,14 @@ export function runCli(argv = process.argv.slice(2)): number {
       } catch (error) {
         throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error));
       }
+    }
+    if (options.command === "work" && options.subcommand === "graph") {
+      try { process.stdout.write(`${JSON.stringify(localFactoryGraphStatusPayload(getRepoRoot(process.cwd()), options.positional), null, 2)}\n`); return EXIT_CODES.PASS; }
+      catch (error) { throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error)); }
+    }
+    if (options.command === "work" && options.subcommand === "approve") {
+      try { process.stdout.write(`${JSON.stringify(localWorkApprovalPayload(getRepoRoot(process.cwd()), options.positional), null, 2)}\n`); return EXIT_CODES.PASS; }
+      catch (error) { throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error)); }
     }
     if (options.command === "cell" && options.subcommand === "check") {
       const root = getRepoRoot(process.cwd());
@@ -1163,6 +1203,7 @@ function makeTuiDeps(): TuiDeps {
     },
     openDashboard: dashboardCommand,
     localRuntime: () => localRuntimeTuiView(process.cwd()),
+    localGraph: (id) => JSON.stringify(localFactoryGraphStatusPayload(getRepoRoot(process.cwd()), id), null, 2),
     stdout: process.stdout,
     stderr: process.stderr,
     stdin: process.stdin,
@@ -1178,7 +1219,7 @@ function tuiCommand(options: CliOptions): number {
 export async function dispatchTui(options: TuiOptions, deps: TuiDeps, interactive: boolean): Promise<number> {
   if (interactive && !options.once && !options.help) {
     const agent = isAgentId(options.agent) ? options.agent : undefined;
-    return runMasterTuiInteractive({
+    return runKitWorkstationInteractive({
       workOrderId: options.subcommand === "work" ? options.positional : undefined,
       agent,
       help: options.help,
@@ -1194,7 +1235,8 @@ export async function dispatchTui(options: TuiOptions, deps: TuiDeps, interactiv
       },
       openDashboard: deps.openDashboard,
       localRuntime: deps.localRuntime ?? (() => localRuntimeTuiView(deps.cwd)),
-      createReport: (input) => deps.createReport({ cwd: input.cwd, command: "check", base: options.base, head: options.head, runBaseTests: options.baseTests }),
+      localGraph: deps.localGraph ?? ((id) => JSON.stringify(localFactoryGraphStatusPayload(getRepoRoot(deps.cwd), id), null, 2)),
+      createReport: () => deps.createReport({ cwd: deps.cwd, command: "check", base: options.base, head: options.head, runBaseTests: options.baseTests }),
       fetchWork: deps.fetchWork ? (id) => {
         const view = deps.fetchWork!(id);
         return { summary: `Work ${id}. Agent stage text is not a verdict.`, verdict: view.workOrder?.verificationVerdict };
@@ -1253,12 +1295,13 @@ async function runHostedCli(argv: string[]): Promise<number | undefined> {
     process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
     return EXIT_CODES.PASS;
   }
-    if (command === "work") {
+  if (command === "work") {
     const subcommand = argv[1] ?? "list";
     if (subcommand === "new") return undefined;
+    if (subcommand === "graph" && !argv[2]) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb work graph requires a work-order id.");
     const id = argv[2];
     const method = ["retry", "approve", "cancel", "take", "return"].includes(subcommand) ? "POST" : "GET";
-    const pathname = !id && subcommand === "list" ? "/work-orders" : id ? `/work-orders/${id}${method === "POST" ? `/${subcommand}` : ""}` : `/work-orders/${subcommand}`;
+    const pathname = !id && subcommand === "list" ? "/work-orders" : id ? `/work-orders/${id}${subcommand === "graph" ? "/graph" : method === "POST" ? `/${subcommand}` : ""}` : `/work-orders/${subcommand}`;
     const response = await hostedRequest(pathname, method);
     if (response.status < 200 || response.status >= 300) {
       process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
@@ -1373,6 +1416,7 @@ export async function mainAsync(argv = process.argv.slice(2)): Promise<number> {
       const payload = await executeLocalRun(getRepoRoot(process.cwd()), {
         profile: options.profile,
         allowProcessRunner: options.allowProcessRunner,
+        allowExternalHarness: options.allowExternalHarness,
         text: options.positional,
         warn: (message) => process.stderr.write(`${message}\n`),
         postSync,
@@ -1391,7 +1435,8 @@ export async function mainAsync(argv = process.argv.slice(2)): Promise<number> {
         fetchWorkAsync: async (id) => {
           const response = await hostedRequest(`/work-orders/${id}`);
           if (response.status < 200 || response.status >= 300) return {};
-          return response.body as { workOrder?: { workOrderId?: string; status?: string; currentStage?: string; verificationVerdict?: string; verificationIngested?: boolean }; run?: { run_id?: string; status?: string }; stages?: Array<{ stage?: string; status?: string; summary?: string }> };
+          const graph = await hostedRequest(`/work-orders/${id}/graph`).catch(() => ({ status: 0, body: {} as Record<string, unknown> }));
+          return { ...response.body, ...(graph.status >= 200 && graph.status < 300 ? { graph: graph.body.graph, economics: graph.body.economics, events: graph.body.events, sourceOfTruth: graph.body.sourceOfTruth } : {}) } as { workOrder?: { workOrderId?: string; status?: string; currentStage?: string; verificationVerdict?: string; verificationIngested?: boolean }; run?: { run_id?: string; status?: string }; stages?: Array<{ stage?: string; status?: string; summary?: string }>; graph?: { verificationVerdict?: string; reviewDecision?: string; releaseDecision?: string; outcomeStatus?: string; outcomeMaturity?: string; eventCount?: number }; economics?: { cogsCents?: number; copqCents?: number; acceptedChanges?: number }; events?: Array<{ type?: string; actorType?: string; occurredAt?: string }>; sourceOfTruth?: string };
         },
         workActionAsync: async (id, action, note) => {
           const response = await hostedRequest(`/work-orders/${id}/${action}`, "POST", action === "steer" ? { note } : undefined);

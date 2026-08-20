@@ -1,6 +1,6 @@
 import type { AgentId } from "./agents";
 
-export type TabKind = "check" | "work" | "agent" | "shell" | "plan" | "cost" | "eval";
+export type TabKind = "check" | "work" | "graph" | "agent" | "shell" | "plan" | "cost" | "eval";
 
 export interface MasterTab {
   id: string;
@@ -18,6 +18,7 @@ export interface MasterState {
   lastVerdict?: string;
   checkLog?: string;
   workLog?: string;
+  graphLog?: string;
   planLog?: string;
   costLog?: string;
   evalLog?: string;
@@ -32,6 +33,7 @@ export type MasterIntent =
   | { type: "none" }
   | { type: "check" }
   | { type: "work"; id: string }
+  | { type: "graph"; id: string }
   | { type: "open-agent"; id: AgentId }
   | { type: "tab-next" }
   | { type: "tab-prev" }
@@ -62,7 +64,7 @@ Leader: ctrl-g then n/p/w to next/prev/close a nested agent tab.
 
 Slash (master, not the child CLI):
   /check /work <id> /claude /gemini /codex /cursor /shell
-  /tab next|prev|close /factory list|show /plan /cost /eval /dashboard /help /exit
+  /tab next|prev|close /factory list|show /plan /cost /eval /graph <id> /dashboard /help /exit
   /merge and /pass are rejected.
 
 Nested CLIs use their own OAuth. Tinkerbot does not store vendor tokens.
@@ -99,6 +101,10 @@ export function parseMasterIntent(line: string): MasterIntent {
     if (command === "work") {
       if (!argument) return { type: "reject", command: "/work", reason: "/work requires a work-order id." };
       return { type: "work", id: argument.split(/\s+/)[0]! };
+    }
+    if (command === "graph") {
+      if (!argument) return { type: "reject", command: "/graph", reason: "/graph requires a work-order id." };
+      return { type: "graph", id: argument.split(/\s+/)[0]! };
     }
     if (command === "claude" || command === "gemini" || command === "codex" || command === "cursor" || command === "shell") return { type: "open-agent", id: command };
     if (command === "tab") {
@@ -159,6 +165,12 @@ export function applyMasterIntent(state: MasterState, intent: MasterIntent): Mas
     const tabs = [...state.tabs, { id, kind: "work" as const, title: `Work ${intent.id}`, workOrderId: intent.id }];
     return { ...state, tabs, active: tabs.length - 1 };
   }
+  if (intent.type === "graph") {
+    const id = `graph:${intent.id}`;
+    if (state.tabs.some((tab) => tab.id === id)) return { ...state, active: state.tabs.findIndex((tab) => tab.id === id), status: "Append-only Factory Graph projection. Read-only." };
+    const tabs = [...state.tabs, { id, kind: "graph" as const, title: `Graph ${intent.id}`, workOrderId: intent.id }];
+    return { ...state, tabs, active: tabs.length - 1, status: "Append-only Factory Graph projection. Read-only." };
+  }
   if (intent.type === "open-agent") {
     const id = `agent:${intent.id}`;
     if (state.tabs.some((tab) => tab.id === id)) return { ...state, active: state.tabs.findIndex((tab) => tab.id === id) };
@@ -193,6 +205,7 @@ export function renderTabBody(state: MasterState): string {
     return state.workLog
       ?? `Work ${tab.workOrderId}. Hosted attach is transcript only. Missing ingest is UNKNOWN. Humans merge.`;
   }
+  if (tab.kind === "graph") return state.graphLog ?? `Graph ${tab.workOrderId}. Read-only projection from the append-only Factory Graph.`;
   if (tab.kind === "plan") return state.planLog ?? "Plan tab. Dry-run stages, skip reasons, and estimates. No WorkOrder is created here.";
   if (tab.kind === "cost") return state.costLog ?? "Cost tab. Tinkerbot invoices seats only. BYOK spend is billed by your provider. Scorers cannot change a verdict.";
   if (tab.kind === "eval") return state.evalLog ?? "Eval tab. Compare personal suite vs baseline. upgradesVerdict stays false.";

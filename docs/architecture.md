@@ -40,4 +40,4 @@ Demand
 
 Customer production deploys are orchestrated and evidenced, not executed by Tinkerbot on the customer cluster.
 
-The interactive terminal is `tb tui`: a tabbed master in `packages/tui` on a TTY, and a Node `--once` transcript for CI. Nested vendor CLIs are user-owned PTYs. The browser control tower remains `tb dashboard`. OpenTUI is isolated from the Node engine, Action, and hosted inference.
+The interactive terminal is `tb tui`: a Claude Code-style kit shell in `packages/tui` on a TTY, and a Node `--once` transcript for CI. Its slash commands project the underlying tabs and nested vendor CLIs remain user-owned PTYs. The browser control tower remains `tb dashboard`. The kit UI is isolated from the Node engine, Action, and hosted inference.

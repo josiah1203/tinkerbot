@@ -74,7 +74,7 @@ export type FactoryIntakeSource =
   | "gitlab_issue"
   | "gitlab_merge_request";
 export type ForemanToolName = "skip_stage" | "ask_human" | "continue_conversation" | "spawn_agent" | "dispatch_sandbox" | "dispatch_verify" | "request_revision";
-export type FactoryWait = "spec_approval" | "sandbox" | "oidc_ingest" | "revision" | "human_merge";
+export type FactoryWait = "spec_approval" | "sandbox" | "self_hosted_harness" | "factory_definition" | "oidc_ingest" | "revision" | "human_merge";
 export type ActivityColumn = "triage" | "planning" | "building" | "reviewing" | "blocked" | "done";
 
 export const FOREMAN_TOOLS: readonly ForemanToolName[] = ["skip_stage", "ask_human", "continue_conversation", "spawn_agent", "dispatch_sandbox", "dispatch_verify", "request_revision"];

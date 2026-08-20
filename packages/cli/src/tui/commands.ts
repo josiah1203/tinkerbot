@@ -12,6 +12,7 @@ export const SLASH_COMMANDS: Array<{ name: string; summary: string; hidden?: boo
   { name: "/plan", summary: "Show the local execution plan. Not a verdict." },
   { name: "/cost", summary: "Show your BYOK provider spend. Tinkerbot invoices seats only." },
   { name: "/eval", summary: "Show portable eval compare. Cannot upgrade tb check." },
+  { name: "/graph", summary: "Show the append-only Factory Graph for a local work order." },
   { name: "/dashboard", summary: "Open the browser control tower." },
   { name: "/clear", summary: "Clear the transcript." },
   { name: "/help", summary: "Show commands." },
@@ -56,6 +57,10 @@ export function parseIntent(line: string): Intent {
     if (command === "plan") return { type: "plan" };
     if (command === "cost") return { type: "cost" };
     if (command === "eval") return { type: "eval" };
+    if (command === "graph") {
+      if (!argument) return { type: "reject", command: "/graph", reason: "/graph requires a work-order id." };
+      return { type: "graph", id: argument.split(/\s+/)[0]! };
+    }
     if (command === "clear") return { type: "clear" };
     if (command === "help") return { type: "help" };
     if (command === "exit" || command === "quit") return { type: "exit" };

@@ -20,7 +20,7 @@ Four planes:
 Roles:
 
 - `@tinker` is the factory’s **external** control handle (GitHub, Slack, Jira, Linear). Mentions become typed, authorized, idempotent commands. The TUI does not parse `@tinker`.
-- The **customer agent** (optional) is a production worker. Hosted YAML must not set `harness: claude-code` (or Codex/Gemini/`oz`).
+- The **customer agent** (optional) is a production worker. Customer harnesses (Claude Code, Codex, Gemini, `oz`, or internal wrappers) require a local or explicitly self-hosted boundary; hosted Workers never execute their commands.
 - **`tb check`** is the authoritative inspection engine.
 
 Three truths that must not collapse:

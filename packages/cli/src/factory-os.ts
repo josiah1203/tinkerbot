@@ -6,6 +6,8 @@ import {
   projectFactoryEvents,
   compileFactoryPlan,
   createMicroIntent,
+  factoryId,
+  validateIntent,
   createWorkOrder,
   dispatchTinkerGateway,
   emptyWaiver,
@@ -18,6 +20,7 @@ import {
   runEvalSuite,
   STARTER_FACTORY_PACKS,
   type FactoryCommand,
+  type OutcomeStatus,
 } from "../../factory/src";
 import { defaultLocalDbPath, providerForProfile, SqliteFactoryStore } from "../../local-runtime/src";
 import { evalCli, factoryPlanPayload } from "./runtime-cli";
@@ -65,8 +68,7 @@ export function localWorkNewPayload(root: string, intent?: string): Record<strin
     waiver: emptyWaiver(),
     acceptanceCriteriaChain: text ? [linkAcceptanceCriterion(text, "repository")] : [],
   }), plan);
-  void store.insertWorkOrder(order);
-  void store.appendFactoryEvent({
+  store.insertWorkOrderSync(order, {
     eventId: `evt_${order.workOrderId}`, type: "work_order.created", aggregateId: order.workOrderId, aggregateType: "work_order",
     organizationId: order.organizationId, factoryId: order.factoryId, actorId: order.actor, actorType: "human", occurredAt: order.createdAt,
     correlationId: order.workOrderId, schemaVersion: 1, policyVersion: order.policyVersion, provenance: "HUMAN_VERIFIED", payload: { intentId: order.workOrderId, intent: text, workOrderId: order.workOrderId },
@@ -75,11 +77,34 @@ export function localWorkNewPayload(root: string, intent?: string): Record<strin
 }
 
 /** Local, accountless intake. Hosted sync may later mirror this canonical intent event. */
-export function localIntentPayload(text?: string): Record<string, unknown> {
+export function localIntentPayload(root: string, text?: string, mode: "micro" | "standard" | "strategic" = "micro"): Record<string, unknown> {
   const title = text?.trim();
   if (!title) throw new Error("intent requires a description");
-  const intent = createMicroIntent(title);
-  return { created: true, intent, next: "tb work new \"<implementation task>\"", requiresHostedAccount: false };
+  const objectiveId = mode === "micro" ? undefined : factoryId("objective");
+  const intent = {
+    ...createMicroIntent(title),
+    mode,
+    ...(objectiveId ? {
+      objectiveId,
+      acceptanceCriteria: [`${title} is complete`],
+      nonGoals: ["No unrelated repository changes"],
+      risk: mode === "strategic" ? "high" as const : "medium" as const,
+      expectedOutcome: `The change achieves the requested result: ${title}`,
+      ...(mode === "strategic" ? {
+        baselineMetric: "baseline to be recorded before release",
+        targetMetric: "measurable improvement against baseline",
+        measurementWindow: "14d",
+        decisionOwner: "local-human",
+        killCriteria: ["No measurable improvement after the measurement window"],
+      } : {}),
+    } : {}),
+  };
+  const missing = validateIntent(intent);
+  if (missing.length) throw new Error(`invalid ${mode} intent: ${missing.join(", ")}`);
+  const store = new SqliteFactoryStore(defaultLocalDbPath(root));
+  if (objectiveId) store.appendFactoryEventSync({ eventId: `evt_${objectiveId}`, type: "objective.created", aggregateId: objectiveId, aggregateType: "objective", organizationId: "local", factoryId: "local-factory", actorId: "local-human", actorType: "human", occurredAt: new Date().toISOString(), correlationId: intent.intentId, schemaVersion: 1, provenance: "HUMAN_VERIFIED", payload: { objectiveId, title } });
+  store.appendFactoryEventSync({ eventId: `evt_${intent.intentId}`, type: "intent.created", aggregateId: intent.intentId, aggregateType: "intent", organizationId: "local", factoryId: "local-factory", actorId: "local-human", actorType: "human", occurredAt: new Date().toISOString(), correlationId: intent.intentId, schemaVersion: 1, provenance: "HUMAN_VERIFIED", payload: { intent } });
+  return { created: true, intent, mode, next: "tb work new \"<implementation task>\"", requiresHostedAccount: false, persisted: true };
 }
 
 export function localFactoryGraphStatusPayload(root: string, aggregateId?: string): Record<string, unknown> {
@@ -87,6 +112,42 @@ export function localFactoryGraphStatusPayload(root: string, aggregateId?: strin
   const store = new SqliteFactoryStore(defaultLocalDbPath(root));
   const events = store.readFactoryEvents(aggregateId);
   return { aggregateId, events, state: projectFactoryEvents(events), economics: calculateFactoryEconomics(events), sourceOfTruth: "append_only_factory_graph" };
+}
+
+export function localWorkApprovalPayload(root: string, workOrderId?: string, decision: "approved" | "rejected" = "approved"): Record<string, unknown> {
+  if (!workOrderId) throw new Error("work approve requires a work-order identifier");
+  const store = new SqliteFactoryStore(defaultLocalDbPath(root));
+  const order = store.orders.get(workOrderId);
+  if (!order) throw new Error("work order not found");
+  const now = new Date().toISOString();
+  store.appendFactoryEventSync({
+    eventId: `approval_${workOrderId}_${decision}_local-human`, type: "approval.recorded", aggregateId: workOrderId, aggregateType: "work_order",
+    organizationId: order.organizationId, factoryId: order.factoryId, actorId: "local-human", actorType: "human", occurredAt: now,
+    correlationId: workOrderId, schemaVersion: 1, policyVersion: order.policyVersion, provenance: "HUMAN_VERIFIED", payload: { decision, workOrderId, signature: "local-human" },
+  });
+  const events = store.readFactoryEvents(workOrderId);
+  return { workOrderId, decision, state: projectFactoryEvents(events), events, sourceOfTruth: "append_only_factory_graph" };
+}
+
+export function localOutcomePayload(root: string, workOrderId: string | undefined, status: OutcomeStatus, mature: boolean, details: Record<string, unknown> = {}): Record<string, unknown> {
+  if (!workOrderId) throw new Error("outcome record requires --work-order");
+  if (!["POSITIVE", "NEUTRAL", "NEGATIVE", "UNKNOWN"].includes(status)) throw new Error("outcome status must be POSITIVE, NEUTRAL, NEGATIVE, or UNKNOWN");
+  const store = new SqliteFactoryStore(defaultLocalDbPath(root));
+  const order = store.orders.get(workOrderId);
+  if (!order) throw new Error("work order not found");
+  const now = new Date().toISOString();
+  store.appendFactoryEventSync({
+    eventId: `outcome_${workOrderId}_${now}`, type: "outcome.observed", aggregateId: workOrderId, aggregateType: "work_order",
+    organizationId: order.organizationId, factoryId: order.factoryId, actorId: "local-human", actorType: "human", occurredAt: now,
+    correlationId: workOrderId, schemaVersion: 1, policyVersion: order.policyVersion, provenance: "HUMAN_VERIFIED", payload: { ...details, status, mature },
+  });
+  if (mature) store.appendFactoryEventSync({
+    eventId: `outcome_matured_${workOrderId}_${now}`, type: "outcome.matured", aggregateId: workOrderId, aggregateType: "work_order",
+    organizationId: order.organizationId, factoryId: order.factoryId, actorId: "local-human", actorType: "human", occurredAt: now,
+    correlationId: workOrderId, schemaVersion: 1, policyVersion: order.policyVersion, provenance: "HUMAN_VERIFIED", payload: { closed: true },
+  });
+  const events = store.readFactoryEvents(workOrderId);
+  return { workOrderId, outcome: { status, mature }, state: projectFactoryEvents(events), economics: calculateFactoryEconomics(events), events, sourceOfTruth: "append_only_factory_graph" };
 }
 
 export function cellCheckPayload(input: { repository: string; branch: string; status?: "free" | "leased" | "held" | "abandoned"; credentialScope?: string }): Record<string, unknown> {

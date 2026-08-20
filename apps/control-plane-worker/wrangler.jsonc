@@ -48,7 +48,10 @@
     { "binding": "EVIDENCE_BUCKET", "bucket_name": "tinkerbot-evidence" }
   ],
   "queues": {
-    "producers": [{ "binding": "FACTORY_EVENTS", "queue": "tinkerbot-factory-events" }],
+    "producers": [
+      { "binding": "FACTORY_EVENTS", "queue": "tinkerbot-factory-events" },
+      { "binding": "SELF_HOSTED_WORK", "queue": "tinkerbot-self-hosted-work" }
+    ],
     "consumers": [{ "queue": "tinkerbot-factory-events", "max_batch_size": 10, "max_retries": 5 }]
   },
   "assets": {
@@ -65,10 +68,7 @@
       "WORKOS_WEBHOOK_SECRET",
       "STRIPE_SECRET_KEY",
       "STRIPE_WEBHOOK_SECRET",
-      "SESSION_ENCRYPTION_KEY",
-      "GITHUB_WEBHOOK_SECRET",
-      "GITHUB_APP_ID",
-      "GITHUB_APP_PRIVATE_KEY"
+      "SESSION_ENCRYPTION_KEY"
     ]
   },
   "env": {
@@ -110,7 +110,10 @@
         { "binding": "EVIDENCE_BUCKET", "bucket_name": "tinkerbot-evidence-staging" }
       ],
       "queues": {
-        "producers": [{ "binding": "FACTORY_EVENTS", "queue": "tinkerbot-factory-events-staging" }],
+        "producers": [
+          { "binding": "FACTORY_EVENTS", "queue": "tinkerbot-factory-events-staging" },
+          { "binding": "SELF_HOSTED_WORK", "queue": "tinkerbot-self-hosted-work-staging" }
+        ],
         "consumers": [{ "queue": "tinkerbot-factory-events-staging", "max_batch_size": 10, "max_retries": 5 }]
       },
       "assets": {
@@ -127,10 +130,7 @@
           "WORKOS_WEBHOOK_SECRET",
           "STRIPE_SECRET_KEY",
           "STRIPE_WEBHOOK_SECRET",
-          "SESSION_ENCRYPTION_KEY",
-          "GITHUB_WEBHOOK_SECRET",
-          "GITHUB_APP_ID",
-          "GITHUB_APP_PRIVATE_KEY"
+          "SESSION_ENCRYPTION_KEY"
         ]
       }
     },
@@ -170,7 +170,10 @@
         { "binding": "EVIDENCE_BUCKET", "bucket_name": "tinkerbot-evidence" }
       ],
       "queues": {
-        "producers": [{ "binding": "FACTORY_EVENTS", "queue": "tinkerbot-factory-events" }],
+        "producers": [
+          { "binding": "FACTORY_EVENTS", "queue": "tinkerbot-factory-events" },
+          { "binding": "SELF_HOSTED_WORK", "queue": "tinkerbot-self-hosted-work" }
+        ],
         "consumers": [{ "queue": "tinkerbot-factory-events", "max_batch_size": 10, "max_retries": 5 }]
       },
       "assets": {
@@ -187,10 +190,7 @@
           "WORKOS_WEBHOOK_SECRET",
           "STRIPE_SECRET_KEY",
           "STRIPE_WEBHOOK_SECRET",
-          "SESSION_ENCRYPTION_KEY",
-          "GITHUB_WEBHOOK_SECRET",
-          "GITHUB_APP_ID",
-          "GITHUB_APP_PRIVATE_KEY"
+          "SESSION_ENCRYPTION_KEY"
         ]
       }
     }

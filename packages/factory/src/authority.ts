@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { autonomyAllowsSkip, type ProductionLineId } from "./os";
-import { FORBIDDEN_HARNESS_TYPES } from "./definition";
+import { isExternalHarness } from "./harness";
 import { UNKNOWN_CODES, type UnknownCode } from "../../core/src/inspection";
 
 export { UNKNOWN_CODES, type UnknownCode };
@@ -13,7 +13,7 @@ export interface FactoryPlanSource {
   skills: unknown[];
   autonomy?: unknown;
   evolution: { autoMerge: boolean };
-  runtime: { runner: { type: string } };
+  runtime: { runner: { type: string }; controlPlane?: string };
 }
 
 export const VERIFICATION_VERDICTS = ["PASS", "FAIL", "UNKNOWN"] as const;
@@ -174,8 +174,8 @@ export function resolveReleaseDecision(input: { verificationVerdict: Verificatio
 export function compileFactoryPlan(definition: FactoryPlanSource, definitionDigest: string, now = new Date().toISOString()): FactoryPlan {
   const issues: string[] = [];
   for (const agent of definition.agents) {
-    if ((FORBIDDEN_HARNESS_TYPES as readonly string[]).includes(agent.harness)) {
-      issues.push(`Customer harness '${agent.harness}' cannot be represented as a Tinkerbot-owned model.`);
+    if (isExternalHarness(agent.harness) && definition.runtime.controlPlane !== "local" && definition.runtime.runner.type !== "self_hosted") {
+      issues.push(`Customer harness '${agent.harness}' requires a local or self-hosted execution boundary.`);
     }
   }
   if (definition.evolution.autoMerge) issues.push("Evolution autoMerge would silently change the plant.");

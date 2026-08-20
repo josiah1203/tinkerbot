@@ -94,6 +94,12 @@ export interface StripePlan {
   catalogVersion?: string;
 }
 
+export interface StripeCatalogValidation {
+  valid: boolean;
+  plans: StripePlan[];
+  errors: string[];
+}
+
 export interface CheckoutSessionInput {
   planId: string;
   interval: "month" | "year";
@@ -1115,30 +1121,50 @@ export function evidenceStoreFromEnv(input: { bucket?: R2BucketLike; exportEndpo
   return new FanoutEvidenceStore(primary, replica);
 }
 
-export function parseStripePlans(value: unknown): StripePlan[] {
-  if (typeof value !== "string" || !value.trim()) return [];
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    if (!Array.isArray(parsed)) return [];
-    const prohibited = ["memberLimit", "seatLimit", "privateRepositoryLimit", "repositoryLimit", "additionalRepositoryPrice", "perRepositoryPrice", "perRunPrice", "perTokenPrice", "factoryLimit"];
-    const plans = parsed.filter((item): item is StripePlan => {
-      if (!item || typeof item !== "object" || Array.isArray(item)) return false;
-      const plan = item as Record<string, unknown>;
-      if (prohibited.some((field) => Object.prototype.hasOwnProperty.call(plan, field))) return false;
-      if (typeof plan.id !== "string" || !plan.id.trim() || typeof plan.monthlyPriceId !== "string" || !plan.monthlyPriceId.trim() || (plan.annualPriceId !== undefined && (typeof plan.annualPriceId !== "string" || !plan.annualPriceId.trim()))) return false;
-      if (!["developer", "team", "business"].includes(plan.id)) return false;
-      return true;
-    });
-    const ids = new Set<string>();
-    const prices = new Set<string>();
-    return plans.filter((plan) => {
-      if (ids.has(plan.id) || prices.has(plan.monthlyPriceId) || (plan.annualPriceId && prices.has(plan.annualPriceId))) return false;
-      ids.add(plan.id);
-      prices.add(plan.monthlyPriceId);
-      if (plan.annualPriceId) prices.add(plan.annualPriceId);
-      return true;
-    });
-  } catch {
-    return [];
+export function validateStripePlans(value: unknown, options: { requireAllPlans?: boolean; requireAnnualPrices?: boolean } = {}): StripeCatalogValidation {
+  const errors: string[] = [];
+  if (typeof value !== "string" || !value.trim()) return { valid: false, plans: [], errors: ["STRIPE_PLANS_JSON is empty."] };
+  let parsed: unknown;
+  try { parsed = JSON.parse(value) as unknown; } catch { return { valid: false, plans: [], errors: ["STRIPE_PLANS_JSON is not valid JSON."] }; }
+  if (!Array.isArray(parsed) || parsed.length === 0) return { valid: false, plans: [], errors: ["STRIPE_PLANS_JSON must be a non-empty array."] };
+  const prohibited = ["memberLimit", "seatLimit", "privateRepositoryLimit", "repositoryLimit", "additionalRepositoryPrice", "perRepositoryPrice", "perRunPrice", "perTokenPrice", "factoryLimit"];
+  const ids = new Set<string>();
+  const prices = new Set<string>();
+  const versions = new Set<string>();
+  const allowedFields = new Set(["id", "monthlyPriceId", "annualPriceId", "catalogVersion"]);
+  const plans: StripePlan[] = [];
+  for (const [index, item] of parsed.entries()) {
+    const context = `Stripe plan ${index + 1}`;
+    if (!item || typeof item !== "object" || Array.isArray(item)) { errors.push(`${context} must be an object.`); continue; }
+    const plan = item as Record<string, unknown>;
+    for (const field of Object.keys(plan)) if (!allowedFields.has(field)) errors.push(`${context} contains unsupported field '${field}'.`);
+    const id = typeof plan.id === "string" ? plan.id.trim() : "";
+    const monthly = typeof plan.monthlyPriceId === "string" ? plan.monthlyPriceId.trim() : "";
+    const annual = plan.annualPriceId === undefined ? undefined : typeof plan.annualPriceId === "string" ? plan.annualPriceId.trim() : "";
+    if (!["developer", "team", "business"].includes(id)) errors.push(`${context} has an unsupported id.`);
+    if (!monthly || !/^price_[A-Za-z0-9]+$/.test(monthly) || monthly.includes("REPLACE")) errors.push(`${context} has an invalid monthlyPriceId.`);
+    if (annual !== undefined && (!annual || !/^price_[A-Za-z0-9]+$/.test(annual) || annual.includes("REPLACE"))) errors.push(`${context} has an invalid annualPriceId.`);
+    if (options.requireAnnualPrices && annual === undefined) errors.push(`${context} is missing annualPriceId.`);
+    for (const field of prohibited) if (Object.prototype.hasOwnProperty.call(plan, field)) errors.push(`${context} must not include ${field}; the catalog is seat-only.`);
+    const catalogVersion = plan.catalogVersion;
+    if (catalogVersion !== undefined) {
+      if (typeof catalogVersion !== "string" || !/^[A-Za-z0-9._-]{1,80}$/.test(catalogVersion)) errors.push(`${context} has an invalid catalogVersion.`);
+      else versions.add(catalogVersion);
+    } else if (options.requireAllPlans) errors.push(`${context} is missing catalogVersion.`);
+    if (!id || !monthly || !/^price_[A-Za-z0-9]+$/.test(monthly)) continue;
+    if (ids.has(id)) errors.push(`Duplicate Stripe plan id '${id}'.`);
+    if (prices.has(monthly)) errors.push(`Duplicate Stripe price id '${monthly}'.`);
+    if (annual && prices.has(annual)) errors.push(`Duplicate Stripe price id '${annual}'.`);
+    ids.add(id);
+    prices.add(monthly);
+    if (annual) prices.add(annual);
+    plans.push({ id, monthlyPriceId: monthly, ...(annual ? { annualPriceId: annual } : {}), ...(typeof catalogVersion === "string" ? { catalogVersion } : {}) });
   }
+  if (versions.size > 1) errors.push("All Stripe plans must use the same catalogVersion.");
+  if (options.requireAllPlans) for (const id of ["developer", "team", "business"]) if (!plans.some((plan) => plan.id === id)) errors.push(`Stripe catalog is missing ${id}.`);
+  return { valid: errors.length === 0, plans: errors.length === 0 ? plans : [], errors };
+}
+
+export function parseStripePlans(value: unknown): StripePlan[] {
+  return validateStripePlans(value).plans;
 }

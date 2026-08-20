@@ -8,6 +8,7 @@ import {
   classifyActivityColumn,
   classifyWorkOrderGroup,
   createWorkOrder,
+  graphEventForWorkOrderTransition,
   factoryDashboardMetrics,
   factoryDefinitionDigest,
   parseFactoryDefinition,
@@ -16,6 +17,7 @@ import {
   type FactoryEvent,
   type FactoryProjection,
   type FactoryDefinition,
+  validateFactoryDefinition,
 } from "../../../packages/factory/src";
 
 export class D1FactoryStore {
@@ -39,6 +41,8 @@ export class D1FactoryStore {
     if (input.yaml) {
       let definition = parseFactoryDefinition(input.yaml);
       if (input.files?.length) definition = applyFactoryTree(definition, input.files);
+      const definitionErrors = validateFactoryDefinition(definition, { requireForeman: definition.schemaVersion === "v1alpha1" || definition.agents.some((agent) => agent.agentType === "FOREMAN") });
+      if (definitionErrors.length) throw new Error(`Invalid factory definition: ${definitionErrors.join("; ")}`);
       digest = factoryDefinitionDigest(definition);
       const definitionId = crypto.randomUUID();
       await this.database.prepare("INSERT INTO tinkerbot_factory_definitions (definition_id, factory_id, digest, yaml, files_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(definitionId, input.factoryId, digest, input.yaml, input.files?.length ? JSON.stringify(input.files) : null, now).run();
@@ -142,6 +146,22 @@ export class D1FactoryStore {
 
   async insertWorkOrder(order: WorkOrder): Promise<void> {
     await this.database.prepare("INSERT INTO tinkerbot_work_orders (work_order_id, factory_id, organization_id, source_type, source_id, repository_id, issue_or_pull_request, intent, acceptance_criteria, policy_version, definition_version, definition_digest, current_stage, status, actor, created_at, updated_at, product_id, line_id, cell_id, owner, risk, autonomy_mode, output_kind, policy_json, dependencies_json, held_by, verification_verdict, review_assessment, release_decision, waiver_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)").bind(order.workOrderId, order.factoryId, order.organizationId, order.sourceType, order.sourceId, order.repositoryId, order.issueOrPullRequest ?? null, order.intent ?? null, order.acceptanceCriteria ?? null, order.policyVersion, order.definitionVersion, order.definitionDigest, order.currentStage, order.status, order.actor, order.createdAt, order.updatedAt, order.productId ?? null, order.lineId ?? null, order.cellId ?? null, order.owner ?? null, order.risk ?? null, order.autonomyMode ?? null, order.outputKind ?? null, order.policyJson ?? null, order.dependenciesJson ?? null, order.heldBy ?? null, order.verificationVerdict ?? "UNKNOWN", order.reviewAssessment ?? "NEEDS_HUMAN_REVIEW", order.releaseDecision ?? "BLOCKED", order.waiver ? JSON.stringify(order.waiver) : null).run();
+    await this.appendFactoryEvent({
+      eventId: `evt_${order.workOrderId}`,
+      type: "work_order.created",
+      aggregateId: order.workOrderId,
+      aggregateType: "work_order",
+      organizationId: order.organizationId,
+      factoryId: order.factoryId,
+      actorId: order.actor,
+      actorType: order.sourceType === "manual" ? "human" : order.sourceType.startsWith("github") || order.sourceType.startsWith("gitlab") ? "integration" : "system",
+      occurredAt: order.createdAt,
+      correlationId: order.workOrderId,
+      schemaVersion: 1,
+      policyVersion: order.policyVersion,
+      provenance: "ATTESTED",
+      payload: { workOrderId: order.workOrderId, intent: order.intent ?? order.issueOrPullRequest ?? "", acceptanceCriteria: order.acceptanceCriteria ?? "" },
+    });
   }
 
   async applyTransition(workOrderId: string, toState: WorkOrderState, causeId: string, actor: string): Promise<{ ok: true; order: WorkOrder; event?: WorkOrderEvent } | { ok: false; code: "not_found" | "invalid_transition" | "idempotent" }> {
@@ -151,6 +171,18 @@ export class D1FactoryStore {
     if ("error" in result) return { ok: false, code: result.error };
     await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_work_order_events (event_id, work_order_id, from_state, to_state, cause_id, actor, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)").bind(result.event.eventId, result.event.workOrderId, result.event.fromState, result.event.toState, result.event.causeId, result.event.actor, result.event.createdAt).run();
     await this.database.prepare("UPDATE tinkerbot_work_orders SET status = ?1, current_stage = ?2, actor = ?3, updated_at = ?4, product_id = COALESCE(?5, product_id), line_id = COALESCE(?6, line_id), cell_id = COALESCE(?7, cell_id), autonomy_mode = COALESCE(?8, autonomy_mode), output_kind = COALESCE(?9, output_kind), held_by = ?10 WHERE work_order_id = ?11").bind(result.order.status, result.order.currentStage, result.order.actor, result.order.updatedAt, result.order.productId ?? null, result.order.lineId ?? null, result.order.cellId ?? null, result.order.autonomyMode ?? null, result.order.outputKind ?? null, result.order.heldBy ?? null, workOrderId).run();
+    const graphEvent = graphEventForWorkOrderTransition({
+      workOrderId: result.order.workOrderId,
+      factoryId: result.order.factoryId,
+      organizationId: result.order.organizationId,
+      actor: result.order.actor,
+      policyVersion: result.order.policyVersion,
+      fromState: result.event.fromState,
+      toState: result.event.toState,
+      causeId: result.event.causeId,
+      createdAt: result.event.createdAt,
+    });
+    if (graphEvent) await this.appendFactoryEvent(graphEvent);
     return { ok: true, order: result.order, event: result.event };
   }
 
@@ -233,6 +265,23 @@ export class D1FactoryStore {
 
   async insertApproval(workOrderId: string, actor: string, decision: "approved" | "rejected", signature: string, now: string): Promise<void> {
     await this.database.prepare("INSERT INTO tinkerbot_approvals (approval_id, work_order_id, actor, decision, signature, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(crypto.randomUUID(), workOrderId, actor, decision, signature, now).run();
+    const order = await this.getWorkOrder(workOrderId);
+    if (order) await this.appendFactoryEvent({
+      eventId: `approval_${workOrderId}_${decision}_${signature}`,
+      type: "approval.recorded",
+      aggregateId: workOrderId,
+      aggregateType: "work_order",
+      organizationId: order.organizationId,
+      factoryId: order.factoryId,
+      actorId: actor,
+      actorType: "human",
+      occurredAt: now,
+      correlationId: workOrderId,
+      schemaVersion: 1,
+      policyVersion: order.policyVersion,
+      provenance: "HUMAN_VERIFIED",
+      payload: { decision, workOrderId, signature },
+    });
   }
 
   async hasSpecApproval(workOrderId: string): Promise<boolean> {

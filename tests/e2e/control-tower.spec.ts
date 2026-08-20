@@ -85,10 +85,10 @@ async function mockControlPlane(page: Page, options: { signedIn?: boolean; evolu
 test("signed-out marketing is not the control tower", async ({ page }) => {
   await mockControlPlane(page, { signedIn: false });
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "Tinkerbot Factory OS" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Software production, under control." })).toBeVisible();
   await expect(page.getByRole("link", { name: "Log in" }).first()).toBeVisible();
   await expect(page.locator(".sidebar")).toHaveCount(0);
-  await expect(page.getByRole("heading", { name: "Inbox" })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Factory floor" })).toHaveCount(0);
   await expect(page.getByText("Triage")).toHaveCount(0);
   await expect(page.getByText("Planning")).toHaveCount(0);
   await expect(page.getByText("Building")).toHaveCount(0);
@@ -105,20 +105,21 @@ test("login is a dedicated auth screen, not the homepage", async ({ page }) => {
   await expect(page.locator(".sidebar")).toHaveCount(0);
 });
 
-test("signed-in inbox is exception-first, not a kanban", async ({ page }) => {
+test("signed-in factory floor is operational, not a kanban", async ({ page }) => {
   await mockControlPlane(page);
   await page.goto("/app/overview");
   await expect(page).toHaveURL(/\/app$/);
-  await expect(page.getByRole("heading", { name: "Inbox" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Needs attention" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "In progress" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Waiting for approval" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Factory floor" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Blocked" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Recently completed" })).toBeVisible();
-  await expect(page.getByText("Verification failed on auth")).toBeVisible();
-  await expect(page.getByText("security")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "In progress" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Awaiting review" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Recently released" })).toBeVisible();
+  await expect(page.getByText("Verification failed on auth").first()).toBeVisible();
+  await expect(page.getByText("security", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Triage")).toHaveCount(0);
-  await expect(page.getByRole("link", { name: "Inbox" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "View all work orders" })).toBeVisible();
+  await expect(page.locator('a[href="/app/runs"]')).toBeVisible();
+  await expect(page.getByRole("link", { name: "MCPs and apps" })).toBeVisible();
   await expect(page.getByRole("link", { name: "Start trial" })).toHaveCount(0);
   await expect(page.locator(".marketing-header")).toHaveCount(0);
 });
@@ -126,15 +127,15 @@ test("signed-in inbox is exception-first, not a kanban", async ({ page }) => {
 test("work-order detail is list plus detail and keeps steer off the home view", async ({ page }) => {
   const posts = await mockControlPlane(page);
   await page.goto("/app");
-  await expect(page.getByRole("heading", { name: "Inbox" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Factory floor" })).toBeVisible();
   await expect(page.getByPlaceholder("Steer the Foreman")).toHaveCount(0);
   await page.goto("/app/work-orders/wo-attention");
   await expect(page).toHaveURL(/\/app\/work\/wo-attention$/);
   await expect(page.locator(".work-split")).toBeVisible();
-  await expect(page.getByText("Producing: pr.")).toBeVisible();
-  await expect(page.getByText("line security")).toBeVisible();
-  await expect(page.getByText("Blocking:")).toBeVisible();
-  await expect(page.getByText("Next:")).toBeVisible();
+  await expect(page.locator(".detail-inline-meta")).toContainText("Producing: pr");
+  await expect(page.locator(".entity-meta")).toContainText("acme/payments");
+  await expect(page.locator(".detail-inline-meta")).toContainText("Blocking:");
+  await expect(page.locator(".detail-inline-meta")).toContainText("Next:");
   await expect(page.getByPlaceholder("Steer the Foreman")).toBeVisible();
   await page.getByRole("button", { name: "Take cell" }).click();
   await page.getByRole("button", { name: "Return cell" }).click();
@@ -145,16 +146,16 @@ test("work-order detail is list plus detail and keeps steer off the home view", 
   await expect.poll(() => posts.some((item) => item.path.endsWith("/approve") && item.method === "POST")).toBe(true);
 });
 
-test("factory activity uses Warp stage names without turning Inbox into a kanban", async ({ page }) => {
+test("factory activity uses Warp stage names without turning the floor into a kanban", async ({ page }) => {
   await mockControlPlane(page);
   await page.goto("/app");
-  await expect(page.getByRole("heading", { name: "Inbox" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Factory floor" })).toBeVisible();
   await expect(page.getByText("Triage")).toHaveCount(0);
   await page.goto("/app/factories/fac_1/activity");
   await expect(page.getByRole("heading", { name: "Triage" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Planning" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Building" })).toBeVisible();
-  await expect(page.getByRole("link", { name: "Activity" })).toBeVisible();
+  await expect(page.getByLabel("Primary navigation").getByRole("link", { name: "Activity", exact: true })).toBeVisible();
   await page.goto("/app/factories/fac_1/scorers");
   await expect(page.getByText("cannot upgrade verdict")).toBeVisible();
   await page.goto("/app/factories/fac_1/self-improvement");
@@ -203,12 +204,12 @@ test("factory wizard and settings destinations stay honest", async ({ page }) =>
   await expect(page.getByText("Export failure does not change")).toBeVisible();
 });
 
-test("command palette opens factory wizard from the inbox", async ({ page }) => {
+test("command palette opens the factory wizard from the floor", async ({ page }) => {
   await mockControlPlane(page);
   await page.goto("/app");
   await page.keyboard.press("Control+k");
   await expect(page.getByRole("dialog", { name: "Command menu" })).toBeVisible();
-  await page.getByPlaceholder("Go to inbox").fill("new factory");
+  await page.getByPlaceholder("Go to factory floor, work, settings…").fill("new factory");
   await page.getByRole("link", { name: "New factory" }).click();
   await expect(page).toHaveURL(/\/app\/factories\/new/);
   await expect(page.locator(".breadcrumbs strong")).toHaveText("New factory");

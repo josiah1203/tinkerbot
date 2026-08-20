@@ -594,14 +594,16 @@ describe("factory operating system", () => {
 });
 
 describe("Warp v1alpha1 factory definition", () => {
-  test("parses owner/name repositories, alias, agentDefaults, and rejects third-party harnesses", () => {
+  test("parses owner/name repositories, alias, agentDefaults, and declares third-party harnesses safely", () => {
     const definition = parseFactoryDefinition(fs.readFileSync(path.join(process.cwd(), "fixtures/factory/v1alpha1/.tinkerbot/factory.yaml"), "utf8"));
     expect(definition.schemaVersion).toBe("v1alpha1");
     expect(definition.alias).toBe("payments");
     expect(definition.repositories).toEqual(["acme/payments-service"]);
     expect(definition.integrations.map((item) => item.type)).toEqual(["slack", "linear"]);
     expect(definition.stages.some((stage) => stage.id === "verification")).toBe(true);
-    expect(() => parseFactoryDefinition("schemaVersion: v1alpha1\nname: bad\nrepositories:\n  - owner: acme\n    name: pay\nagentDefaults:\n  harness:\n    type: claude\n    model: x\n")).toThrow(/harness/);
+    const external = parseFactoryDefinition("schemaVersion: v1alpha1\nname: bad\nrepositories:\n  - owner: acme\n    name: pay\nagentDefaults:\n  harness:\n    type: claude\n    model: x\n");
+    expect(external.agentDefaults?.harness).toBe("claude");
+    expect(external.harnesses.claude).toMatchObject({ id: "claude", command: "claude", protocol: "stdio-json" });
     expect(() => parseFactoryDefinition("schemaVersion: v1alpha1\nname: bad\nrepositories: [acme/pay]\nagentDefaults:\n  model: auto\n  harness:\n    type: oz\n")).toThrow(/both model and harness/);
     expect(() => parseFactoryDefinition("schemaVersion: v1alpha1\nname: dual\nrepositories: [acme/pay]\nintegrations:\n  - type: linear\n  - type: jira\nagentDefaults:\n  model: auto\n")).toThrow(/Linear or Jira/);
   });
@@ -616,7 +618,7 @@ describe("Warp v1alpha1 factory definition", () => {
     expect(loaded.definition.sources.some((source) => source.type === "github_issue")).toBe(true);
   });
 
-  test("automation filters, GitLab rejection, and macOS runners fail closed", () => {
+  test("automation filters, GitLab rejection, and cross-platform self-hosted runners fail closed", () => {
     const automation = parseAutomationFile("labeled-issue", "---\nagent: foreman\ntriggers:\n  - provider: github\n    event: issue_labeled\n    filter:\n      repos: [acme/payments-service]\n      labels: [factory-ready]\n---\nTriage the issue.\n");
     expect(automationMatches(automation, { provider: "github", event: "issue_labeled", repo: "acme/payments-service", labels: ["factory-ready"] })).toBe(true);
     expect(automationMatches(automation, { provider: "github", event: "issue_labeled", repo: "acme/other", labels: ["factory-ready"] })).toBe(false);
@@ -624,7 +626,7 @@ describe("Warp v1alpha1 factory definition", () => {
     expect(() => parseAutomationFile("gl", "---\ntriggers:\n  - provider: gitlab\n    event: Pipeline Hook\n---\nx\n")).toThrow(/privileged/);
     const gitlabMr = parseAutomationFile("gl-mr", "---\ntriggers:\n  - provider: gitlab\n    event: merge_request\n---\nx\n");
     expect(gitlabMr.triggers[0]?.provider).toBe("gitlab");
-    expect(() => parseRunnerYaml("mac", "platform:\n  os: macos\n")).toThrow(/linux/);
+    expect(parseRunnerYaml("mac", "platform:\n  os: macos\n")).toMatchObject({ name: "mac", platformOs: "macos", image: "macos" });
     const agent = parseAgentFile("foreman", "---\nagentType: MAIN\nmodel: auto\n---\nRoute work.\n");
     expect(agent.agentType).toBe("FOREMAN");
     expect(() => parseAgentFile("x", "---\nagentType: FOREMAN\nmodel: auto\nharness: tinkerbot-sandbox\n---\nnope\n")).toThrow(/both model and harness/);
@@ -649,9 +651,9 @@ describe("Warp v1alpha1 factory definition", () => {
     expect(parseRepositories(null)).toEqual([]);
     expect(assertAllowedHarness("workers-ai", "test")).toBe("default");
     expect(assertAllowedHarness(undefined, "test")).toBeUndefined();
-    expect(() => assertAllowedHarness("claude", "test")).toThrow(/not supported/);
-    expect(() => assertAllowedHarness({ type: "codex" }, "test")).toThrow(/not supported/);
-    expect(() => assertAllowedHarness({ type: "unknown" }, "test")).toThrow(/invalid/);
+    expect(assertAllowedHarness("claude", "test")).toBe("claude");
+    expect(assertAllowedHarness({ type: "codex" }, "test")).toBe("codex");
+    expect(assertAllowedHarness({ type: "unknown" }, "test")).toBe("unknown");
     expect(() => assertAllowedHarness(12, "test")).toThrow(/invalid/);
     expect(() => parseAgentType("nope")).toThrow(/agentType/);
     expect(parseAgentFile("docs", "No frontmatter here.").agentType).toBe("CUSTOM");
@@ -670,6 +672,7 @@ describe("Warp v1alpha1 factory definition", () => {
     expect(sourceTypeFromTrigger(slack.triggers[6]!)).toBe("github_pull_request");
     expect(sourceTypeFromTrigger(slack.triggers[7]!)).toBeUndefined();
     expect(parseRunnerYaml("plain", "image: cloudflare/sandbox:next\nsetupCommands: [corepack enable]\n").image).toBe("cloudflare/sandbox:next");
+    expect(() => parseRunnerYaml("unsafe-image", "image: '$(evil)'\n")).toThrow(/safe container image/);
     expect(() => parseRunnerYaml("list", "- not a mapping\n")).toThrow(/mapping/);
     expect(() => parseFactorySchemaVersion({ version: 2 })).toThrow(/Unsupported/);
     expect(parseIntegrations("slack")).toEqual([]);

@@ -127,6 +127,8 @@ export function localDashboardPayload(root: string): LocalRuntimeView {
 export async function executeLocalRun(root: string, input: {
   profile?: string;
   allowProcessRunner?: boolean;
+  allowExternalHarness?: boolean;
+  receiptSigningKeyRef?: string;
   text?: string;
   postSync?: (kind: string, payload: Record<string, unknown>) => Promise<{ ok: boolean }>;
   warn?: (message: string) => void;
@@ -154,6 +156,8 @@ export async function executeLocalRun(root: string, input: {
     actor: "local-human",
     untrustedText: input.text ?? "local run",
     verificationVerdict: "UNKNOWN",
+    allowExternalHarness: input.allowExternalHarness,
+    receiptSigningKeyRef: input.receiptSigningKeyRef ?? process.env.TINKERBOT_RECEIPT_SIGNING_KEY_REF,
     postSync: input.postSync,
   });
   if (input.postSync && loaded.definition.runtime.sync !== "offline") {

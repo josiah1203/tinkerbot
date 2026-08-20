@@ -89,6 +89,7 @@ export type Intent =
   | { type: "plan" }
   | { type: "cost" }
   | { type: "eval" }
+  | { type: "graph"; id: string }
   | { type: "clear" }
   | { type: "help" }
   | { type: "exit" }

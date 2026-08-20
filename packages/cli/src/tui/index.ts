@@ -36,6 +36,7 @@ export interface TuiDeps {
   reportExitCode: (report: PrProofReport) => number;
   openDashboard: () => number;
   localRuntime?: () => { plan: string; cost: string; eval: string };
+  localGraph?: (id: string) => string;
   fetchWork?: (id: string) => HostedWorkView;
   fetchWorkAsync?: (id: string) => Promise<HostedWorkView>;
   workAction?: (id: string, action: "steer" | "take" | "return" | "approve", note?: string) => { ok: boolean; message: string };
@@ -49,7 +50,7 @@ export interface TuiDeps {
 
 export const TUI_HELP = `Usage: tb tui [check|work <id>] [--agent claude|gemini|codex|cursor|shell] [options]
 
-Master terminal (OpenTUI-style tabs) on a real TTY: pnpm tb tui or pnpm tui
+Interactive TTY (Claude Code-style kit shell) on a real TTY: pnpm tb tui or pnpm tui
 Nested CLIs (claude, gemini, codex, cursor, shell) use their own OAuth. Tinkerbot never stores vendor tokens.
 Non-interactive: tb tui --once runs one Node check transcript (CI / non-TTY).
 
@@ -61,10 +62,10 @@ Non-interactive: tb tui --once runs one Node check transcript (CI / non-TTY).
   --mutation-enabled BOOL
   --help                 show this help
 
-Master slash: /check /work /claude /gemini /codex /cursor /shell /tab /factory list|show /dashboard /help /exit
-Forbidden on the master: /merge /pass /fail /approve-verdict
-Leader ctrl-g leaves a nested PTY. A raw nested terminal can still run gh pr merge if you could; Tinkerbot will not merge for it.
-Node --once slash: /check /impact /select-tests /work /steer /take /return /approve /dashboard /help /exit
+Slash palette: /check /work /graph /claude /gemini /codex /cursor /shell /tab /factory list|show /dashboard /help /exit
+Forbidden in the session: /merge /pass /fail /approve-verdict
+Use /tab next|prev|close to switch the underlying tabs. A raw nested terminal can still run gh pr merge if you could; Tinkerbot will not merge for it.
+Node --once slash: /check /impact /select-tests /work /graph /steer /take /return /approve /dashboard /help /exit
 `;
 
 export function isInteractiveTty(stdout: { isTTY?: boolean }, stdin: { isTTY?: boolean }, env: NodeJS.ProcessEnv): boolean {
@@ -111,6 +112,8 @@ function applyWorkView(session: Session, id: string, view: HostedWorkView): Sess
     current = applyStageEvent(current, { type: "stage_end", id: tool.id, status: tool.status === "running" ? "running" : "done", summary: tool.result, feedsVerdict: false });
   }
   const verification = hostedVerificationFromView(view);
+  const graph = view.graph;
+  if (graph) current = appendAssistant(current, `Factory Graph: verification=${graph.verificationVerdict ?? "UNKNOWN"}, review=${graph.reviewDecision ?? "NOT_REVIEWED"}, release=${graph.releaseDecision ?? "NOT_RELEASED"}, outcome=${graph.outcomeStatus ?? "UNMEASURED"}/${graph.outcomeMaturity ?? "IMMATURE"}. Events=${graph.eventCount ?? view.events?.length ?? 0}.`);
   return setVerdict(current, verification.verdict, verification.detail);
 }
 
@@ -131,6 +134,7 @@ function applyWorkAction(session: Session, deps: TuiDeps, intent: Extract<Intent
 }
 
 function applyLocalRuntimeIntent(session: Session, intent: Intent, deps: TuiDeps): Session | undefined {
+  if (intent.type === "graph") return appendAssistant(session, deps.localGraph?.(intent.id) ?? "Local graph inspection is unavailable in this session.");
   if (intent.type !== "plan" && intent.type !== "cost" && intent.type !== "eval") return undefined;
   const view = deps.localRuntime?.();
   const text = intent.type === "plan" ? view?.plan : intent.type === "cost" ? view?.cost : view?.eval;

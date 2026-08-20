@@ -24,7 +24,7 @@ import { admitWebhook, githubEventKind, githubInstallationAccount, inlineReviewC
 import { admitGitlabWebhook } from "../../../packages/gitlab/src";
 import { D1FactoryStore } from "./factory-store";
 import { ForemanDurableObject, Sandbox, handleFactoryMcpRequest, intakeFromIntegration, runFactoryTurn, classifyWorkOrderGroup, githubSecurityIntake, sweepFactoryOs } from "./factory-runtime";
-import { createWorkOrder, verifyOidcJwt, oidcReplayKey, containsRawCredentials, customerProviderLabel, dispatchTinkerGateway, githubTinkerMention, sameActorApprovalBlocked } from "../../../packages/factory/src";
+import { calculateFactoryEconomics, createWorkOrder, projectFactoryEvents, verifyOidcJwt, oidcReplayKey, containsRawCredentials, customerProviderLabel, dispatchTinkerGateway, githubTinkerMention, sameActorApprovalBlocked } from "../../../packages/factory/src";
 import { translateLegacyVerdict } from "../../../packages/core/src/verdict";
 import { createChangeSet, assessChangeSet, assessReleaseSafety, createReleaseManifest } from "../../../packages/assurance/src";
 import { calculateEntitlements, type EntitlementKey } from "../../../packages/control-plane/src";
@@ -70,6 +70,7 @@ interface Env extends Record<string, unknown> {
   EVIDENCE_BUCKET?: { put(key: string, value: string, options?: { httpMetadata?: { contentType?: string } }): Promise<unknown>; get(key: string): Promise<{ text(): Promise<string> } | null>; delete(key: string): Promise<void> };
   AI?: { run(model: string, input: { messages: Array<{ role: string; content: string }> }, options?: { gateway?: { id: string; collectLog?: boolean; metadata?: Record<string, string> } }): Promise<{ response?: string }> };
   FACTORY_EVENTS?: { send(body: unknown): Promise<void> };
+  SELF_HOSTED_WORK?: { send(body: unknown): Promise<void> };
   ASSETS?: { fetch(request: Request): Promise<Response> };
   FOREMAN?: { idFromName(name: string): unknown; get(id: unknown): { fetch(input: Request): Promise<Response> } };
   FACTORY_RUN?: { create(options: { id: string; params: unknown }): Promise<unknown> };
@@ -642,6 +643,7 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     return json({ authorized: true, installations: rows });
   }
   const factoryMatch = url.pathname.match(/^\/factories(?:\/([^/]+))?$/);
+  const workGraphMatch = url.pathname.match(/^\/work-orders\/([^/]+)\/graph$/);
   const workMatch = url.pathname.match(/^\/work-orders(?:\/([^/]+))?(?:\/(retry|approve|cancel|steer|take|return))?$/);
   const runMatch = url.pathname.match(/^\/runs\/([^/]+)(?:\/(events))?$/);
   if (url.pathname === "/usage" && request.method === "GET") {
@@ -658,6 +660,22 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     const kind = typeof body.kind === "string" ? body.kind : "factory-run";
     const ingested = await factories.ingestLocalRuntimePayload({ organizationId: access.membership.organizationId, kind, payload: body, now: new Date().toISOString() });
     return json({ ...ingested, origin: "local", identity: "hosted-session" });
+  }
+  if (workGraphMatch && request.method === "GET") {
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
+    if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
+    let workOrderId: string;
+    try { workOrderId = decodeURIComponent(workGraphMatch[1]); } catch { return json({ error: "Work-order identifier is malformed.", code: "invalid_request" }, 400); }
+    const order = await factories.getWorkOrder(workOrderId);
+    if (!order || order.organizationId !== access.membership.organizationId) return json({ error: "Work order not found.", code: "not_found" }, 404);
+    const events = await factories.listFactoryEvents(workOrderId, access.membership.organizationId);
+    return json({
+      workOrder: { ...order, group: classifyWorkOrderGroup(order.status) },
+      graph: projectFactoryEvents(events),
+      economics: calculateFactoryEconomics(events),
+      events,
+      sourceOfTruth: "append_only_factory_graph",
+    });
   }
   if (factoryMatch && (request.method === "GET" || request.method === "POST" || request.method === "PATCH")) {
     if (request.method !== "GET" && !originAllowed(request, env)) return json({ error: "Cross-origin factory mutation rejected.", code: "csrf_origin_rejected" }, 403);

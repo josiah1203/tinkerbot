@@ -29,6 +29,7 @@ test("master slash rejects merge and pass and opens agent tabs", () => {
   expect(parseMasterIntent("/plan")).toEqual({ type: "plan" });
   expect(parseMasterIntent("/cost")).toEqual({ type: "cost" });
   expect(parseMasterIntent("/eval")).toEqual({ type: "eval" });
+  expect(parseMasterIntent("/graph wo_1")).toEqual({ type: "graph", id: "wo_1" });
   expect(parseMasterIntent("/factory show fac_1")).toEqual({ type: "factory", sub: "show", id: "fac_1" });
   expect(parseMasterIntent("/tab close")).toEqual({ type: "tab-close" });
   expect(parseMasterIntent("/tab nope")).toMatchObject({ type: "reject" });
@@ -38,6 +39,8 @@ test("master slash rejects merge and pass and opens agent tabs", () => {
   expect(parseMasterIntent("@tinker status")).toMatchObject({ type: "reject", reason: expect.stringMatching(/GitHub|Slack/) });
   const withWork = applyMasterIntent(state, { type: "work", id: "wo_1" });
   expect(withWork.tabs.some((tab) => tab.kind === "work")).toBe(true);
+  const withGraph = applyMasterIntent(withWork, { type: "graph", id: "wo_1" });
+  expect(withGraph.tabs.some((tab) => tab.kind === "graph")).toBe(true);
   expect(applyMasterIntent(withWork, { type: "work", id: "wo_1" }).active).toBe(withWork.active);
   const withAgent = applyMasterIntent(withWork, { type: "open-agent", id: "claude" });
   expect(renderTabStrip(withAgent)).toContain("claude");
@@ -52,6 +55,7 @@ test("master slash rejects merge and pass and opens agent tabs", () => {
   expect(applyMasterIntent(withAgent, { type: "reject", command: "/merge", reason: "no" }).status).toBe("no");
   expect(renderTabBody(state)).toContain("Check tab");
   expect(renderTabBody(withWork)).toContain("Work wo_1");
+  expect(renderTabBody(withGraph)).toContain("Graph wo_1");
   expect(renderTabBody(withAgent)).toContain("nested agentic terminal");
   expect(MASTER_HELP).toContain("pnpm tb tui");
   expect(tuiRejectsTinkerMention("@tinker hi")).toBe(true);
@@ -111,6 +115,10 @@ test("PTY spawn is mockable and runMasterTui seeds work and agent tabs", () => {
     ...deps(),
     localRuntime: () => ({ plan: "Plan from sqlite", cost: "cost", eval: "eval" }),
   }).state.planLog).toContain("Plan from sqlite");
+  expect(processMasterCommand(result.state, "/graph wo_2", {
+    ...deps(),
+    localGraph: (id) => `graph ${id}`,
+  }).state.graphLog).toBe("graph wo_2");
   expect(processMasterCommand(result.state, "/dashboard", deps()).dashboard).toBe(true);
   expect(processMasterCommand(result.state, "/claude", deps()).spawn).toBe("claude");
   expect(processMasterCommand(result.state, "/factory list", deps()).state.status).toContain("factory list");

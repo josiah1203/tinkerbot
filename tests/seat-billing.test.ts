@@ -1,6 +1,6 @@
 import { expect, test } from "vitest";
 import { calculateEntitlements, containsPaidCapField, modelForCostClass } from "../packages/control-plane/src";
-import { parseStripePlans } from "../packages/hosted-integrations/src";
+import { parseStripePlans, validateStripePlans } from "../packages/hosted-integrations/src";
 import { entitlementDenied, productionCatalogUnavailable, stripeStatus } from "../apps/control-plane-worker/src/billing";
 
 test("Stripe plan JSON rejects paid-cap fields and unknown plan ids", () => {
@@ -10,6 +10,23 @@ test("Stripe plan JSON rejects paid-cap fields and unknown plan ids", () => {
   expect(parseStripePlans(JSON.stringify([{ id: "enterprise", monthlyPriceId: "price_ent" }]))).toEqual([]);
   expect(containsPaidCapField({ memberLimit: 1 })).toBe(true);
   expect(containsPaidCapField({ monthlyPriceId: "price_x" })).toBe(false);
+});
+
+test("Stripe catalog validation rejects placeholders, duplicate prices, and incomplete production catalogs", () => {
+  expect(parseStripePlans(JSON.stringify([{ id: "developer", monthlyPriceId: "price_REPLACE_DEVELOPER_MONTHLY" }]))).toEqual([]);
+  expect(validateStripePlans(JSON.stringify([
+    { id: "developer", monthlyPriceId: "price_dev", annualPriceId: "price_devy", catalogVersion: "seat-v1" },
+    { id: "team", monthlyPriceId: "price_team", annualPriceId: "price_teamy", catalogVersion: "seat-v1" },
+    { id: "business", monthlyPriceId: "price_biz", annualPriceId: "price_bizy", catalogVersion: "seat-v1" },
+  ]), { requireAllPlans: true, requireAnnualPrices: true })).toMatchObject({ valid: true });
+  expect(validateStripePlans(JSON.stringify([
+    { id: "developer", monthlyPriceId: "price_dev", annualPriceId: "price_devy", catalogVersion: "seat-v1" },
+    { id: "team", monthlyPriceId: "price_dev", annualPriceId: "price_teamy", catalogVersion: "seat-v1" },
+    { id: "business", monthlyPriceId: "price_biz", annualPriceId: "price_bizy", catalogVersion: "seat-v2" },
+  ]), { requireAllPlans: true, requireAnnualPrices: true })).toMatchObject({ valid: false });
+  expect(validateStripePlans(JSON.stringify([
+    { id: "developer", monthlyPriceId: "price_dev", annualPriceId: "price_devy", catalogVersion: "seat-v1", metadata: "must-not-ship" },
+  ]), { requireAllPlans: true, requireAnnualPrices: true }).errors).toEqual(expect.arrayContaining([expect.stringContaining("unsupported field")]));
 });
 
 test("invoice.paid does not wipe a Tinkerbot trial, and production catalog fails closed", () => {

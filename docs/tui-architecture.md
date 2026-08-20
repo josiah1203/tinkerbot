@@ -4,4 +4,4 @@ The interactive master terminal lives in `packages/tui`. It is not imported by `
 
 `tb tui --once` stays in `packages/cli/src/tui/` so CI and non-TTY coverage remain on the Node engine. OpenTUI-style chrome is excluded from the CLI coverage ratchet (`packages/tui/**`).
 
-Master chrome is a tab strip (Check, Work, nested agent, Shell), body, and status bar. Nested `claude` / `gemini` / `codex` / `cursor` / `$SHELL` processes inherit stdio and keep vendor OAuth in the child. Leader `ctrl-g` then `n`/`p`/`w` changes tabs after the child exits.
+The interactive chrome is a compact kit shell: branded header, slash suggestions, editable prompt, transcript projections, and model/cost footer. The underlying state still contains Check, Work, nested agent, and Shell tabs, which are exposed through `/tab next|prev|close`. Nested `claude` / `gemini` / `codex` / `cursor` / `$SHELL` processes keep vendor OAuth in the child.

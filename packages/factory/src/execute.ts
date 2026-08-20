@@ -11,6 +11,7 @@ import { hostedRuntimeDefaults, type ExecutionPlan } from "./runtime";
 import { buildExecutionPlan } from "./planner";
 import { mayUseInlineSelfReview } from "./approval";
 import type { FactoryStore } from "./store";
+import type { FactoryEvent } from "./graph";
 import type { InferenceProvider } from "./inference";
 import { factoryAiFromProvider } from "./inference";
 import type { FactoryAi, FactoryDefinition, FactoryRunStepResult, FactoryStageId, WorkOrder, WorkOrderState } from "./index";
@@ -29,12 +30,13 @@ export async function executeFactoryRun(input: {
   reviewRequestsRevision?: boolean;
   workOrderId?: string;
   factoryId?: string;
+  organizationId?: string;
   paths?: string[];
   diffs?: { paths: string[]; changedFileCount: number; changedLines: number };
   impactUnknown?: boolean;
   testIntegrityUnknown?: boolean;
   priorFailures?: number;
-  store?: Pick<FactoryStore, "putExecutionPlan" | "putCostEstimate" | "putCostActual">;
+  store?: Pick<FactoryStore, "putExecutionPlan" | "putCostEstimate" | "putCostActual"> & Partial<Pick<FactoryStore, "appendFactoryEvent">>;
   actorKind?: "human" | "agent";
 }): Promise<{ stages: FactoryRunStepResult[]; terminal: WorkOrderState; wait?: FactoryWait; lineId?: ProductionLineId; autonomyMode?: AutonomyMode; plan?: ExecutionPlan; escalated?: boolean }> {
   const { runForeman, runTriageAgent, runSpecificationAgent, runReviewAgent, verificationAuthority, sanitizeUntrustedPromptInput } = await import("./index");
@@ -60,6 +62,31 @@ export async function executeFactoryRun(input: {
   const { plan, decision, autonomyMode, lineId } = built;
   const estimatedTokens = plan.cost.estimatedInputTokens + plan.cost.estimatedOutputTokens;
   const estimatedCents = plan.cost.byokSpendCents + plan.cost.managedCogsCents;
+  let eventSequence = 0;
+  const appendGraph = async (
+    type: FactoryEvent["type"],
+    payload: Record<string, unknown>,
+    overrides: Partial<Pick<FactoryEvent, "actorId" | "actorType" | "provenance">> = {},
+  ): Promise<void> => {
+    if (!input.workOrderId || !input.store?.appendFactoryEvent) return;
+    const eventId = `${plan.planId}:${eventSequence++}:${type}`;
+    await input.store.appendFactoryEvent({
+      eventId,
+      type,
+      aggregateId: input.workOrderId,
+      aggregateType: "work_order",
+      organizationId: input.organizationId ?? "local",
+      factoryId: input.factoryId ?? "local-factory",
+      actorId: overrides.actorId ?? (input.actorKind === "human" ? "local-human" : "factory-orchestrator"),
+      actorType: overrides.actorType ?? "system",
+      occurredAt: new Date().toISOString(),
+      correlationId: plan.planId,
+      schemaVersion: 1,
+      policyVersion: "default",
+      provenance: overrides.provenance ?? "ATTESTED",
+      payload: { ...payload, planId: plan.planId },
+    });
+  };
   const overBudget = input.definition.budgets.tokens <= 0
     || input.definition.budgets.usdCents <= 0
     || estimatedTokens > input.definition.budgets.tokens
@@ -68,11 +95,22 @@ export async function executeFactoryRun(input: {
     await input.store.putExecutionPlan(plan);
     await input.store.putCostEstimate(plan.planId, plan.cost);
   }
+  await appendGraph("task.decomposed", { planId: plan.planId, selectedPipeline: plan.selectedPipeline, stages: plan.stages.map((stage) => stage.id), skip: plan.skip });
+  if (estimatedCents > 0) await appendGraph("cost.recorded", { costCents: estimatedCents, category: "cogs", planId: plan.planId });
   const product = resolveProduct(input.definition, input.definition.repositories[0] ?? "unknown/unknown");
   const skip = plan.skip.filter((stage) => stage !== "verification" && autonomyAllowsSkip(autonomyMode ?? "approval_gated", stage as FactoryStageId));
   const planned = runForeman(input.definition, input.sourceType, skip as FactoryStageId[], lineId);
   if (!planned.length) return { stages: [{ stage: "foreman", status: "skipped", summary: "Source is not enabled for this factory." }], terminal: "cancelled", lineId, autonomyMode, plan };
   if (product.blocked) return { stages: [{ stage: "foreman", status: "blocked", summary: product.action ?? "map repository to product" }], terminal: "blocked", lineId, autonomyMode, plan };
+  if (planned.includes("verification")) {
+    await appendGraph("verification.started", { verdict: input.verificationVerdict ?? "UNKNOWN" });
+    if ((input.verificationVerdict === "PASS" || input.verificationVerdict === "FAIL") && (input.verificationIngested ?? true)) {
+      await appendGraph("verification.completed", { verdict: input.verificationVerdict }, { actorId: "deterministic-verifier", actorType: "system", provenance: "DETERMINISTICALLY_VERIFIED" });
+    }
+  }
+  if (planned.includes("review")) await appendGraph("review.requested", { requiredReviewer: "independent-human-or-agent" });
+  if (planned.includes("release")) await appendGraph("release.requested", { authority: "human" });
+  if (planned.includes("outcome")) await appendGraph("outcome.measurement_started", { maturity: "IMMATURE" });
   const ai = input.inference ? factoryAiFromProvider(input.inference) : input.ai;
   const inline = mayUseInlineSelfReview({ approval: profile.approval, autonomyMode, lineId, actorKind: input.actorKind ?? "agent" });
   const specApproved = Boolean(input.specApproved || inline.allowed);
@@ -87,7 +125,7 @@ export async function executeFactoryRun(input: {
       plan.escalated = true;
       plan.escalationReason = composite.escalateReason;
       if (input.store) await input.store.putExecutionPlan(plan);
-    } else {
+    } else if (!planned.includes("implementation") || input.sandboxComplete) {
       return completeFactoryStages(stages, { definition: input.definition, verificationVerdict: input.verificationVerdict, verificationIngested: input.verificationIngested }, planned, autonomyMode, lineId, plan, false);
     }
   } else {

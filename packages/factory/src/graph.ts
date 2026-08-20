@@ -52,6 +52,8 @@ export interface AutonomyProfile { autonomyProfileId: string; workerId?: string;
 export interface CapacitySnapshot { capacitySnapshotId: string; factoryId: string; subjectId: string; band: CapacityBand; attentionDebt: number; }
 export interface CostEvent { costEventId: string; workOrderId?: string; category: "cogs" | "prevention" | "appraisal" | "internal_failure" | "external_failure"; costCents: number; }
 export interface QualityEvent { qualityEventId: string; workOrderId: string; kind: "rework" | "rollback" | "defect_escape" | "first_pass"; }
+export interface IntegrationConnection { integrationConnectionId: string; organizationId: string; factoryId: string; provider: ExternalReference["provider"]; status: "active" | "paused" | "revoked"; secretRef?: string; createdAt: string; updatedAt: string; }
+export interface AuditEvent { auditEventId: string; organizationId: string; factoryId: string; actorId: string; action: string; aggregateId?: string; correlationId: string; occurredAt: string; provenance: ClaimStatus; }
 
 export interface IntentContract {
   intentId: string; mode: IntentMode; title: string; why: string; expectedBehavior: string;

@@ -85,22 +85,33 @@ function parsePlans() {
     throw new Error("STRIPE_PLANS_JSON is not valid JSON.");
   }
   if (!Array.isArray(value) || value.length === 0) throw new Error("STRIPE_PLANS_JSON must contain at least one plan.");
+  if (value.length !== 3) throw new Error("STRIPE_PLANS_JSON must contain exactly developer, team, and business plans.");
+  const ids = new Set();
+  const priceIds = new Set();
+  const versions = new Set();
   const prices = [];
+  const allowedFields = new Set(["id", "monthlyPriceId", "annualPriceId", "catalogVersion"]);
   for (const plan of value) {
     if (!plan || typeof plan !== "object" || typeof plan.id !== "string" || !plan.id) throw new Error("Every Stripe plan must have an id.");
+    for (const key of Object.keys(plan)) if (!allowedFields.has(key)) throw new Error(`Stripe plan ${plan.id} contains unsupported field ${key}.`);
     for (const key of ["memberLimit", "seatLimit", "privateRepositoryLimit", "repositoryLimit", "additionalRepositoryPrice", "perRepositoryPrice", "perRunPrice", "perTokenPrice", "factoryLimit"]) {
       if (Object.prototype.hasOwnProperty.call(plan, key)) throw new Error(`Stripe plan ${plan.id} must not include ${key}. Seat-only catalogs omit paid caps.`);
     }
     if (!["developer", "team", "business"].includes(plan.id)) throw new Error(`Stripe plan ${plan.id} is not in the seat catalog.`);
+    if (ids.has(plan.id)) throw new Error(`Duplicate Stripe plan ${plan.id}.`);
+    ids.add(plan.id);
+    if (typeof plan.catalogVersion !== "string" || !/^[A-Za-z0-9._-]{1,80}$/.test(plan.catalogVersion)) throw new Error(`Stripe plan ${plan.id} has an invalid catalogVersion.`);
+    versions.add(plan.catalogVersion);
     for (const key of ["monthlyPriceId", "annualPriceId"]) {
-      if (plan[key] !== undefined) {
-        if (typeof plan[key] !== "string" || !plan[key] || String(plan[key]).includes("REPLACE")) throw new Error(`Stripe plan ${plan.id} has an invalid ${key}.`);
-        prices.push({ planId: plan.id, priceId: plan[key] });
-      }
+      if (typeof plan[key] !== "string" || !/^price_[A-Za-z0-9]+$/.test(plan[key]) || String(plan[key]).includes("REPLACE")) throw new Error(`Stripe plan ${plan.id} has an invalid ${key}.`);
+      if (priceIds.has(plan[key])) throw new Error(`Stripe price ${plan[key]} is reused.`);
+      priceIds.add(plan[key]);
+      prices.push({ planId: plan.id, priceId: plan[key] });
     }
-    if (typeof plan.monthlyPriceId !== "string" || !plan.monthlyPriceId) throw new Error(`Stripe plan ${plan.id} is missing monthlyPriceId.`);
   }
-  return { planCount: value.length, prices };
+  if (versions.size !== 1) throw new Error("Stripe plans must share one catalogVersion.");
+  for (const id of ["developer", "team", "business"]) if (!ids.has(id)) throw new Error(`Stripe catalog is missing ${id}.`);
+  return { planCount: value.length, prices, catalogVersion: [...versions][0] };
 }
 
 async function run() {

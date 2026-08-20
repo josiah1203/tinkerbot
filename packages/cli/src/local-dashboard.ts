@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import { calculateFactoryEconomics, projectFactoryEvents } from "../../factory/src";
 import { resolveControlPlaneDirectory, safeControlPlaneFilePath } from "./serve";
 import { defaultLocalDbPath, localRuntimeView, SqliteFactoryStore } from "../../local-runtime/src";
 
@@ -36,6 +37,24 @@ export function localDashboardApi(store: SqliteFactoryStore, url: URL, method: s
   }
   if (url.pathname === "/work-orders") {
     return { status: 200, body: { workOrders: localRuntimeView(store).workOrders } };
+  }
+  const graphMatch = url.pathname.match(/^\/work-orders\/([^/]+)\/graph$/);
+  if (graphMatch) {
+    let workOrderId: string;
+    try { workOrderId = decodeURIComponent(graphMatch[1]); } catch { return { status: 400, body: { error: "Work-order identifier is malformed.", code: "invalid_request" } }; }
+    const order = store.orders.get(workOrderId);
+    if (!order) return { status: 404, body: { error: "Work order not found.", code: "not_found" } };
+    const events = store.readFactoryEvents(workOrderId);
+    return {
+      status: 200,
+      body: {
+        workOrder: { workOrderId: order.workOrderId, status: order.status, currentStage: order.currentStage, intent: order.intent, repositoryId: order.repositoryId },
+        graph: projectFactoryEvents(events),
+        economics: calculateFactoryEconomics(events),
+        events,
+        sourceOfTruth: "append_only_factory_graph",
+      },
+    };
   }
   if (url.pathname === "/exceptions" || url.pathname === "/local/exceptions") {
     const view = localRuntimeView(store);

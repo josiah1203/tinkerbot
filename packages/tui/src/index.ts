@@ -9,7 +9,11 @@ export { applyLeaderChord, applyMasterIntent, createMasterState, MASTER_HELP, pa
 export { attachAgentPty } from "./pty";
 export { renderMasterChrome } from "./chrome";
 export { CLAUDE_CODE_KIT_PACKAGES, renderKitWorkstation, tuiRejectsTinkerMention, KIT_COMMANDS } from "./kit";
+export { defaultClaudeCodeKitRoot, discoverClaudeCodeKit, loadClaudeCodeKit } from "./kit-runtime";
+export { createKitWorkstationState, handleKitWorkstationKey, processKitWorkstationLine, renderKitWorkstationFrame, runKitWorkstationInteractive, runKitWorkstationOnce, suggestKitCommands, KIT_WORKSTATION_HELP } from "./workstation";
 export type { AgentId, DetectedAgent } from "./agents";
+export type { ClaudeCodeKitRuntime, LoadedClaudeCodeKit } from "./kit-runtime";
+export type { KitWorkstationDeps, KitWorkstationHeader, KitWorkstationKeyResult, KitWorkstationMessage, KitWorkstationRenderOptions, KitWorkstationState } from "./workstation";
 
 export interface MasterTuiDeps {
   stdout: { write: (chunk: string) => boolean; isTTY?: boolean };
@@ -23,6 +27,7 @@ export interface MasterTuiDeps {
   createReport?: (input: { cwd: string }) => { verdict: string; limitations?: string[] };
   fetchWork?: (id: string) => { summary?: string; verdict?: string };
   localRuntime?: () => { plan?: string; cost?: string; eval?: string };
+  localGraph?: (id: string) => string;
 }
 
 export function isAgentId(value: string | undefined): value is AgentId {
@@ -57,6 +62,9 @@ export function processMasterCommand(state: MasterState, line: string, deps: Mas
       lastVerdict: view.verdict ?? next.lastVerdict,
       workLog: view.summary ?? `Work ${intent.id}. Agent text is not PASS.`,
     };
+  }
+  if (intent.type === "graph" && deps.localGraph) {
+    next = { ...next, graphLog: deps.localGraph(intent.id), status: "Read-only append-only Factory Graph projection. tb check remains the verdict." };
   }
   if (intent.type === "plan" && deps.localRuntime) {
     next = { ...next, planLog: deps.localRuntime().plan, status: "Local execution plan. tb check is the verdict." };

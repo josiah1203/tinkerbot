@@ -5,8 +5,22 @@ import os from "node:os";
 import path from "node:path";
 
 export interface SandboxPort {
+  /** Identifies whether execution is isolated, host-process, or a test stub. */
+  readonly kind?: "docker" | "process" | "stub";
   start(input: { repositoryRoot: string; workOrderId: string; image?: string }): Promise<{ worktree: string; branch: string; cleanup: () => Promise<void> }>;
-  exec(worktree: string, argv: string[], options?: { env?: Record<string, string>; timeoutMs?: number }): Promise<{ stdout: string; stderr: string; exitCode: number }>;
+  exec(worktree: string, argv: string[], options?: { env?: Record<string, string>; timeoutMs?: number; stdin?: string }): Promise<{ stdout: string; stderr: string; exitCode: number }>;
+}
+
+function executionEnvironment(overrides?: Record<string, string>): Record<string, string> {
+  // Never forward the invoking shell's environment wholesale. Provider keys and
+  // session cookies commonly live there; only explicit harness bindings may cross
+  // the execution boundary.
+  return {
+    PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+    HOME: "/tmp/tinkerbot-home",
+    LANG: process.env.LANG ?? "C.UTF-8",
+    ...overrides,
+  };
 }
 
 export function dockerAvailable(execFn: typeof spawnSync = spawnSync): boolean {
@@ -30,6 +44,12 @@ function copyIsolatedWorktree(repositoryRoot: string, worktree: string): void {
   }
 }
 
+function assertSafeImage(image: string): string {
+  const normalized = image.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._\/@:-]{0,255}$/.test(normalized) || normalized.includes("..")) throw new Error("Runner image is not a safe image reference.");
+  return normalized;
+}
+
 function createBranchWorktree(repositoryRoot: string, worktree: string, branch: string, execFn: typeof spawnSync): boolean {
   if (!fs.existsSync(path.join(repositoryRoot, ".git"))) return false;
   const created = execFn("git", ["-C", repositoryRoot, "worktree", "add", "-B", branch, worktree], { encoding: "utf8", timeout: 30_000 });
@@ -37,7 +57,9 @@ function createBranchWorktree(repositoryRoot: string, worktree: string, branch: 
 }
 
 export function dockerSandboxPort(execFn: typeof spawnSync = spawnSync): SandboxPort {
+  const images = new Map<string, string>();
   return {
+    kind: "docker",
     async start(input) {
       if (!dockerAvailable(execFn)) {
         throw new Error("Docker is required for the local factory runner. process runner is opt-in via --allow-process-runner. Tests and CI use the stub sandbox when Docker is unavailable (TINKERBOT_STUB_SANDBOX=1).");
@@ -50,6 +72,7 @@ export function dockerSandboxPort(execFn: typeof spawnSync = spawnSync): Sandbox
         fs.mkdirSync(worktree, { recursive: true });
         copyIsolatedWorktree(input.repositoryRoot, worktree);
       }
+      images.set(worktree, assertSafeImage(input.image?.trim() || "cloudflare/sandbox:next"));
       return {
         worktree,
         branch,
@@ -58,16 +81,18 @@ export function dockerSandboxPort(execFn: typeof spawnSync = spawnSync): Sandbox
             execFn("git", ["-C", input.repositoryRoot, "worktree", "remove", "--force", worktree], { encoding: "utf8", timeout: 30_000 });
             execFn("git", ["-C", input.repositoryRoot, "branch", "-D", branch], { encoding: "utf8", timeout: 15_000 });
           }
+          images.delete(worktree);
           fs.rmSync(worktree, { recursive: true, force: true });
         },
       };
     },
     async exec(worktree, argv, options) {
-      const image = "cloudflare/sandbox:next";
+      const image = images.get(worktree) ?? "cloudflare/sandbox:next";
       const result = execFn("docker", ["run", "--rm", "--network", "none", "-v", `${worktree}:/work`, "-w", "/work", image, ...argv], {
         encoding: "utf8",
         timeout: options?.timeoutMs ?? 120_000,
-        env: { ...process.env, ...options?.env },
+        input: options?.stdin,
+        env: executionEnvironment(options?.env),
       });
       return { stdout: String(result.stdout ?? ""), stderr: String(result.stderr ?? ""), exitCode: result.status ?? 1 };
     },
@@ -77,6 +102,7 @@ export function dockerSandboxPort(execFn: typeof spawnSync = spawnSync): Sandbox
 export function processSandboxPort(allow: boolean, execFn: typeof spawnSync = spawnSync): SandboxPort {
   if (!allow) throw new Error("process runner requires --allow-process-runner.");
   return {
+    kind: "process",
     async start(input) {
       const branch = `tinkerbot/${input.workOrderId.slice(0, 8)}`;
       const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "tinkerbot-process-"));
@@ -84,7 +110,7 @@ export function processSandboxPort(allow: boolean, execFn: typeof spawnSync = sp
       return { worktree, branch, cleanup: async () => { fs.rmSync(worktree, { recursive: true, force: true }); } };
     },
     async exec(worktree, argv, options) {
-      const result = execFn(argv[0] ?? "true", argv.slice(1), { cwd: worktree, encoding: "utf8", timeout: options?.timeoutMs ?? 60_000, env: { ...process.env, ...options?.env } });
+      const result = execFn(argv[0] ?? "true", argv.slice(1), { cwd: worktree, encoding: "utf8", timeout: options?.timeoutMs ?? 60_000, input: options?.stdin, env: executionEnvironment(options?.env) });
       return { stdout: String(result.stdout ?? ""), stderr: String(result.stderr ?? ""), exitCode: result.status ?? 1 };
     },
   };
@@ -92,6 +118,7 @@ export function processSandboxPort(allow: boolean, execFn: typeof spawnSync = sp
 
 export function stubSandboxPort(): SandboxPort {
   return {
+    kind: "stub",
     async start(input) {
       const worktree = path.join(os.tmpdir(), `tinkerbot-stub-${crypto.randomUUID()}`);
       fs.mkdirSync(worktree, { recursive: true });

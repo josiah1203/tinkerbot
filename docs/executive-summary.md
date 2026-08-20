@@ -215,7 +215,7 @@ Billing is per active human seat:
 
 Paid plans intentionally have no seat or repository cap. Team has a 14-day cardless trial. `past_due`/grace keeps verification reads available while blocking premium mutations. AI tokens and run counts are internal fair-use/COGS telemetry, not invoice units.
 
-The source catalog is in `packages/control-plane/src/entitlements.ts`. The JSON configuration is intentionally limited to plan IDs, monthly/annual Stripe Price IDs, and `catalogVersion`. The checked-in example still contains placeholder Price IDs, and `wrangler.jsonc` currently sets `STRIPE_PLANS_JSON` to `[]` in the default/staging variables. Real IDs and a nonempty production variable are external release requirements.
+The source catalog is in `packages/control-plane/src/entitlements.ts`. The JSON configuration is intentionally limited to plan IDs, monthly/annual Stripe Price IDs, and `catalogVersion`; `pnpm validate:stripe` now rejects placeholders, duplicates, unknown fields, missing plans, and version drift. The checked-in example remains an intentionally non-deployable template, and real IDs plus a nonempty production variable are external release requirements.
 
 There is also an internal contract drift: `scripts/validate-live-providers.mjs` still expects legacy fields (`privateRepositoryLimit`, `memberLimit`, `retentionDays`, and a boolean `features` map), while the current billing catalog and example JSON explicitly removed those fields. The provider validation script must be brought into agreement with the seat-based catalog before it can be a trustworthy release gate.
 
@@ -440,10 +440,10 @@ The current substrate and required changes are:
 
 - `packages/factory/src/warp.ts` already has bounded Foreman actions, heuristic stage skipping, conversations, scoring, and self-improvement hooks. Add a deterministic execution planner that consumes diff size, changed paths, impact, repository history, prior outcomes, and policy.
 - `packages/factory/src/index.ts` already models stages, budgets, autonomy, WorkOrder transitions, and `executeFactoryRun`. Add a persisted `ExecutionPlan`, pipeline mode, approval mode, runtime origin, and cost estimate. Keep verification mandatory and keep restricted paths from being auto-skipped.
-- `packages/factory/src/definition.ts` already parses runners and agent defaults, but runners are Linux/Cloudflare-oriented and self-hosted workers are rejected. Add process/Docker/local runner types and provider-neutral inference references.
-- `apps/control-plane-worker/src/factory-runtime.ts` currently chooses Workers AI models and an optional Cloudflare Sandbox. Refactor it behind runner and inference adapters so the same run can execute locally, with BYOK, or in the hosted Worker.
+- `packages/factory/src/definition.ts` now parses provider-neutral harnesses, process/Docker/local/self-hosted runner boundaries, and credential references. External commands are explicit no-shell bindings and are never executed by the hosted Worker.
+- `apps/control-plane-worker/src/factory-runtime.ts` now restores the persisted definition tree, validates it before execution, and emits a credential-free `SELF_HOSTED_WORK` handoff for customer workers; the remaining release gate is the deployed worker adapter and its callback/OIDC loop.
 - `packages/cli/src/index.ts` currently keeps `tb check` and factory validation local while hosted factory/work/run commands require an HTTPS session. Add a local orchestrator path (`tb run --local`, `tb eval`, and a local state store) without making WorkOS a prerequisite.
-- `packages/control-plane/src/entitlements.ts` currently marks `selfHostedAvailable` false and reserves `private_execution` for Enterprise. Add separate `local_execution`, `byok_inference`, `portable_eval_suites`, and `offline_assurance` capabilities. Do not conflate free local execution with dedicated hosted private execution.
+- `packages/control-plane/src/entitlements.ts` exposes self-hosted workers as a portable capability on every plan while keeping `private_execution` as Enterprise dedicated hosted infrastructure. Local execution, BYOK, portable evals, and offline assurance remain distinct capabilities.
 
 Billing can remain per active human seat. A one-person organization should use the same identity and role model as a team. BYOK provider spend should remain external to Tinkerbot invoices, while managed inference can continue to show estimated COGS and usage telemetry.
 

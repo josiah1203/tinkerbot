@@ -56,7 +56,7 @@ test("paid plans are per-active-seat, have no repository caps, and reject paymen
   expect(PLAN_CATALOG.developer).toMatchObject({ price: { amountCents: 2000 }, annualPriceCents: 20000, billingUnit: "active_seat", paidSeatCap: "none", paidRepositoryCap: "none" });
   expect(PLAN_CATALOG.team).toMatchObject({ price: { amountCents: 4000 }, annualPriceCents: 40000, billingUnit: "active_seat", paidSeatCap: "none" });
   expect(PLAN_CATALOG.business).toMatchObject({ price: { amountCents: 6000 }, annualPriceCents: 60000, billingUnit: "active_seat", paidSeatCap: "none" });
-  expect(PLAN_CATALOG.enterprise.selfHostedAvailable).toBe(false);
+  expect(PLAN_CATALOG.enterprise.selfHostedAvailable).toBe(true);
   expect(canConnectPrivateRepository({ planId: "developer", billingStatus: "active", activePrivateRepositories: 2, memberCount: 1 })).toBe(true);
   expect(canConnectPrivateRepository({ planId: "developer", billingStatus: "active", activePrivateRepositories: 500, memberCount: 1 })).toBe(true);
   expect(canConnectPrivateRepository({ planId: "developer", billingStatus: "past_due", activePrivateRepositories: 0, memberCount: 1 })).toBe(false);

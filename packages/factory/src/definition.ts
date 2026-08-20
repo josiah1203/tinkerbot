@@ -1,5 +1,14 @@
 import { parse as parseYaml } from "yaml";
 import { defaultModelForAgent } from "./warp";
+import {
+  assertHarnessWorkerHost,
+  defaultHarnessDefinition,
+  isExternalHarness,
+  parseHarnessDefinitions,
+  type FactoryHarnessDefinition,
+} from "./harness";
+
+export type { FactoryHarnessDefinition } from "./harness";
 
 export const FACTORY_SCHEMA_V1ALPHA1 = "v1alpha1" as const;
 export const FACTORY_SCHEMA_V1ALPHA2 = "v1alpha2" as const;
@@ -27,6 +36,7 @@ export interface FactoryAgentFile {
   description?: string;
   model?: string;
   harness?: string;
+  workerHost?: string;
   secrets: string[];
   mcpServers: string[];
   instructions: string;
@@ -52,7 +62,8 @@ export interface FactoryRunnerDefinition {
   description?: string;
   image: string;
   setupCommands: string[];
-  platformOs: "linux";
+  platformOs: "linux" | "macos" | "windows";
+  workerHost?: string;
   timeoutSeconds?: number;
 }
 
@@ -67,6 +78,13 @@ export interface FactoryDashboardMetrics {
 
 const ALIAS_PATTERN = /^[A-Za-z0-9 ._-]{1,60}$/;
 const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const RUNNER_IMAGE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._\/@:-]{0,255}$/;
+
+function assertRunnerImage(value: string, context: string): string {
+  const image = value.trim();
+  if (!image || !RUNNER_IMAGE_PATTERN.test(image) || image.startsWith("-") || image.includes("..")) throw new Error(`${context} image must be a safe container image or local runner identifier.`);
+  return image;
+}
 
 export function parseMarkdownDocument(contents: string): { frontmatter: Record<string, unknown>; body: string } {
   const match = contents.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
@@ -101,13 +119,14 @@ export function assertAllowedHarness(value: unknown, context: string): string | 
   if (value == null) return undefined;
   if (typeof value === "object" && !Array.isArray(value)) {
     const type = String((value as { type?: unknown }).type ?? "");
-    if ((FORBIDDEN_HARNESS_TYPES as readonly string[]).includes(type)) throw new Error(`${context} harness '${type}' is not supported. Use tinkerbot-sandbox or github_actions.`);
-    throw new Error(`${context} harness type is invalid.`);
+    if (!type) throw new Error(`${context} harness type is invalid.`);
+    return assertAllowedHarness(type, context);
   }
   if (typeof value !== "string") throw new Error(`${context} harness is invalid.`);
-  if ((FORBIDDEN_HARNESS_TYPES as readonly string[]).includes(value)) throw new Error(`${context} harness '${value}' is not supported. Use tinkerbot-sandbox or github_actions.`);
-  if (!(ALLOWED_HARNESSES as readonly string[]).includes(value) && value !== "workers-ai") throw new Error(`${context} harness '${value}' is not supported.`);
-  return value === "workers-ai" ? "default" : value;
+  const normalized = value.trim().toLowerCase();
+  if (!/^[a-z][a-z0-9._-]{0,63}$/.test(normalized)) throw new Error(`${context} harness must be a safe identifier.`);
+  if (!(ALLOWED_HARNESSES as readonly string[]).includes(normalized) && normalized !== "workers-ai" && isExternalHarness(normalized)) return normalized;
+  return normalized === "workers-ai" ? "default" : normalized;
 }
 
 export function parseAgentType(value: unknown): FactoryAgentType {
@@ -122,6 +141,7 @@ export function parseAgentFile(id: string, contents: string): FactoryAgentFile {
   const { frontmatter, body } = parseMarkdownDocument(contents);
   if (frontmatter.model != null && frontmatter.harness != null) throw new Error(`Agent ${id} cannot set both model and harness.`);
   const harness = assertAllowedHarness(frontmatter.harness, `Agent ${id}`);
+  const workerHost = assertHarnessWorkerHost(frontmatter.workerHost, `Agent ${id}`);
   const secrets = Array.isArray(frontmatter.secrets) ? frontmatter.secrets.filter((item): item is string => typeof item === "string") : [];
   const mcpServers = mcpServerNames(frontmatter.mcpServers);
   return {
@@ -130,6 +150,7 @@ export function parseAgentFile(id: string, contents: string): FactoryAgentFile {
     description: typeof frontmatter.description === "string" ? frontmatter.description : undefined,
     model: typeof frontmatter.model === "string" ? (frontmatter.model === "auto" ? defaultModelForAgent(id) : frontmatter.model) : undefined,
     harness,
+    workerHost,
     secrets,
     mcpServers,
     instructions: body,
@@ -156,11 +177,18 @@ export function parseRunnerYaml(name: string, contents: string): FactoryRunnerDe
   const raw = parsed as Record<string, unknown>;
   const platform = raw.platform && typeof raw.platform === "object" && !Array.isArray(raw.platform) ? raw.platform as Record<string, unknown> : {};
   const os = typeof platform.os === "string" ? platform.os : "linux";
-  if (os !== "linux") throw new Error(`Runner ${name} must use linux. macOS and self-hosted workers are not supported.`);
+  if (os !== "linux" && os !== "macos" && os !== "windows") throw new Error(`Runner ${name} platform.os must be linux, macos, or windows.`);
   const linux = platform.linux && typeof platform.linux === "object" && !Array.isArray(platform.linux) ? platform.linux as Record<string, unknown> : {};
-  const image = typeof linux.dockerImage === "string" && linux.dockerImage.trim() ? linux.dockerImage.trim() : typeof raw.image === "string" ? raw.image : "cloudflare/sandbox:next";
-  const setupCommands = Array.isArray(raw.setupCommands) ? raw.setupCommands.filter((item): item is string => typeof item === "string") : [];
-  return { name, description: typeof raw.description === "string" ? raw.description : undefined, image, setupCommands, platformOs: "linux", timeoutSeconds: Number(raw.timeoutSeconds ?? 0) || undefined };
+  const image = assertRunnerImage(typeof linux.dockerImage === "string" && linux.dockerImage.trim() ? linux.dockerImage : typeof raw.image === "string" ? raw.image : os === "linux" ? "cloudflare/sandbox:next" : os, `Runner ${name}`);
+  if (raw.setupCommands != null && !Array.isArray(raw.setupCommands)) throw new Error(`Runner ${name} setupCommands must be an array.`);
+  const setupCommands = (Array.isArray(raw.setupCommands) ? raw.setupCommands : []).map((item, index) => {
+    if (typeof item !== "string" || item.length > 4_096 || /[\u0000-\u001f\u007f]/.test(item)) throw new Error(`Runner ${name} setupCommands[${index}] contains invalid control data.`);
+    return item;
+  });
+  if (setupCommands.length > 64) throw new Error(`Runner ${name} setupCommands cannot contain more than 64 commands.`);
+  const timeoutRaw = raw.timeoutSeconds == null ? undefined : Number(raw.timeoutSeconds);
+  if (timeoutRaw !== undefined && (!Number.isFinite(timeoutRaw) || timeoutRaw < 1 || timeoutRaw > 86_400)) throw new Error(`Runner ${name} timeoutSeconds must be between 1 and 86400.`);
+  return { name, description: typeof raw.description === "string" ? raw.description : undefined, image, setupCommands, platformOs: os, workerHost: assertHarnessWorkerHost(raw.workerHost, `Runner ${name}`), timeoutSeconds: timeoutRaw };
 }
 
 export function parseFactorySchemaVersion(raw: Record<string, unknown>): FactorySchemaVersion {
@@ -195,11 +223,9 @@ export function parseAgentDefaults(raw: unknown): { model?: string; harness?: st
   if (record.model != null && record.harness != null) throw new Error("agentDefaults cannot set both model and harness.");
   const harness = assertAllowedHarness(record.harness, "agentDefaults");
   const workerHost = typeof record.workerHost === "string" ? record.workerHost : undefined;
-  if (workerHost && workerHost !== "warp" && workerHost !== "github_actions" && workerHost !== "tinkerbot-sandbox") {
-    throw new Error("workerHost must be warp (Cloudflare sandbox) or github_actions.");
-  }
+  const normalizedWorkerHost = assertHarnessWorkerHost(workerHost, "agentDefaults");
   const model = typeof record.model === "string" ? record.model : undefined;
-  return { model: model === "auto" ? undefined : model, harness, runner: typeof record.runner === "string" ? record.runner : undefined, workerHost };
+  return { model: model === "auto" ? undefined : model, harness, runner: typeof record.runner === "string" ? record.runner : undefined, workerHost: normalizedWorkerHost };
 }
 
 export function mcpServerNames(value: unknown): string[] {
@@ -224,11 +250,12 @@ export function runnerFileName(relativePath: string): string | undefined {
 }
 
 export function applyFactoryTree<T extends {
-  agents: Array<{ id: string; model: string; provider: "workers-ai" | "gateway" | "none"; harness: string; timeoutSeconds: number; agentType?: FactoryAgentType; description?: string }>;
+  agents: Array<{ id: string; model: string; provider: "workers-ai" | "gateway" | "none"; harness: string; timeoutSeconds: number; agentType?: FactoryAgentType; description?: string; workerHost?: string; secretRefs?: string[]; mcpServers?: string[] }>;
   agentInstructions: Record<string, string>;
   secretRefs: string[];
   mcpServers: string[];
   sources: Array<{ type: string; enabled: boolean }>;
+  harnesses: Record<string, FactoryHarnessDefinition>;
   automations?: FactoryAutomationDefinition[];
   runners?: FactoryRunnerDefinition[];
   alias?: string;
@@ -243,6 +270,9 @@ export function applyFactoryTree<T extends {
     if (!id) continue;
     if (nestedIds.has(id) && !file.path.endsWith("/agent.md")) continue;
     const parsed = parseAgentFile(id, file.contents);
+    if (parsed.harness && isExternalHarness(parsed.harness) && !definition.harnesses[parsed.harness]) {
+      definition.harnesses[parsed.harness] = defaultHarnessDefinition(parsed.harness);
+    }
     instructions[id] = parsed.instructions;
     const existing = agents.findIndex((agent) => agent.id === id);
     const next = {
@@ -253,6 +283,9 @@ export function applyFactoryTree<T extends {
       timeoutSeconds: existing >= 0 ? agents[existing]!.timeoutSeconds : 60,
       agentType: parsed.agentType,
       description: parsed.description,
+      workerHost: parsed.workerHost ?? (existing >= 0 ? agents[existing]!.workerHost : undefined),
+      secretRefs: parsed.secrets.map((secret) => secret.startsWith("secret://") || secret.startsWith("env:") ? secret : `secret://${secret}`),
+      mcpServers: parsed.mcpServers,
     };
     if (existing >= 0) agents[existing] = next;
     else agents.push(next);

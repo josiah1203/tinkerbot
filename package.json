@@ -27,7 +27,10 @@
   "bin": {
     "pr-proof": "dist/packages/cli/src/index.js",
     "tb": "dist/packages/cli/src/index.js",
-    "tinkerbot": "dist/packages/cli/src/index.js"
+    "tinkerbot": "dist/packages/cli/src/index.js",
+    "tinkerbot-factory": "dist/packages/cli/src/factory-cli.js",
+    "tinkerbot-tui": "dist/packages/cli/src/workstation-cli.js",
+    "tinkerbot-mcp": "dist/packages/platform-mcp/src/cli.js"
   },
   "files": [
     "dist/packages",
@@ -49,9 +52,13 @@
     "test:e2e": "playwright install chromium && playwright test",
     "test:all": "pnpm test && pnpm test:e2e",
     "validate:providers": "node scripts/validate-live-providers.mjs",
+    "validate:stripe": "pnpm build && node scripts/validate-stripe-catalog.mjs",
     "prepare": "npm run build",
     "prepack": "node scripts/prepare-package.mjs",
     "tb": "node dist/packages/cli/src/index.js",
+    "factory-cli": "node dist/packages/cli/src/factory-cli.js",
+    "tui:kit": "node dist/packages/cli/src/workstation-cli.js",
+    "mcp:platform": "node dist/packages/platform-mcp/src/cli.js",
     "tui": "node dist/packages/cli/src/index.js tui",
     "tui:once": "node dist/packages/cli/src/index.js tui --once",
     "release:clients": "pnpm build && node scripts/package-release-clients.mjs && node scripts/generate-release-manifest.mjs",

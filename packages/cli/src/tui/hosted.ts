@@ -16,6 +16,10 @@ export interface HostedWorkView {
   };
   run?: { run_id?: string; status?: string };
   stages?: HostedStage[];
+  graph?: { verificationVerdict?: string; reviewDecision?: string; releaseDecision?: string; outcomeStatus?: string; outcomeMaturity?: string; eventCount?: number };
+  economics?: { cogsCents?: number; copqCents?: number; acceptedChanges?: number };
+  events?: Array<{ type?: string; actorType?: string; occurredAt?: string }>;
+  sourceOfTruth?: string;
 }
 
 const VERDICTS = new Set(["PASS", "FAIL", "UNKNOWN"]);

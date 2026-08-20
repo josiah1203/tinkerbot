@@ -3,7 +3,9 @@ import { createImplementPullRequest, mintInstallationToken } from "../../../pack
 import {
   createWorkOrder,
   executeFactoryRun,
+  applyFactoryTree,
   parseFactoryDefinition,
+  validateFactoryDefinition,
   signRecord,
   classifyWorkOrderGroup,
   conversationTranscript,
@@ -24,6 +26,8 @@ import {
   dispatchTinkerGateway,
   draftImprovementProposal,
   factoryAnalystReport,
+  isExternalHarness,
+  sanitizeUntrustedPromptInput,
   incidentIntake,
   supportIntake,
   githubSecurityIntake,
@@ -42,6 +46,7 @@ import {
   type FactoryDefinition,
   type FactoryQueueMessage,
   type FactorySourceType,
+  type FactoryEvent,
 } from "../../../packages/factory/src";
 import { modelForCostClass, type AiCostClass } from "../../../packages/control-plane/src";
 import { evidenceStoreFromEnv, HttpEvidenceReplica } from "../../../packages/hosted-integrations/src";
@@ -63,6 +68,8 @@ export interface FactoryEnv {
   CONTROL_PLANE_URL?: string;
   BROWSER?: unknown;
   Sandbox?: unknown;
+  /** Optional producer for customer-managed self-hosted workers. It never carries credentials. */
+  SELF_HOSTED_WORK?: { send(body: unknown): Promise<void> };
 }
 
 function estimatedCostMinor(aiClass: AiCostClass, tokens: number): number {
@@ -75,6 +82,55 @@ function gatewayAi(env: FactoryEnv): FactoryAi | undefined {
   return {
     run: async (model, input, options) => env.AI!.run(model, input, options ?? workersAiGatewayOptions({ stage: "factory" })),
   };
+}
+
+interface SelfHostedDispatchInput {
+  organizationId: string;
+  factoryId: string;
+  workOrderId: string;
+  runId: string;
+  repository: string;
+  sourceType: FactorySourceType;
+  sourceId: string;
+  definitionDigest: string;
+  prompt?: string;
+  definition: FactoryDefinition;
+}
+
+/**
+ * Hand off implementation to a customer-owned worker without putting a
+ * credential, session token, or provider secret on the queue. The worker can
+ * fetch the repository itself and must return through the existing verification
+ * / OIDC path; this message is only a dispatch claim, never a merge authority.
+ */
+async function dispatchSelfHostedWork(env: FactoryEnv, input: SelfHostedDispatchInput): Promise<{ ok: true; dispatchId: string } | { ok: false; dispatchId: string; reason: string }> {
+  const dispatchId = `selfhost:${input.workOrderId}:${input.runId}`;
+  if (!env.SELF_HOSTED_WORK) return { ok: false, dispatchId, reason: "self_hosted_queue_not_configured" };
+  const implementation = input.definition.agents.find((agent) => agent.agentType === "IMPLEMENT" || agent.id === "implement" || agent.id === "implementation");
+  const externalHarness = implementation && isExternalHarness(implementation.harness) ? input.definition.harnesses[implementation.harness] : undefined;
+  const payload = {
+    protocolVersion: 1,
+    dispatchId,
+    executionBoundary: "self_hosted",
+    organizationId: input.organizationId,
+    factoryId: input.factoryId,
+    workOrderId: input.workOrderId,
+    runId: input.runId,
+    repository: input.repository,
+    sourceType: input.sourceType,
+    sourceId: input.sourceId,
+    definitionDigest: input.definitionDigest,
+    harness: externalHarness?.id ?? implementation?.harness ?? "default",
+    model: implementation?.model,
+    prompt: sanitizeUntrustedPromptInput(input.prompt ?? "Implement the approved change.", 16_000),
+    authority: { mayMerge: false, mayRelease: false, mayWriteVerificationVerdict: false },
+  };
+  try {
+    await env.SELF_HOSTED_WORK.send(payload);
+    return { ok: true, dispatchId };
+  } catch {
+    return { ok: false, dispatchId, reason: "self_hosted_queue_send_failed" };
+  }
 }
 
 export async function persistTranscript(env: FactoryEnv, organizationId: string, workOrderId: string, messages: ConversationMessage[]): Promise<void> {
@@ -106,13 +162,45 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
     order = createWorkOrder({ factoryId: factory.factoryId, organizationId, sourceType: message.sourceType as FactorySourceType, sourceId: message.sourceId, repositoryId: repository, issueOrPullRequest: message.issueOrPullRequest, policyVersion: "default", definitionVersion: record?.definitionDigest ?? "unknown", definitionDigest: record?.definitionDigest ?? "unknown", actor: message.actor, now });
     await factories.insertWorkOrder(order);
   }
-  const existingRun = await factories.getRunByWorkOrder(order.workOrderId);
+  const persistedOrder = order;
+  const existingRun = await factories.getRunByWorkOrder(persistedOrder.workOrderId);
   const runId = existingRun?.run_id ?? crypto.randomUUID();
-  if (!existingRun) await factories.insertRun({ runId, workOrderId: order.workOrderId, factoryId: factory.factoryId, definitionDigest: order.definitionDigest, status: "running", now });
+  if (!existingRun) await factories.insertRun({ runId, workOrderId: persistedOrder.workOrderId, factoryId: factory.factoryId, definitionDigest: persistedOrder.definitionDigest, status: "running", now });
+  const appendRunGraphEvent = async (type: FactoryEvent["type"], payload: Record<string, unknown>, actorId: string, actorType: FactoryEvent["actorType"] = "system"): Promise<void> => {
+    await factories.appendFactoryEvent({
+      eventId: `${runId}:${type}`, type, aggregateId: persistedOrder.workOrderId, aggregateType: "work_order", organizationId, factoryId: factory.factoryId,
+      actorId, actorType, occurredAt: new Date().toISOString(), correlationId: runId, schemaVersion: 1, policyVersion: persistedOrder.policyVersion, provenance: actorType === "human" ? "HUMAN_VERIFIED" : "ATTESTED", payload,
+    });
+  };
+  await appendRunGraphEvent("worker.session_started", { sessionId: runId, workerId: "factory-foreman", workOrderId: persistedOrder.workOrderId }, "factory-foreman", "agent");
   const calculated = await entitlementsForOrganization(env.DB, organizationId);
   let definition: FactoryDefinition;
-  try { definition = parseFactoryDefinition({ version: 1, name: factory.name, repositories: [repository], sources: [{ type: message.sourceType }, { type: "mcp" }, { type: "incident" }, { type: "scheduled" }] }); } catch { return { workOrderId: order.workOrderId, runId, terminal: "unknown" }; }
+  try {
+    const latest = await factories.getLatestDefinition(factory.factoryId);
+    if (latest) {
+      definition = parseFactoryDefinition(latest.yaml);
+      if (latest.files.length) definition = applyFactoryTree(definition, latest.files);
+    } else {
+      definition = parseFactoryDefinition({ version: 1, name: factory.name, repositories: [repository], sources: [{ type: message.sourceType }, { type: "mcp" }, { type: "incident" }, { type: "scheduled" }] });
+    }
+    if (!definition.sources.some((source) => source.type === message.sourceType)) {
+      definition = { ...definition, sources: [...definition.sources, { type: message.sourceType, enabled: true }] };
+    }
+    const definitionErrors = validateFactoryDefinition(definition, { requireForeman: definition.schemaVersion === "v1alpha1" || definition.agents.some((agent) => agent.agentType === "FOREMAN") });
+    if (definitionErrors.length) {
+      await appendRunGraphEvent("task.blocked", { reason: "invalid_factory_definition", errors: definitionErrors.slice(0, 20) }, "factory-policy", "system");
+      await factories.applyTransition(order.workOrderId, "blocked", `definition:${message.deliveryId}`, "factory-policy");
+      return { workOrderId: order.workOrderId, runId, wait: "factory_definition", terminal: "blocked" };
+    }
+  } catch {
+    await appendRunGraphEvent("task.blocked", { reason: "invalid_factory_definition" }, "factory-policy", "system");
+    await factories.applyTransition(order.workOrderId, "blocked", `definition-parse:${message.deliveryId}`, "factory-policy");
+    return { workOrderId: order.workOrderId, runId, wait: "factory_definition", terminal: "blocked" };
+  }
   const managed = definition.runtime.inference.mode === "managed";
+  const implementationAgent = definition.agents.find((agent) => agent.agentType === "IMPLEMENT" || agent.id === "implement" || agent.id === "implementation");
+  const externalImplementation = implementationAgent && isExternalHarness(implementationAgent.harness) ? definition.harnesses[implementationAgent.harness] : undefined;
+  const requiresSelfHostedExecution = definition.runtime.runner.type === "self_hosted" || Boolean(externalImplementation);
   if (managed) definition = { ...definition, agents: definition.agents.map((agent) => ({ ...agent, model: modelForCostClass(calculated.aiClass, agent.id) })) };
   order = applyWorkOrderRouting(order, definition);
   await factories.patchWorkOrder(order.workOrderId, { productId: order.productId, lineId: order.lineId, autonomyMode: order.autonomyMode, outputKind: order.outputKind, risk: order.risk, now });
@@ -131,6 +219,7 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
     verificationIngested: message.verificationIngested,
     workOrderId: order.workOrderId,
     factoryId: factory.factoryId,
+    organizationId,
     store: factories,
   });
   for (const stage of result.stages) {
@@ -155,6 +244,9 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
       });
       const signed = signRecord(receipt, env.SESSION_ENCRYPTION_KEY ?? "factory-dev", "factory-v1", now);
       await factories.insertAgentReceipt({ runId, agentId: stage.stage, receipt, digest: signed.digest, signed: true, now });
+      await appendRunGraphEvent("worker.claim_emitted", { sessionId: runId, workerId: `factory-${stage.stage}`, claimStatus: "ATTESTED", receiptDigest: signed.digest, stage: stage.stage }, `factory-${stage.stage}`, "agent");
+      await appendRunGraphEvent("evidence.receipt_created", { sessionId: runId, receiptDigest: signed.digest, signed: true, stage: stage.stage }, `factory-${stage.stage}`, "agent");
+      if (stage.stage === "implementation") await appendRunGraphEvent("change.proposed", { sessionId: runId, changeRef: `run-stage://${runId}/${stage.stage}`, receiptDigest: signed.digest }, `factory-${stage.stage}`, "agent");
       const tokens = Math.ceil(stage.summary.length / 4);
       const costCents = estimatedCostMinor(calculated.aiClass, tokens);
       await factories.insertUsage({ organizationId, factoryId: factory.factoryId, runId, kind: `agent:${stage.stage}`, tokens, costCents, now });
@@ -179,9 +271,32 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
       }
     }
   }
+  await appendRunGraphEvent("worker.session_completed", { sessionId: runId, workerId: "factory-foreman", terminal: result.terminal }, "factory-foreman", "agent");
   const messages: ConversationMessage[] = result.stages.map((stage) => ({ role: "assistant", agentId: stage.stage, content: stage.summary, at: now }));
   await persistTranscript(env, organizationId, order.workOrderId, messages);
   if (result.wait === "sandbox") {
+    if (requiresSelfHostedExecution) {
+      const handoff = await dispatchSelfHostedWork(env, {
+        organizationId,
+        factoryId: factory.factoryId,
+        workOrderId: order.workOrderId,
+        runId,
+        repository,
+        sourceType: message.sourceType as FactorySourceType,
+        sourceId: message.sourceId,
+        definitionDigest: order.definitionDigest,
+        prompt: message.issueOrPullRequest,
+        definition,
+      });
+      if (handoff.ok) {
+        await appendRunGraphEvent("task.queued", { executionBoundary: "self_hosted", dispatchId: handoff.dispatchId, harness: externalImplementation?.id ?? implementationAgent?.harness ?? "default" }, "factory-policy", "system");
+        await factories.applyTransition(order.workOrderId, "implementation", `self-hosted:${handoff.dispatchId}`, "factory-policy");
+        return { workOrderId: order.workOrderId, runId, wait: "self_hosted_harness", terminal: "implementation" };
+      }
+      await appendRunGraphEvent("task.blocked", { executionBoundary: "self_hosted", reason: handoff.reason, dispatchId: handoff.dispatchId }, "factory-policy", "system");
+      await factories.applyTransition(order.workOrderId, "blocked", `self-hosted:${handoff.dispatchId}`, "factory-policy");
+      return { workOrderId: order.workOrderId, runId, wait: "self_hosted_harness", terminal: "blocked" };
+    }
     const cells = (await factories.listWorkCells(factory.factoryId)).map((row) => ({
       cellId: String(row.cell_id),
       factoryId: String(row.factory_id),

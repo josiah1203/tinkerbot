@@ -9,7 +9,8 @@ Code in this repository cannot create live Stripe, WorkOS, Cloudflare, or GitHub
 - [ ] Create distinct D1 databases for development, staging, and production; paste real `database_id` values into wrangler; apply migrations to each.
 - [ ] Attach the `Sandbox` Durable Object / platform Sandbox implementation in each environment. The Worker exports a placeholder `Sandbox` class until the account binding is live.
 - [ ] Confirm R2 evidence buckets, queues, Vectorize indexes, Browser Rendering, Workers AI, and DNS already differ for staging where required.
-- [ ] Set secrets: WorkOS, Stripe, `SESSION_ENCRYPTION_KEY`, GitHub App PEM and webhook secret, optional `GITLAB_WEBHOOK_SECRET` and evidence-export secrets (operator-only; never customer copy).
+- [ ] Set core secrets: WorkOS, Stripe, and `SESSION_ENCRYPTION_KEY`.
+- [ ] If enabling the optional GitHub adapter, set `GITHUB_WEBHOOK_SECRET`, `GITHUB_APP_ID`, and `GITHUB_APP_PRIVATE_KEY`; otherwise no Tinkerbot GitHub App installation is needed. `GITLAB_WEBHOOK_SECRET` and evidence-export secrets are also optional (operator-only; never customer copy).
 - [ ] Leave `WORKOS_EVENTS_SYNC_ENABLED` false until production WorkOS webhooks exist.
 - [ ] Set nonempty live `STRIPE_PLANS_JSON` per environment (no `price_REPLACE_*`). Empty catalog → `catalog_unavailable`; nobody can buy a seat.
 
@@ -24,10 +25,10 @@ Code in this repository cannot create live Stripe, WorkOS, Cloudflare, or GitHub
 - [ ] Seat-only catalog: `developer` / `team` / `business` with `monthlyPriceId` (optional `annualPriceId`). Do not include `memberLimit` or `privateRepositoryLimit`.
 - [ ] Validate with `TINKERBOT_WORKER_URL`, `TINKERBOT_OPS_SESSION` (owner/admin session for `GET /config/status`), and Stripe/WorkOS env vars via `scripts/validate-live-providers.mjs`.
 
-## GitHub App and Action
+## Optional GitHub App and Action
 
-- [ ] Register the App, store PEM, install on a test org/repo. Fail closed: OIDC exchange requires an installation for the repository.
-- [ ] Enable OIDC only after JWKS verification is deployed.
+- [ ] If the GitHub adapter is part of the launch scope, register the App, store PEM, and install on a test org/repo. Core factory use remains available without it.
+- [ ] If GitHub Action publishing is enabled, configure OIDC only after JWKS verification is deployed; the repository must have an installation for that adapter path.
 - [ ] Release tags must include built `dist/action/index.js` (root `dist/` is gitignored). Package the compiled Action in the tag; do not expect a source checkout to satisfy `action/index.js`.
 
 ## Distribution (P2)
