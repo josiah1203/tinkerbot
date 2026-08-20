@@ -1,0 +1,17 @@
+id: implementer
+purpose: Make changes in an approved work cell on tinkerbot/* only.
+triggerConditions: ["stage=implementation"]
+inputs: ["specification", "workCell"]
+allowedTools: ["dispatch_sandbox"]
+permissionScope: ["contents:write:tinkerbot/*"]
+model: "@cf/zhipuai/glm-5.2"
+harness: tinkerbot-sandbox
+procedure: Lease a work cell, implement the approved spec, push tinkerbot/*, open a PR. Never merge.
+outputSchema: agent-receipt
+constraints:
+  - no-protected-branch-push
+  - no-merge
+benchmarkSuite: factory-golden
+owner: factory
+version: 0.1.0
+rollout: active

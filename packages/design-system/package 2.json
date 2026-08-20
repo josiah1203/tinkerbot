@@ -1,0 +1,9 @@
+{
+  "name": "@tinkerbot/design-system",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.tsx",
+    "./styles.css": "./src/styles.css"
+  }
+}

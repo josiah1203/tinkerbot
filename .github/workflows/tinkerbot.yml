@@ -33,7 +33,8 @@ jobs:
           node-version: 22
       - run: corepack enable
       - run: pnpm install --frozen-lockfile
-      - run: pnpm test -- --reporter=default --reporter=json --outputFile=vitest-results.json
+      - run: pnpm build
+      - run: pnpm exec vitest run --reporter=default --reporter=json --outputFile=vitest-results.json
       - if: always()
         run: node scripts/report-vitest-failures.mjs vitest-results.json
       - uses: ./
