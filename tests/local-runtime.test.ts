@@ -360,7 +360,12 @@ describe("local runtime", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "tb-symlink-root-"));
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "tb-symlink-secret-"));
     fs.writeFileSync(path.join(outside, "secret.txt"), "do-not-copy");
-    fs.symlinkSync(outside, path.join(root, "linked-outside"));
+    try {
+      fs.symlinkSync(outside, path.join(root, "linked-outside"));
+    } catch {
+      // Symlink creation can be unavailable on restricted Windows runners.
+      return;
+    }
     const lease = await processSandboxPort(true).start({ repositoryRoot: root, workOrderId: "wo_symlink", image: "" });
     expect(fs.existsSync(path.join(lease.worktree, "linked-outside"))).toBe(false);
     await lease.cleanup();
