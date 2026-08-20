@@ -69,6 +69,10 @@ test("PATH detection uses env overrides and never claims vendor tokens", () => {
   expect(JSON.parse(listAgentsJson(env)).storesVendorTokens).toBe(false);
   expect(spawnSpec("gemini", "/tmp", { PATH: "/no/such" })).toMatchObject({ error: expect.stringMatching(/not found/) });
   expect(spawnSpec("shell", "/tmp", env)).toMatchObject({ bin: "/bin/sh", trust: expect.stringMatching(/user-owned|gh pr merge/) });
+  const nested = spawnSpec("claude", "/tmp", { ...env, GH_TOKEN: "ghs_secret", GITHUB_TOKEN: "ghs_secret" });
+  expect("env" in nested && nested.env.GH_TOKEN).toBeUndefined();
+  expect("env" in nested && nested.env.GITHUB_TOKEN).toBeUndefined();
+  expect("trust" in nested && nested.trust).toMatch(/merge tokens stripped/);
 });
 
 test("PTY spawn is mockable and runMasterTui seeds work and agent tabs", () => {

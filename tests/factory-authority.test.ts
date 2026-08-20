@@ -1,7 +1,12 @@
 import { describe, expect, test } from "vitest";
-import { combineVerification, moduleFeedsVerification } from "../packages/core/src";
+import { combineVerification, moduleFeedsVerification, classifyUnknowns } from "../packages/core/src";
 import {
+  evaluateMergeReadiness,
+  sameActorApprovalBlocked,
+  classifyAiInvocation,
+  workersAiInferenceProvider,
   acquireWorkCellLease,
+  checkWorkCell,
   cleanupWorkCell,
   compileFactoryPlan,
   createWorkOrder,
@@ -9,11 +14,13 @@ import {
   defaultAftercare,
   dispatchTinkerGateway,
   emptyWaiver,
+  executeFactoryRun,
   githubTinkerMention,
   inspectRepository,
   linkAcceptanceCriterion,
   MemoryFactoryStore,
   ownershipGraph,
+  parseFactoryDefinition,
   parseTinkerIntent,
   pinWorkOrderPlan,
   rejectWorkerVerdict,
@@ -128,6 +135,14 @@ describe("factory authority", () => {
     });
     expect(combined.ignoredReported).toBe(1);
     expect(combined.verificationVerdict).toBe("PASS");
+    expect(combined.reviewAssessment).toBe("CLEAR");
+    const warned = combineVerification({
+      findings: [{ id: "w", ruleId: "impact.unverified", category: "impact", severity: "warning", message: "review", explanation: "x", suggestedAction: "y", confidence: "medium" } as never],
+      config: { test_integrity: { mode: "advisory" } } as never,
+      unknowns: [],
+    });
+    expect(warned.verificationVerdict).toBe("UNKNOWN");
+    expect(warned.reviewAssessment).toBe("NEEDS_HUMAN_REVIEW");
   });
 
   test("catalog, aftercare, packs, and steward loop stay off the verdict path", () => {
@@ -150,20 +165,85 @@ describe("factory authority", () => {
     expect(improvementLoopStep("propose").silentChangeForbidden).toBe(true);
   });
 
-  test("factory commands and aftercare persist off the verdict path", async () => {
-    const store = new MemoryFactoryStore();
-    const dispatched = dispatchTinkerGateway({
-      text: "@tinker status",
-      organizationId: "org",
-      sourceSystem: "slack",
-      sourceObjectId: "1",
-      actorId: "u",
-      authorized: true,
+  test("internal Workers AI cannot serve customer production", async () => {
+    expect(() => classifyAiInvocation({ stage: "implementation", providerId: "workers-ai", mode: "managed" })).toThrow(/customer_production_cannot_use_tinkerbot_provider/);
+    expect(classifyAiInvocation({ stage: "triage", providerId: "workers-ai", mode: "managed" })).toMatchObject({
+      aiPurpose: "internal_factory_intelligence",
+      billingOwner: "tinkerbot",
     });
-    await store.insertFactoryCommand(dispatched.command);
-    await store.insertAftercare(defaultAftercare("rel_persist", "owner"));
-    expect(store.commands).toHaveLength(1);
-    expect(store.aftercare[0]?.outcomeStatus).toBe("pending");
+    let productionCalls = 0;
+    const provider = workersAiInferenceProvider({
+      run: async () => {
+        productionCalls += 1;
+        return { response: "no" };
+      },
+    });
+    await expect(provider.run({ model: "x", messages: [], stage: "implementation" })).rejects.toThrow(/customer_production/);
+    expect(productionCalls).toBe(0);
+    await expect(provider.run({ model: "x", messages: [], stage: "triage" })).resolves.toMatchObject({ text: "no" });
+  });
+
+  test("restricted lines enforce author-never-approver and never auto-merge", () => {
+    expect(sameActorApprovalBlocked({ actorId: "alice", cellHolderId: "alice", lineId: "security", autonomyMode: "restricted" })).toEqual({ blocked: true, reason: "author_cannot_approve" });
+    expect(sameActorApprovalBlocked({ actorId: "bob", cellHolderId: "alice", lineId: "security", autonomyMode: "restricted" }).blocked).toBe(false);
+    expect(sameActorApprovalBlocked({ actorId: "alice", cellHolderId: "alice", lineId: "feature" }).blocked).toBe(false);
+    expect(evaluateMergeReadiness({ verdict: "PASS", approvals: 1, evidenceFresh: true, unknowns: [] }).humanMergeRequired).toBe(true);
+  });
+
+  test("WIP limits and productionAccess denial", () => {
+    const wip = acquireWorkCellLease({
+      cells: [],
+      factoryId: "f",
+      workOrderId: "wo_bbbbbbbb",
+      repository: "acme/pay",
+      branch: "tinkerbot/wo",
+      actor: "agent",
+      now: "2030-01-01T00:00:00.000Z",
+      wipLimit: 1,
+      inProgressCount: 1,
+    });
+    expect(wip).toMatchObject({ ok: false, reason: "wip" });
+    const leased = acquireWorkCellLease({
+      cells: [],
+      factoryId: "f",
+      workOrderId: "wo_cccccccc",
+      repository: "acme/pay",
+      branch: "tinkerbot/wo",
+      actor: "agent",
+      now: "2030-01-01T00:00:00.000Z",
+    });
+    expect(leased.ok).toBe(true);
+    if (!leased.ok) return;
+    expect(leased.cell.productionAccess).toBe("denied");
+    expect(checkWorkCell({ ...leased.cell, productionAccess: "allowed" }, "2030-01-01T00:00:00.000Z").ok).toBe(false);
+    expect(checkWorkCell(leased.cell, "2030-01-01T00:00:00.000Z").ok).toBe(true);
+  });
+
+  test("Inspect closed-loop contract rehearsals", async () => {
+    expect(evaluateMergeReadiness({ verdict: "PASS", approvals: 1, evidenceFresh: true, unknowns: [], restricted: false }).humanMergeRequired).toBe(true);
+    expect(evaluateMergeReadiness({ verdict: "PASS", approvals: 1, evidenceFresh: true, unknowns: [], restricted: true }).ready).toBe(false);
+    const missing = combineVerification({
+      findings: [],
+      config: { test_integrity: { mode: "advisory" } } as never,
+      unknowns: classifyUnknowns(["required test was not executed"]),
+      reportedClaims: [{ statement: "tests passed", provenance: "reported" }],
+    });
+    expect(missing.verificationVerdict).toBe("UNKNOWN");
+    expect(missing.ignoredReported).toBe(1);
+    expect(() => classifyAiInvocation({ stage: "implementation", providerId: "workers-ai" })).toThrow(/customer_production/);
+    const leased = acquireWorkCellLease({ cells: [], factoryId: "f", workOrderId: "wo_dddddddd", repository: "acme/pay", branch: "tinkerbot/wo", actor: "inspect", now: "2030-01-01T00:00:00.000Z" });
+    expect(leased.ok).toBe(true);
+    if (!leased.ok) return;
+    const human = takeWorkCell(leased.cell, "human-reviewer", "2030-01-01T00:00:01.000Z");
+    expect(human.heldBy).toBe("human-reviewer");
+    expect(human.leasedBy).toBe("human-reviewer");
+    expect(leased.cell.leasedBy).toBe("inspect");
+    expect(productionMetrics({ passedFirst: 1, total: 2, rework: 1, unknowns: 0, cycle: 10, queue: 1, costCents: 42 }).costPerWorkOrderCents).toBe(42);
+    expect(defaultAftercare("rel_loop", "owner").releaseId).toBe("rel_loop");
+    const definition = parseFactoryDefinition("name: inspect\nrepositories: [acme/pay]\nbudgets:\n  usdCents: 0\n  tokens: 0\nsources:\n  - type: github_issue\n");
+    const run = await executeFactoryRun({ definition, sourceType: "github_issue", untrustedText: "add a button", sandboxComplete: false, specApproved: true });
+    expect(run.stages.some((stage) => stage.stage === "implementation" && stage.status === "skipped")).toBe(true);
+    expect(run.stages.some((stage) => stage.stage === "verification")).toBe(true);
   });
 });
 

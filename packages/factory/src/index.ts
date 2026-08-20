@@ -55,6 +55,12 @@ export * from "./evals";
 export * from "./authority";
 export * from "./init";
 export * from "./oidc";
+export * from "./graph";
+export * from "./integrations";
+export * from "./orchestration";
+export * from "./production";
+export * from "./assurance";
+export * from "./outcomes";
 export { executeFactoryRun } from "./execute";
 import { assertCredentialRef, hostedRuntimeDefaults, parseRuntimeProfile, type RuntimeProfile } from "./runtime";
 import type { AcceptanceCriterionLink, Waiver } from "./authority";
@@ -162,6 +168,7 @@ export interface FactoryDefinition {
   secretRefs: string[];
   timeouts: { stageSeconds: number; runSeconds: number };
   budgets: { tokens: number; usdCents: number };
+  wipLimit: number;
   approvals: { required: boolean; roles: string[] };
   product?: FactoryProductDefinition;
   lines: ProductionLineDefinition[];
@@ -414,6 +421,7 @@ export function parseFactoryDefinition(input: unknown): FactoryDefinition {
     secretRefs: asStringArray(raw.secretRefs ?? raw.secrets).map((item) => item.startsWith("secret://") || item.startsWith("env:") ? item : `secret://${item}`),
     timeouts: { stageSeconds: Number(timeouts.stageSeconds ?? 900), runSeconds: Number(timeouts.runSeconds ?? 3600) },
     budgets: { tokens: Number(budgets.tokens ?? 100_000), usdCents: Number(budgets.usdCents ?? 500) },
+    wipLimit: Math.max(1, Number(raw.wipLimit ?? budgets.wipLimit ?? 8)),
     approvals: { required: approvals.required !== false, roles: asStringArray(approvals.roles).length ? asStringArray(approvals.roles) : ["maintainer", "admin", "owner"] },
     lines: defaultProductionLines(),
     skills: [],

@@ -66,7 +66,7 @@ function renderTool(block: Extract<Block, { kind: "tool" }>, color: boolean): st
 function verdictTone(text: string, color: boolean): string {
   if (/\bPASS\b/.test(text)) return paint(color, GREEN, text);
   if (/\bFAIL\b/.test(text)) return paint(color, RED, text);
-  if (/\bUNKNOWN\b|\bNEEDS_REVIEW\b/.test(text)) return paint(color, YELLOW, text);
+  if (/\bUNKNOWN\b/.test(text)) return paint(color, YELLOW, text);
   return text;
 }
 

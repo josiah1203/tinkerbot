@@ -13,6 +13,7 @@ import {
   soloRuntimeOverlay,
   validateInlineApproval,
   mergeRuntimeProfile,
+  type FactoryEvent,
 } from "../packages/factory/src";
 import { publicCapabilities } from "../packages/control-plane/src/entitlements";
 import { anthropicProvider, assertNoSecretInPayload, LOCAL_DB_SCHEMA_VERSION, replayOutbox, resolveCredentialRef, runLocalFactory, selectInferenceProvider, selectLocalSandbox, SQLITE_MAGIC, SqliteFactoryStore, stubInferenceProvider, stubSandboxPort } from "../packages/local-runtime/src";
@@ -70,6 +71,20 @@ describe("runtime contracts", () => {
 });
 
 describe("local runtime", () => {
+  test("persists and reconstructs the append-only Factory Graph", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tb-graph-"));
+    const db = path.join(dir, "local.db");
+    const store = new SqliteFactoryStore(db);
+    const base = { aggregateId: "wo_graph", aggregateType: "work_order", organizationId: "local", factoryId: "local-factory", actorId: "deterministic-verifier", actorType: "system" as const, correlationId: "corr_graph", schemaVersion: 1 as const, provenance: "DETERMINISTICALLY_VERIFIED" as const };
+    await store.appendFactoryEvent({ ...base, eventId: "event-1", type: "verification.completed", occurredAt: "2026-08-20T00:00:00.000Z", payload: { verdict: "PASS" } });
+    await store.appendFactoryEvent({ ...base, eventId: "event-2", type: "review.completed", occurredAt: "2026-08-20T00:00:01.000Z", payload: { decision: "APPROVE" } });
+    expect((await store.reconstructFactoryGraph("wo_graph"))).toMatchObject({ verificationVerdict: "PASS", reviewDecision: "APPROVE" });
+    expect((await store.listOutbox()).filter((event) => event.kind === "factory-graph-event")).toHaveLength(2);
+    const reopened = new SqliteFactoryStore(db);
+    expect((await reopened.listFactoryEvents("wo_graph"))).toHaveLength(2);
+    await expect(reopened.appendFactoryEvent({ ...base, eventId: "event-2", type: "release.requested", occurredAt: "2026-08-20T00:00:02.000Z", payload: {} } as FactoryEvent)).rejects.toThrow();
+  });
+
   test("sqlite work order to stub sandbox receipt without secrets", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tb-local-"));
     const db = path.join(dir, "local.db");
@@ -151,6 +166,16 @@ describe("local runtime", () => {
     expect(runtime?.body).toMatchObject({ billing: "seats_only", upgradesVerdict: false });
     const exceptions = localDashboardApi(store, new URL("http://127.0.0.1/exceptions"), "GET");
     expect(exceptions?.body).toMatchObject({ kanban: false, attentionFirst: true });
+  });
+
+  test("missing BYOK does not fall back to workers-ai", () => {
+    expect(() => selectInferenceProvider({
+      mode: "byok",
+      env: { TINKERBOT_STUB_INFERENCE: "0", VITEST: "1" },
+    })).toThrow(/no BYOK credentialRef resolved/);
+    const stub = selectInferenceProvider({ mode: "byok", env: { VITEST: "1", TINKERBOT_STUB_INFERENCE: "1" } });
+    expect(stub.id).not.toBe("workers-ai");
+    expect(stub.id).toBe("stub");
   });
 
   test("OpenRouter is an OpenAI-compatible customer baseUrl", () => {

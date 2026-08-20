@@ -2,7 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   checkWorkCell,
+  calculateFactoryEconomics,
+  projectFactoryEvents,
   compileFactoryPlan,
+  createMicroIntent,
   createWorkOrder,
   dispatchTinkerGateway,
   emptyWaiver,
@@ -63,7 +66,27 @@ export function localWorkNewPayload(root: string, intent?: string): Record<strin
     acceptanceCriteriaChain: text ? [linkAcceptanceCriterion(text, "repository")] : [],
   }), plan);
   void store.insertWorkOrder(order);
+  void store.appendFactoryEvent({
+    eventId: `evt_${order.workOrderId}`, type: "work_order.created", aggregateId: order.workOrderId, aggregateType: "work_order",
+    organizationId: order.organizationId, factoryId: order.factoryId, actorId: order.actor, actorType: "human", occurredAt: order.createdAt,
+    correlationId: order.workOrderId, schemaVersion: 1, policyVersion: order.policyVersion, provenance: "HUMAN_VERIFIED", payload: { intentId: order.workOrderId, intent: text, workOrderId: order.workOrderId },
+  });
   return { created: true, workOrderId: order.workOrderId, lineId: order.lineId, verificationVerdict: order.verificationVerdict, reviewAssessment: order.reviewAssessment, releaseDecision: order.releaseDecision, requiresAi: false, pinnedPlan: plan.digest };
+}
+
+/** Local, accountless intake. Hosted sync may later mirror this canonical intent event. */
+export function localIntentPayload(text?: string): Record<string, unknown> {
+  const title = text?.trim();
+  if (!title) throw new Error("intent requires a description");
+  const intent = createMicroIntent(title);
+  return { created: true, intent, next: "tb work new \"<implementation task>\"", requiresHostedAccount: false };
+}
+
+export function localFactoryGraphStatusPayload(root: string, aggregateId?: string): Record<string, unknown> {
+  if (!aggregateId) throw new Error("factory status requires a work-order or aggregate identifier");
+  const store = new SqliteFactoryStore(defaultLocalDbPath(root));
+  const events = store.readFactoryEvents(aggregateId);
+  return { aggregateId, events, state: projectFactoryEvents(events), economics: calculateFactoryEconomics(events), sourceOfTruth: "append_only_factory_graph" };
 }
 
 export function cellCheckPayload(input: { repository: string; branch: string; status?: "free" | "leased" | "held" | "abandoned"; credentialScope?: string }): Record<string, unknown> {

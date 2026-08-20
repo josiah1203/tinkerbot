@@ -77,6 +77,6 @@ Use the example workflow in [`.github/workflows/pr-proof.example.yml`](../.githu
 
 ## Read the result
 
-`PASS` means no actionable finding was produced. `NEEDS_REVIEW` identifies evidence that needs a human review. `UNKNOWN` means an optional or dynamic evidence source was unavailable; it is not a false pass or automatic failure. `FAIL` is reserved for explicitly configured blocking behavior.
+`PASS` means no actionable finding was produced. `UNKNOWN` means evidence is incomplete or warning-level findings need a human `reviewAssessment`. `FAIL` is reserved for blocking or critical findings.
 
 Hosted commands (`login`, `verify`, `factory`, `work`, `run`, `dashboard`) require a valid hosted session. Local deterministic subcommands remain available for development and CI; they cannot represent hosted authorization, policy, or accepted assurance state. No source code or full diff is uploaded by the hosted assurance ingestion path.

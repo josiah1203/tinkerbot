@@ -34,6 +34,9 @@ import {
   workersAiInferenceProvider,
   factoryAiFromProvider,
   defaultAftercare,
+  classifyAiInvocation,
+  INTELLIGENCE_STAGES,
+  IN_PROGRESS_STATES,
   type ConversationMessage,
   type FactoryAi,
   type FactoryDefinition,
@@ -132,7 +135,8 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
   });
   for (const stage of result.stages) {
     await factories.insertStage(runId, stage.stage, stage.status, stage.summary, now);
-    if (stage.stage === "triage" || stage.stage === "specification" || stage.stage === "review" || stage.stage === "foreman" || stage.stage === "architecture" || stage.stage === "security") {
+    if (INTELLIGENCE_STAGES.has(stage.stage) || stage.stage === "security") {
+      const classified = classifyAiInvocation({ stage: stage.stage, providerId: "workers-ai", mode: "managed" });
       const receipt = createAgentExecutionReceipt({
         repository,
         baseSha: message.sha ?? "unknown",
@@ -154,7 +158,7 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
       const tokens = Math.ceil(stage.summary.length / 4);
       const costCents = estimatedCostMinor(calculated.aiClass, tokens);
       await factories.insertUsage({ organizationId, factoryId: factory.factoryId, runId, kind: `agent:${stage.stage}`, tokens, costCents, now });
-      await factories.insertAiCostEvent({ organizationId, factoryId: factory.factoryId, workOrderId: order.workOrderId, runId, stageId: stage.stage, agentId: stage.stage, modelId: definition.agents.find((agent) => agent.id === stage.stage)?.model ?? modelForCostClass(calculated.aiClass, stage.stage), tokens, costMinor: costCents, now });
+      await factories.insertAiCostEvent({ organizationId, factoryId: factory.factoryId, workOrderId: order.workOrderId, runId, stageId: stage.stage, agentId: stage.stage, modelId: definition.agents.find((agent) => agent.id === stage.stage)?.model ?? modelForCostClass(calculated.aiClass, stage.stage), tokens, costMinor: costCents, now, provider: classified.providerOwnership === "tinkerbot" ? "workers-ai" : "customer" });
       if (result.plan) {
         const usage = inference?.usage({ text: stage.summary }) ?? {
           provider: "workers-ai",
@@ -192,12 +196,13 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
       cleanupAt: String(row.cleanup_at ?? now),
       createdAt: String(row.created_at ?? now),
     }));
-    const lease = acquireWorkCellLease({ cells, factoryId: factory.factoryId, workOrderId: order.workOrderId, repository, branch: implementBranchName(order.workOrderId), actor: "factory-agent", now });
+    const inProgress = (await factories.listWorkOrders(organizationId)).filter((item) => IN_PROGRESS_STATES.includes(item.status)).length;
+    const lease = acquireWorkCellLease({ cells, factoryId: factory.factoryId, workOrderId: order.workOrderId, repository, branch: implementBranchName(order.workOrderId), actor: "factory-agent", now, wipLimit: definition.wipLimit, inProgressCount: inProgress });
     if (!lease.ok) {
       await factories.applyTransition(order.workOrderId, "blocked", `cell:${lease.reason}:${message.deliveryId}`, "factory-workflow");
       return { workOrderId: order.workOrderId, runId, wait: result.wait, terminal: "blocked" };
     }
-    await factories.upsertWorkCell({ ...lease.cell, now });
+    await factories.upsertWorkCell({ ...lease.cell, now, productionAccess: lease.cell.productionAccess, observability: lease.cell.observability, allowedTools: lease.cell.allowedTools });
     await factories.patchWorkOrder(order.workOrderId, { cellId: lease.cell.cellId, now });
     const sandbox = await dispatchSandboxIfBound(env, { workOrderId: order.workOrderId, repository, intent: message.issueOrPullRequest, installationId: message.installationId, organizationId, runId });
     if (sandbox.complete) {

@@ -148,7 +148,7 @@ function marketingHeader() {
   const productOpen = signedIn();
   return h(
     "<header class=\"marketing-header\">",
-    "<a class=\"marketing-brand\" href=\"/\">Tinkerbot</a>",
+    "<a class=\"marketing-brand\" href=\"/\"><span class=\"proof-mark\" aria-hidden=\"true\"></span>Tinkerbot</a>",
     "<nav class=\"marketing-nav\">",
     "<a href=\"/product\">Product</a>",
     "<a href=\"/changelog\">Changelog</a>",
@@ -178,6 +178,11 @@ function marketingShell(body) {
 
 function prose(title, body) {
   return h("<main class=\"prose\"><h1>", esc(title), "</h1>", body, "</main>");
+}
+
+function mountMascots() {
+  if (!app.querySelector("[data-tinkerbot-mascot]")) return;
+  void import("/mascot-island.js").then(({ mountTinkerbotMascots }) => mountTinkerbotMascots(app));
 }
 
 const CHANGELOG = [
@@ -254,13 +259,14 @@ function publicPage() {
     return marketingShell(prose("Terms", "<p>Tinkerbot is a proprietary hosted factory operating system. Hosted commands require an authenticated session. Local verification remains independently authoritative.</p>"));
   }
   return marketingShell(h(
-    "<main class=\"hero\">",
+    "<main class=\"hero hero-with-mascot\"><div>",
     "<p class=\"eyebrow\">Factory operating system</p>",
-    "<h1>Tinkerbot Factory OS</h1>",
+    "<h1>Software production, under control.</h1>",
     "<p>A governed production system that turns software intent into verified, traceable, releasable changes.</p>",
     "<p class=\"hero-actions\">",
     signedIn() ? "<a class=\"button primary\" href=\"/app\">Open app</a>" : h("<a class=\"button primary\" href=\"/login\">Start trial</a> <a class=\"button\" href=\"/login\">Log in</a>"),
-    " <a href=\"/pricing\">Pricing</a></p>",
+    " <a href=\"/pricing\">Pricing</a></p></div>",
+    "<div class=\"marketing-mascot\" data-tinkerbot-mascot=\"hero\" data-expression=\"happy\" aria-hidden=\"true\"></div>",
     "</main>",
   ));
 }
@@ -722,6 +728,7 @@ function appPage() {
 }
 
 function render() {
+  window.__tinkerbotDisposeMascots?.();
   const canonical = canonicalHref();
   if (canonical !== pathName() + window.location.search) {
     window.history.replaceState({}, "", canonical);
@@ -730,6 +737,7 @@ function render() {
   if (path.startsWith("/app")) {
     if (!signedIn()) {
       app.innerHTML = publicPage();
+      mountMascots();
       return;
     }
     app.innerHTML = appPage();
@@ -743,6 +751,7 @@ function render() {
     return;
   }
   app.innerHTML = publicPage();
+  mountMascots();
 }
 
 function loadStatus(error) {

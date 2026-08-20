@@ -113,7 +113,7 @@ The local engine is the most mature and testable part of the repository. It crea
 9. release and assurance contracts;
 10. machine-readable and human-readable reports.
 
-The verdict model is explicit: `PASS`, `FAIL`, `NEEDS_REVIEW`, or `UNKNOWN`. Unknowns are retained as evidence and are not converted into passes. The report schema deliberately distinguishes findings, limitations, evidence, baselines, and summary metrics instead of presenting a single opaque score.
+The verdict model is explicit: `PASS`, `FAIL`, or `UNKNOWN`. Human review is a separate `reviewAssessment`. Unknowns are retained as evidence and are not converted into passes. The report schema deliberately distinguishes findings, limitations, evidence, baselines, and summary metrics instead of presenting a single opaque score.
 
 The CLI exposes both narrow commands (`tb check`, `tb verify`, `tb test-integrity`, `tb impact`, `tb contracts`, `tb select-tests`, `tb baseline`, `tb policy`, `tb artifacts`, `tb history`) and hosted/factory commands (`tb factory`, `tb work`, `tb cell`, `tb product`, `tb skill`, `tb evolution`, `tb run`, `tb receipt`, `tb release`, `tb outcome`, `tb evidence`, `tb change`, `tb change-set`). `tb serve` is intentionally retired as a product surface and returns the documented exit code rather than impersonating the hosted control plane.
 

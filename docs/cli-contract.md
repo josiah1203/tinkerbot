@@ -4,15 +4,16 @@
 
 | Code | Meaning |
 | ---: | --- |
-| 0 | PASS, advisory NEEDS_REVIEW, or an informational command completed |
-| 1 | FAIL, or NEEDS_REVIEW in blocking mode |
+| 0 | PASS, advisory UNKNOWN, or an informational command completed |
+| 1 | FAIL |
+
 | 2 | UNKNOWN when `output.fail_on_unknown` is enabled, or an unavailable history/artifact command |
 | 3 | Configuration, argument, policy, format, or report-input error |
 | 4 | Repository, Git, worktree, or execution error |
 | 5 | Unexpected internal error |
 | 12 | Recognized command unavailable in this client build |
 
-Scripts may rely on these values. A normal advisory `NEEDS_REVIEW` does not fail the process; blocking mode and explicit unknown policy do.
+Scripts may rely on these values. Advisory `UNKNOWN` does not fail the process unless `output.fail_on_unknown` is enabled. Review lives on `reviewAssessment`, not `verdict`.
 
 ## Commands
 

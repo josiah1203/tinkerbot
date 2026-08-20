@@ -2,11 +2,21 @@
 
 A Tinkerbot factory is a standing workflow: a Foreman routes each work item through triage, specification, implementation, review, and verification. The factory does repetitive work. Your team stays in the loop at spec approval and merge. AI workers are optional: Git, `tb`, CI, `tb check`, and humans are enough.
 
+## Factory Graph and migration
+
+The Factory Graph is the shared source of truth behind the CLI, TUI, Control Plane, reports, and integrations. Its append-only ledger records lifecycle events with actor, organization, factory, correlation, policy, provenance, and external-reference metadata. Read projections keep deterministic verification, review, release, and outcome decisions as separate fields; a passing check is never an approval or release.
+
+`packages/factory/src/graph.ts` defines the portable event, intent, task, worker-contract, receipt, external-reference, authority, economics, and integration-command contracts. Local SQLite and hosted D1 stores persist the same append-only events and materialize read projections without requiring a hosted account for local verification. A micro intent only needs why and expected behavior, while standard and strategic intents progressively require governance and outcome fields.
+
+`tb factory status <work-order-id>` reconstructs the local lifecycle and cost projection from the append-only ledger. `tb intent "..."` starts an accountless micro intent; use `tb work new "..."` to create the corresponding local work order.
+
+The former GitHub App template is deprecated and retained for historical migration only. New GitHub, Slack, Jira, Linear, and webhook integrations use `@tinkerbot` commands and `ExternalReference` mapping rather than provider-owned task state. Customer-owned, least-privilege GitHub Actions remain supported for deterministic verification.
+
 `tb check` is the only verification verdict. Agents never merge. Seat billing is unchanged. Hosted Workers AI is the intelligence plane (routing hints, judges, Steward drafts), not the customer coding model. `@tinker` is the external command handle on GitHub/Slack/Jira/Linear.
 
 ## Definition as code
 
-`tb factory init` inspects the repository and writes a conservative starter. `tb factory new` and `/app/factories/new` write a named starter `.tinkerbot` tree (MCP `create_factory` is the same payload). `tb factory validate` parses the tree. `tb factory check` compiles an immutable FactoryPlan. `tb factory plan` prints a dry-run ExecutionPlan and CostEstimate with no WorkOrder or branch. `tb factory sync` uploads it to the control plane. `tb run --local` starts a local run against SQLite (schema 14) + Docker. The process runner is opt-in (`--allow-process-runner`) and prints a warning. Tests and CI use a stub sandbox unless `TINKERBOT_STUB_SANDBOX=0`. When Docker is missing, the stub sandbox is used and documented on stderr. `tb eval` runs portable personal suites. Scorers never upgrade `tb check`. `tb dashboard --local` serves the control-plane SPA with a local SQLite adapter (`organizationId = local`). Optional outbox replay POSTs to `/runtime/sync` when you are logged in and `sync` is `hosted` or `manual`.
+`tb factory init` inspects the repository and writes a conservative starter. `tb factory new` and `/app/factories/new` write a named starter `.tinkerbot` tree (MCP `create_factory` is the same payload). `tb factory validate` parses the tree. `tb factory check` compiles an immutable FactoryPlan. `tb factory plan` prints a dry-run ExecutionPlan and CostEstimate with no WorkOrder or branch. `tb factory sync` uploads it to the control plane. `tb run --local` starts a local run against SQLite (schema 15) + Docker. The process runner is opt-in (`--allow-process-runner`) and prints a warning. Tests and CI use a stub sandbox unless `TINKERBOT_STUB_SANDBOX=0`. When Docker is missing, the stub sandbox is used and documented on stderr. `tb eval` runs portable personal suites. Scorers never upgrade `tb check`. `tb dashboard --local` serves the control-plane SPA with a local SQLite adapter (`organizationId = local`). Optional outbox replay POSTs to `/runtime/sync` when you are logged in and `sync` is `hosted` or `manual`.
 
 ```text
 .tinkerbot/factory.yaml

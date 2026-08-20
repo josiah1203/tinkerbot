@@ -12,8 +12,9 @@
     "skipLibCheck": true,
     "sourceMap": false,
     "declaration": true,
-    "types": ["node", "vitest/globals"]
+    "jsx": "react-jsx",
+    "types": ["node", "vitest/globals", "react", "react-dom"]
   },
-  "include": ["packages/**/*.ts", "action/**/*.ts", "tests/**/*.ts"],
+  "include": ["packages/**/*.ts", "packages/**/*.tsx", "action/**/*.ts", "tests/**/*.ts"],
   "exclude": ["node_modules", "dist", "fixtures/**/node_modules", "packages/**/*.test.ts", "tests/e2e"]
 }

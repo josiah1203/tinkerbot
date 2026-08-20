@@ -1,4 +1,4 @@
-import worker, { roleHasCapability } from "../apps/control-plane-worker/src";
+import worker, { roleHasCapability, workOSRoleToTenantRole } from "../apps/control-plane-worker/src";
 import { createHmac } from "node:crypto";
 
 function cookieFrom(response: Response, name: string): string {
@@ -40,6 +40,12 @@ test("tenant RBAC capabilities are explicit and least-privilege", () => {
   expect(roleHasCapability("viewer", "ops:read")).toBe(false);
   expect(roleHasCapability("maintainer", "factory:write")).toBe(true);
   expect(roleHasCapability("owner", "ops:read")).toBe(true);
+});
+
+test("SCIM/WorkOS roles map through the versioned Tinkerbot role table", () => {
+  expect(workOSRoleToTenantRole(["admin"])).toBe("admin");
+  expect(workOSRoleToTenantRole(["maintainer"])).toBe("maintainer");
+  expect(workOSRoleToTenantRole([])).toBe("viewer");
 });
 
 test("Cloudflare Worker accepts only signed GitHub installation webhooks and persists them replay-safely", async () => {

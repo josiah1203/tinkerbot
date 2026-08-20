@@ -18,7 +18,7 @@ export interface HostedWorkView {
   stages?: HostedStage[];
 }
 
-const VERDICTS = new Set(["PASS", "FAIL", "UNKNOWN", "NEEDS_REVIEW"]);
+const VERDICTS = new Set(["PASS", "FAIL", "UNKNOWN"]);
 
 function agentClaimedPass(stages: HostedStage[]): boolean {
   return stages.some((stage) => /tests?\s+passed|\bPASS\b/i.test(stage.summary ?? ""));
@@ -37,7 +37,7 @@ export function hostedVerificationFromView(view: HostedWorkView): { ingested: bo
         : "Waiting for Action OIDC ingest of tb check. Missing ingest is UNKNOWN.",
     };
   }
-  const raw = order.verificationVerdict;
+  const raw = order.verificationVerdict === "NEEDS_REVIEW" ? "UNKNOWN" : order.verificationVerdict;
   const verdict: Verdict = raw && VERDICTS.has(raw) ? raw as Verdict : "UNKNOWN";
   return { ingested: true, verdict, detail: `Ingested tb check verdict ${verdict}.` };
 }

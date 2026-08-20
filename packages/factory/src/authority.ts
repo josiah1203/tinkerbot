@@ -1,6 +1,9 @@
 import crypto from "node:crypto";
 import { autonomyAllowsSkip, type ProductionLineId } from "./os";
 import { FORBIDDEN_HARNESS_TYPES } from "./definition";
+import { UNKNOWN_CODES, type UnknownCode } from "../../core/src/inspection";
+
+export { UNKNOWN_CODES, type UnknownCode };
 
 export interface FactoryPlanSource {
   name: string;
@@ -27,19 +30,6 @@ export type WaiverStatus = (typeof WAIVER_STATUSES)[number];
 
 export const FACT_PROVENANCE = ["verified", "attested", "reported", "inferred", "unknown"] as const;
 export type FactProvenance = (typeof FACT_PROVENANCE)[number];
-
-export const UNKNOWN_CODES = [
-  "evidence_unavailable",
-  "source_not_uploaded",
-  "oidc_ingest_missing",
-  "environment_not_reproducible",
-  "required_test_not_executed",
-  "dependency_graph_incomplete",
-  "runtime_outcome_not_observed",
-  "receipt_stale",
-  "worker_claim_unverifiable",
-] as const;
-export type UnknownCode = (typeof UNKNOWN_CODES)[number];
 
 export const TINKER_ACTIONS = [
   "traveler_status",
@@ -257,6 +247,24 @@ export function createWorkerEnvelope(input: Omit<WorkerEnvelope, "capabilityToke
     ...input,
     capabilityToken: input.capabilityToken ?? `cap:${input.cellLeaseId}:${input.workerId}`,
   };
+}
+
+export function sameActorApprovalBlocked(input: {
+  actorId: string;
+  implementerId?: string;
+  cellHolderId?: string;
+  lineId?: string;
+  autonomyMode?: string;
+}): { blocked: boolean; reason?: string } {
+  const restricted = input.autonomyMode === "restricted"
+    || input.lineId === "security"
+    || input.lineId === "release"
+    || input.lineId === "incident"
+    || input.lineId === "migration";
+  if (!restricted) return { blocked: false };
+  const producer = input.implementerId ?? input.cellHolderId;
+  if (producer && producer === input.actorId) return { blocked: true, reason: "author_cannot_approve" };
+  return { blocked: false };
 }
 
 export function rejectWorkerVerdict(payload: Record<string, unknown>): { ok: true } | { ok: false; reason: string } {

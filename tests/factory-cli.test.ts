@@ -274,6 +274,10 @@ test("tb factory init, factory check, work new, and cell check do not require AI
   git(root, ["commit", "-qm", "seed"]);
   process.chdir(root);
   process.env.TINKERBOT_LOCAL_DB = path.join(root, "state.sqlite");
+  const intent = capture(() => runCli(["intent", "Fix invoice timezone formatting"]));
+  expect(intent.code).toBe(0);
+  expect(intent.stdout).toContain('"mode": "micro"');
+  expect(intent.stdout).toContain('"intentId"');
   const initialized = capture(() => runCli(["factory", "init", "demo-factory"]));
   expect(initialized.code).toBe(0);
   expect(initialized.stdout).toContain('"requiresAi": false');
@@ -286,6 +290,10 @@ test("tb factory init, factory check, work new, and cell check do not require AI
   expect(work.code).toBe(0);
   expect(work.stdout).toContain('"requiresAi": false');
   expect(work.stdout).toContain('"verificationVerdict": "UNKNOWN"');
+  const workId = JSON.parse(work.stdout).workOrderId as string;
+  const graphStatus = capture(() => runCli(["factory", "status", workId]));
+  expect(graphStatus.code).toBe(0);
+  expect(graphStatus.stdout).toContain('"sourceOfTruth": "append_only_factory_graph"');
   const cell = capture(() => runCli(["cell", "check"]));
   expect(cell.code).toBe(0);
   expect(cell.stdout).toContain('"inspection": "cell"');

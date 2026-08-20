@@ -109,11 +109,11 @@ test("revision commands use safe argv, scrub secret environment, time out, and c
   expect(fs.existsSync(directory)).toBe(false);
 });
 
-test("all four verdict states remain explicit", () => {
+test("tb check verdicts are PASS, FAIL, or UNKNOWN", () => {
   const advisory = structuredClone(DEFAULT_CONFIG);
   expect(calculateVerdict([], advisory, [])).toBe("PASS");
   expect(calculateVerdict([], advisory, ["coverage unavailable"])).toBe("UNKNOWN");
-  expect(calculateVerdict([baseFinding({ severity: "warning" })], advisory, [])).toBe("NEEDS_REVIEW");
+  expect(calculateVerdict([baseFinding({ severity: "warning" })], advisory, [])).toBe("UNKNOWN");
   const blocking = structuredClone(DEFAULT_CONFIG);
   blocking.test_integrity.mode = "blocking";
   expect(calculateVerdict([baseFinding({ severity: "high", blocking: true })], blocking, [])).toBe("FAIL");
@@ -155,7 +155,7 @@ test("artifact loading and parser diagnostics make unsupported input explicit", 
 
 test("reporters escape hostile text and omit fake SARIF locations", () => {
   const finding = baseFinding({ file: "tests/[evil]|name.ts", message: "bad\n::error file=secret.ts::leak", line: undefined });
-  const rendered = renderMarkdown(report([finding], "NEEDS_REVIEW"));
+  const rendered = renderMarkdown(report([finding], "UNKNOWN"));
   expect(rendered).not.toContain("\n::error");
   expect(rendered).toContain("tests/\\[evil\\]\\|name.ts");
   const sarif = JSON.parse(renderSarif(finalizeReport(report([baseFinding({ file: "repository", line: undefined })])))) as { runs: Array<{ results: Array<{ locations?: unknown[] }> }> };
@@ -179,7 +179,7 @@ test("stability fixture manifest remains structured and bounded", () => {
     expect(typeof scenario.area).toBe("string");
     expect(typeof scenario.scenario).toBe("string");
     expect(Array.isArray(scenario.expectedFindings)).toBe(true);
-    expect(["PASS", "NEEDS_REVIEW", "UNKNOWN", "FAIL"]).toContain(scenario.expectedVerdict);
+    expect(["PASS", "UNKNOWN", "FAIL"]).toContain(scenario.expectedVerdict);
     expect(Array.isArray(scenario.expectedUnknowns)).toBe(true);
     expect(Number.isInteger(scenario.expectedExitCode)).toBe(true);
   }

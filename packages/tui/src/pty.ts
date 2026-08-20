@@ -10,6 +10,6 @@ export function attachAgentPty(id: AgentId, cwd: string, env: NodeJS.ProcessEnv,
   const spec = spawnSpec(id, cwd, env);
   if ("error" in spec) return { error: spec.error, trust: "Install the vendor CLI and complete its own login. Tinkerbot does not store OAuth tokens." };
   const run = deps.spawn ?? spawn;
-  const child = run(spec.bin, spec.args, { cwd: spec.cwd, env, stdio: "inherit" });
+  const child = run(spec.bin, spec.args, { cwd: spec.cwd, env: spec.env, stdio: "inherit" });
   return { process: child, trust: spec.trust };
 }

@@ -72,7 +72,7 @@ function report(overrides: Record<string, unknown> = {}): PrProofReport {
     base: "base",
     head: "head",
     generatedAt: "2026-01-01T00:00:00.000Z",
-    verdict: "NEEDS_REVIEW",
+    verdict: "UNKNOWN",
     summary: {
       assertionsWeakened: 1,
       newTests: 2,
@@ -265,7 +265,7 @@ test("reporters render complete and minimized views with escaping and explicit f
   expect(renderSarif(rich)).toContain('"startLine": 4');
   for (const format of ["json", "markdown", "sarif", "review-context", "receipt", "change-assurance", "release-manifest", "terminal"] as const) expect(renderReport(rich, format)).toBeTruthy();
   expect(verdictEmoji("PASS")).toBe("✅");
-  expect(verdictEmoji("NEEDS_REVIEW")).toBe("⚠️");
+  expect(verdictEmoji("UNKNOWN")).toBe("❔");
   expect(verdictEmoji("FAIL")).toBe("❌");
   expect(verdictEmoji("UNKNOWN")).toBe("❔");
 });

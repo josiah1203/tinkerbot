@@ -5,10 +5,10 @@ import crypto from "node:crypto";
 import { MemoryFactoryStore, type FactoryStore, type OutboxEvent, type InlineApprovalRecord } from "../../factory/src/store";
 import type { CostEstimate, ExecutionPlan, ProviderUsage } from "../../factory/src/runtime";
 import type { EvalAttempt, EvalSuite } from "../../factory/src/evals";
-import type { AftercareRecord, FactoryCommand, WorkOrder, WorkOrderState } from "../../factory/src";
+import { projectFactoryEvents, type AftercareRecord, type FactoryCommand, type FactoryEvent, type FactoryProjection, type WorkOrder, type WorkOrderState } from "../../factory/src";
 import { openSqliteDatabase, SQLITE_MAGIC, type SqliteDatabase } from "./sqlite-engine";
 
-export const LOCAL_DB_SCHEMA_VERSION = 14;
+export const LOCAL_DB_SCHEMA_VERSION = 16;
 
 export function defaultLocalDbPath(root?: string): string {
   if (process.env.TINKERBOT_LOCAL_DB) return process.env.TINKERBOT_LOCAL_DB;
@@ -69,7 +69,11 @@ CREATE TABLE IF NOT EXISTS tinkerbot_work_orders (
   dependencies_json TEXT,
   held_by TEXT,
   origin TEXT,
-  execution_plan_id TEXT
+  execution_plan_id TEXT,
+  verification_verdict TEXT NOT NULL DEFAULT 'UNKNOWN',
+  review_assessment TEXT NOT NULL DEFAULT 'NEEDS_HUMAN_REVIEW',
+  release_decision TEXT NOT NULL DEFAULT 'BLOCKED',
+  waiver_json TEXT
 );
 CREATE TABLE IF NOT EXISTS tinkerbot_work_order_events (
   event_id TEXT PRIMARY KEY,
@@ -213,6 +217,24 @@ CREATE TABLE IF NOT EXISTS tinkerbot_aftercare (
   payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tinkerbot_factory_graph_events (
+  event_id TEXT PRIMARY KEY,
+  aggregate_id TEXT NOT NULL,
+  aggregate_type TEXT NOT NULL,
+  organization_id TEXT NOT NULL,
+  factory_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  actor_type TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  correlation_id TEXT NOT NULL,
+  causation_id TEXT,
+  policy_version TEXT,
+  provenance TEXT NOT NULL,
+  external_references_json TEXT,
+  payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tinkerbot_factory_graph_aggregate ON tinkerbot_factory_graph_events (aggregate_id, occurred_at);
 `;
 
 function isSqliteFile(filePath: string): boolean {
@@ -248,6 +270,7 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
     }
     this.database = openSqliteDatabase(filePath);
     this.database.exec(LOCAL_DDL);
+    ensureSqliteColumns(this.database);
     this.migratedFromJson = Boolean(jsonPending);
     if (jsonPending) this.importJson(jsonPending);
     else this.loadSql();
@@ -372,12 +395,14 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
     this.database.prepare(`INSERT INTO tinkerbot_work_orders (
       work_order_id, factory_id, organization_id, source_type, source_id, repository_id, issue_or_pull_request, intent, acceptance_criteria,
       policy_version, definition_version, definition_digest, current_stage, status, actor, created_at, updated_at, product_id, line_id, cell_id,
-      owner, risk, autonomy_mode, output_kind, policy_json, dependencies_json, held_by, origin, execution_plan_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(work_order_id) DO UPDATE SET status = excluded.status, current_stage = excluded.current_stage, updated_at = excluded.updated_at`).run(
+      owner, risk, autonomy_mode, output_kind, policy_json, dependencies_json, held_by, origin, execution_plan_id,
+      verification_verdict, review_assessment, release_decision, waiver_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(work_order_id) DO UPDATE SET status = excluded.status, current_stage = excluded.current_stage, updated_at = excluded.updated_at, verification_verdict = excluded.verification_verdict, review_assessment = excluded.review_assessment, release_decision = excluded.release_decision`).run(
       order.workOrderId, order.factoryId, order.organizationId, order.sourceType, order.sourceId, order.repositoryId, order.issueOrPullRequest ?? null, order.intent ?? null, order.acceptanceCriteria ?? null,
       order.policyVersion, order.definitionVersion, order.definitionDigest, order.currentStage, order.status, order.actor, order.createdAt, order.updatedAt, order.productId ?? null, order.lineId ?? null, order.cellId ?? null,
       order.owner ?? null, order.risk ?? null, order.autonomyMode ?? null, order.outputKind ?? null, order.policyJson ?? null, order.dependenciesJson ?? null, order.heldBy ?? null, order.origin ?? "local", order.executionPlanId ?? null,
+      order.verificationVerdict ?? "UNKNOWN", order.reviewAssessment ?? "NEEDS_HUMAN_REVIEW", order.releaseDecision ?? "BLOCKED", order.waiver ? JSON.stringify(order.waiver) : null,
     );
   }
 
@@ -490,6 +515,39 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
       record.releaseId, record.owner, record.environment, JSON.stringify(record), new Date().toISOString(),
     );
   }
+
+  override async appendFactoryEvent(event: FactoryEvent): Promise<void> {
+    await super.appendFactoryEvent(event);
+    try {
+      this.database.prepare("INSERT INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, policy_version, provenance, external_references_json, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+        event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
+      );
+      await this.enqueueOutbox({ eventId: event.eventId, kind: "factory-graph-event", payloadJson: JSON.stringify({ event }), createdAt: event.occurredAt });
+    } catch (error) {
+      this.factoryEvents.splice(this.factoryEvents.findIndex((item) => item.eventId === event.eventId), 1);
+      throw error;
+    }
+  }
+
+  readFactoryEvents(aggregateId: string): FactoryEvent[] {
+    const rows = this.database.prepare("SELECT * FROM tinkerbot_factory_graph_events WHERE aggregate_id = ? ORDER BY occurred_at, event_id").all(aggregateId) as Array<Record<string, unknown>>;
+    return rows.map(rowToFactoryEvent);
+  }
+
+  override async listFactoryEvents(aggregateId: string): Promise<FactoryEvent[]> { return this.readFactoryEvents(aggregateId); }
+
+  override async reconstructFactoryGraph(aggregateId: string): Promise<FactoryProjection> {
+    return projectFactoryEvents(this.readFactoryEvents(aggregateId));
+  }
+}
+
+function ensureSqliteColumns(database: SqliteDatabase): void {
+  const columns = database.prepare("PRAGMA table_info(tinkerbot_work_orders)").all() as Array<{ name: string }>;
+  const names = new Set(columns.map((column) => column.name));
+  if (!names.has("verification_verdict")) database.exec("ALTER TABLE tinkerbot_work_orders ADD COLUMN verification_verdict TEXT NOT NULL DEFAULT 'UNKNOWN'");
+  if (!names.has("review_assessment")) database.exec("ALTER TABLE tinkerbot_work_orders ADD COLUMN review_assessment TEXT NOT NULL DEFAULT 'NEEDS_HUMAN_REVIEW'");
+  if (!names.has("release_decision")) database.exec("ALTER TABLE tinkerbot_work_orders ADD COLUMN release_decision TEXT NOT NULL DEFAULT 'BLOCKED'");
+  if (!names.has("waiver_json")) database.exec("ALTER TABLE tinkerbot_work_orders ADD COLUMN waiver_json TEXT");
 }
 
 function rowToWorkOrder(row: Record<string, unknown>): WorkOrder {
@@ -513,6 +571,9 @@ function rowToWorkOrder(row: Record<string, unknown>): WorkOrder {
     updatedAt: String(row.updated_at),
     origin: row.origin === "hosted" ? "hosted" : "local",
     executionPlanId: row.execution_plan_id ? String(row.execution_plan_id) : undefined,
+    verificationVerdict: (row.verification_verdict as WorkOrder["verificationVerdict"]) || "UNKNOWN",
+    reviewAssessment: (row.review_assessment as WorkOrder["reviewAssessment"]) || "NEEDS_HUMAN_REVIEW",
+    releaseDecision: (row.release_decision as WorkOrder["releaseDecision"]) || "BLOCKED",
   };
 }
 
@@ -530,4 +591,8 @@ function rowToUsage(row: Record<string, unknown>): ProviderUsage {
     catalogVersion: String(row.catalog_version),
     runnerOrigin: row.runner_origin === "hosted" ? "hosted" : "local",
   };
+}
+
+function rowToFactoryEvent(row: Record<string, unknown>): FactoryEvent {
+  return { eventId: String(row.event_id), aggregateId: String(row.aggregate_id), aggregateType: String(row.aggregate_type), organizationId: String(row.organization_id), factoryId: String(row.factory_id), type: String(row.event_type) as FactoryEvent["type"], actorId: String(row.actor_id), actorType: String(row.actor_type) as FactoryEvent["actorType"], occurredAt: String(row.occurred_at), correlationId: String(row.correlation_id), causationId: row.causation_id ? String(row.causation_id) : undefined, schemaVersion: 1, policyVersion: row.policy_version ? String(row.policy_version) : undefined, provenance: String(row.provenance) as FactoryEvent["provenance"], externalReferences: row.external_references_json ? JSON.parse(String(row.external_references_json)) : undefined, payload: JSON.parse(String(row.payload_json)) };
 }

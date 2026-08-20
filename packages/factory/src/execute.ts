@@ -58,6 +58,12 @@ export async function executeFactoryRun(input: {
     workOrderId: input.workOrderId,
   });
   const { plan, decision, autonomyMode, lineId } = built;
+  const estimatedTokens = plan.cost.estimatedInputTokens + plan.cost.estimatedOutputTokens;
+  const estimatedCents = plan.cost.byokSpendCents + plan.cost.managedCogsCents;
+  const overBudget = input.definition.budgets.tokens <= 0
+    || input.definition.budgets.usdCents <= 0
+    || estimatedTokens > input.definition.budgets.tokens
+    || estimatedCents > input.definition.budgets.usdCents;
   if (input.store) {
     await input.store.putExecutionPlan(plan);
     await input.store.putCostEstimate(plan.planId, plan.cost);
@@ -106,7 +112,9 @@ export async function executeFactoryRun(input: {
     stages.push({ stage: "architecture", status: architecture.status, summary: architecture.summary });
   }
   if (decision.requestRevision || planned.includes("implementation")) {
-    if (lineId !== "release" && !input.sandboxComplete) {
+    if (overBudget) {
+      stages.push({ stage: "implementation", status: "skipped", summary: "Budget exceeded. Implementation skipped. Verification still runs." });
+    } else if (lineId !== "release" && !input.sandboxComplete) {
       stages.push({ stage: "implementation", status: "ok", summary: "Queued Cloudflare Sandbox implement in a leased work cell. GitHub Actions remains verification-only. No application code has been written yet." });
       return { stages, terminal: "implementation", wait: decision.requestRevision ? "revision" : "sandbox", lineId, autonomyMode, plan, escalated };
     }

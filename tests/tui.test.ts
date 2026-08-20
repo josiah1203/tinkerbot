@@ -161,7 +161,7 @@ test("hosted agent stage text cannot become PASS without ingest", () => {
     workOrder: { verificationIngested: true, verificationVerdict: "NEEDS_REVIEW" },
     stages: [{ summary: "PASS" }],
   });
-  expect(ingested.verdict).toBe("NEEDS_REVIEW");
+  expect(ingested.verdict).toBe("UNKNOWN");
   expect(hostedVerificationFromView({ workOrder: { verificationIngested: true, verificationVerdict: "SHIP_IT" } }).verdict).toBe("UNKNOWN");
   expect(hostedStageTools({ stages: [{ stage: "triage", status: "running" }] })[0]).toMatchObject({ status: "running", name: "triage" });
 });

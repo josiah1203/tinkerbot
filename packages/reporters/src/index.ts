@@ -221,5 +221,5 @@ export function renderReport(report: PrProofReport, format: ReportFormat): strin
 }
 
 export function verdictEmoji(verdict: Verdict): string {
-  return verdict === "PASS" ? "✅" : verdict === "NEEDS_REVIEW" ? "⚠️" : verdict === "FAIL" ? "❌" : "❔";
+  return verdict === "PASS" ? "✅" : verdict === "FAIL" ? "❌" : "❔";
 }

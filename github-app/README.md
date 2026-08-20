@@ -1,4 +1,6 @@
-# Tinkerbot Verify GitHub App template
+# Deprecated GitHub App template
+
+This directory is retained only for historical installations and migration reference. It is not a Tinkerbot product surface and is not required to use Tinkerbot. New integrations use the provider-neutral `@tinkerbot` command/event protocol and map GitHub records to canonical Factory Graph objects through external references. Prefer the customer-owned GitHub Action or another least-privilege connector.
 
 [`manifest.json`](./manifest.json) points at `https://control.tinkerbot.dev`. Replace those URLs with the approved production control-plane host before creating the App.
 

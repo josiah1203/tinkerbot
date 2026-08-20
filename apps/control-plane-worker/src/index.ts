@@ -24,7 +24,8 @@ import { admitWebhook, githubEventKind, githubInstallationAccount, inlineReviewC
 import { admitGitlabWebhook } from "../../../packages/gitlab/src";
 import { D1FactoryStore } from "./factory-store";
 import { ForemanDurableObject, Sandbox, handleFactoryMcpRequest, intakeFromIntegration, runFactoryTurn, classifyWorkOrderGroup, githubSecurityIntake, sweepFactoryOs } from "./factory-runtime";
-import { createWorkOrder, verifyOidcJwt, oidcReplayKey, containsRawCredentials, customerProviderLabel, dispatchTinkerGateway, githubTinkerMention } from "../../../packages/factory/src";
+import { createWorkOrder, verifyOidcJwt, oidcReplayKey, containsRawCredentials, customerProviderLabel, dispatchTinkerGateway, githubTinkerMention, sameActorApprovalBlocked } from "../../../packages/factory/src";
+import { translateLegacyVerdict } from "../../../packages/core/src/verdict";
 import { createChangeSet, assessChangeSet, assessReleaseSafety, createReleaseManifest } from "../../../packages/assurance/src";
 import { calculateEntitlements, type EntitlementKey } from "../../../packages/control-plane/src";
 import {
@@ -445,7 +446,7 @@ async function publishVerificationToGitHub(env: Env, input: { repository: string
   }
 }
 
-function workOSRoleToTenantRole(roleSlugs: readonly string[]): TenantRole {
+export function workOSRoleToTenantRole(roleSlugs: readonly string[]): TenantRole {
   const roles = new Set(roleSlugs.map((role) => role.trim().toLowerCase()));
   if (roles.has("owner")) return "owner";
   if (roles.has("admin")) return "admin";
@@ -493,7 +494,12 @@ async function applyWorkOSEvent(event: WorkOSWebhookEvent, tenants: D1TenantStor
       if (entitlementDenied(calculated, "scim", true)) return;
     }
     const deleted = event.event.includes("deleted") || event.event.includes("removed");
-    await tenants.upsertMembership({ organizationId, userId, role: "viewer", status: deleted ? "removed" : "active", identityType: "human", accessState: deleted ? "disabled" : "enabled", updatedAt });
+    const roleSlugs: string[] = [];
+    if (typeof data.role === "string") roleSlugs.push(data.role);
+    if (typeof data.role_slug === "string") roleSlugs.push(data.role_slug);
+    const nestedRole = data.role && typeof data.role === "object" && data.role !== null && "slug" in data.role ? String((data.role as { slug?: string }).slug ?? "") : "";
+    if (nestedRole) roleSlugs.push(nestedRole);
+    await tenants.upsertMembership({ organizationId, userId, role: workOSRoleToTenantRole(roleSlugs), status: deleted ? "removed" : "active", identityType: "human", accessState: deleted ? "disabled" : "enabled", updatedAt });
     await afterSeatChange(env, tenants, organizationId, userId, deleted ? "removed" : "joined");
     return;
   }
@@ -728,6 +734,13 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
       if (workMatch[2] === "approve") {
         const current = await factories.getWorkOrder(workMatch[1]);
         if (!current || current.organizationId !== access.membership.organizationId) return json({ error: "Work order not found.", code: "not_found" }, 404);
+        const sod = sameActorApprovalBlocked({
+          actorId: access.current.session.user.id,
+          cellHolderId: current.heldBy,
+          lineId: current.lineId,
+          autonomyMode: current.autonomyMode,
+        });
+        if (sod.blocked) return json({ error: "The producer cannot approve this restricted work order.", code: sod.reason }, 403);
         const spec = current.status === "specification" || current.currentStage === "specification";
         await factories.insertApproval(current.workOrderId, access.current.session.user.id, "approved", "session", new Date().toISOString());
         if (spec) {
@@ -1123,12 +1136,15 @@ export default {
           bundle: checked.value,
           dashboardUrl: applicationUrl(request, env, "/app"),
         });
-        const verdict = typeof (checked.value as { receipts?: Array<{ verdict?: string }> }).receipts?.[0]?.verdict === "string" ? (checked.value as { receipts: Array<{ verdict: string }> }).receipts[0].verdict : "UNKNOWN";
+        const verdict = translateLegacyVerdict(typeof (checked.value as { receipts?: Array<{ verdict?: string }> }).receipts?.[0]?.verdict === "string" ? (checked.value as { receipts: Array<{ verdict: string }> }).receipts[0].verdict : "UNKNOWN");
         if (runToken?.runId && env.DB) {
           const run = await factories.getRun(runToken.runId);
           if (run?.work_order_id) {
             const order = await factories.getWorkOrder(run.work_order_id);
-            if (order) await handleFactoryQueueMessage(env, { deliveryId: `oidc:${runToken.runId}`, organizationId: order.organizationId, factoryId: order.factoryId, repository, sourceType: order.sourceType, sourceId: order.sourceId, workOrderId: order.workOrderId, actor: "oidc-ingest", sha: runToken.sha, verificationVerdict: verdict, verificationIngested: true, specApproved: true, sandboxComplete: true });
+            if (order) {
+              await factories.patchWorkOrder(order.workOrderId, { verificationVerdict: verdict, reviewAssessment: verdict === "FAIL" ? "REVISE" : verdict === "PASS" ? "CLEAR" : "NEEDS_HUMAN_REVIEW", now: new Date().toISOString() });
+              await handleFactoryQueueMessage(env, { deliveryId: `oidc:${runToken.runId}`, organizationId: order.organizationId, factoryId: order.factoryId, repository, sourceType: order.sourceType, sourceId: order.sourceId, workOrderId: order.workOrderId, actor: "oidc-ingest", sha: runToken.sha, verificationVerdict: verdict, verificationIngested: true, specApproved: true, sandboxComplete: true });
+            }
           }
         }
         return json({ ingested: true, authorized: true, organizationId: org, repository, sourceUpload: "not_uploaded" });

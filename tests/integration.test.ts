@@ -39,5 +39,6 @@ test("creates a unified report from a real base/head Git fixture", () => {
   expect(report.impact?.changedSymbols.some((symbol) => symbol.file === "src/routes.ts")).toBe(true);
   expect(report.impact?.paths.some((impact) => impact.file === "src/session.ts" || impact.file === "src/routes.ts")).toBe(true);
   expect(report.impact?.paths.some((impact) => impact.classification === "runtime_unknown")).toBe(true);
-  expect(report.verdict).toBe("NEEDS_REVIEW");
+  expect(report.verdict).toBe("UNKNOWN");
+  expect(report.reviewAssessment).toBe("REVISE");
 });

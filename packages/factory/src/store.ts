@@ -2,6 +2,7 @@ import type { AftercareRecord, FactoryCommand } from "./authority";
 import type { WorkOrder, WorkOrderEvent, WorkOrderState } from "./index";
 import type { CostEstimate, ExecutionPlan, ProviderUsage } from "./runtime";
 import type { EvalAttempt, EvalSuite } from "./evals";
+import { assertFactoryEventAuthority, graphEventForWorkOrderTransition, projectFactoryEvents, type FactoryEvent, type FactoryProjection } from "./graph";
 
 export interface FactoryStore {
   insertWorkOrder(order: WorkOrder): Promise<void>;
@@ -28,6 +29,9 @@ export interface FactoryStore {
   enqueueOutbox(event: OutboxEvent): Promise<void>;
   listOutbox(limit?: number): Promise<OutboxEvent[]>;
   markOutboxSynced(eventId: string, now: string): Promise<void>;
+  appendFactoryEvent(event: FactoryEvent): Promise<void>;
+  listFactoryEvents(aggregateId: string): Promise<FactoryEvent[]>;
+  reconstructFactoryGraph(aggregateId: string): Promise<FactoryProjection>;
 }
 
 export interface InlineApprovalRecord {
@@ -66,6 +70,7 @@ export class MemoryFactoryStore implements FactoryStore {
   readonly suites = new Map<string, EvalSuite>();
   readonly attempts: EvalAttempt[] = [];
   readonly outbox: OutboxEvent[] = [];
+  readonly factoryEvents: FactoryEvent[] = [];
   readonly commands: FactoryCommand[] = [];
   readonly aftercare: AftercareRecord[] = [];
 
@@ -89,6 +94,8 @@ export class MemoryFactoryStore implements FactoryStore {
     if ("error" in result) return { ok: false, code: result.error };
     this.orders.set(workOrderId, result.order);
     this.events.push(result.event);
+    const graphEvent = graphEventForWorkOrderTransition({ ...result.order, fromState: result.event.fromState, toState: result.event.toState, causeId: result.event.causeId, createdAt: result.event.createdAt });
+    if (graphEvent) await this.appendFactoryEvent(graphEvent);
     return { ok: true, order: result.order, event: result.event };
   }
 
@@ -177,6 +184,20 @@ export class MemoryFactoryStore implements FactoryStore {
   async markOutboxSynced(eventId: string, now: string): Promise<void> {
     const event = this.outbox.find((item) => item.eventId === eventId);
     if (event) event.syncedAt = now;
+  }
+
+  async appendFactoryEvent(event: FactoryEvent): Promise<void> {
+    assertFactoryEventAuthority(event);
+    if (this.factoryEvents.some((item) => item.eventId === event.eventId)) throw new Error("duplicate_event_id");
+    this.factoryEvents.push(Object.freeze(event));
+  }
+
+  async listFactoryEvents(aggregateId: string): Promise<FactoryEvent[]> {
+    return this.factoryEvents.filter((event) => event.aggregateId === aggregateId);
+  }
+
+  async reconstructFactoryGraph(aggregateId: string): Promise<FactoryProjection> {
+    return projectFactoryEvents(await this.listFactoryEvents(aggregateId));
   }
 
   async insertFactoryCommand(command: FactoryCommand): Promise<void> {

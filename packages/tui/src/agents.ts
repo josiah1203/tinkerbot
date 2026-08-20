@@ -75,13 +75,31 @@ export function detectAgents(env: NodeJS.ProcessEnv = process.env): DetectedAgen
   });
 }
 
-export function spawnSpec(id: AgentId, cwd: string, env: NodeJS.ProcessEnv = process.env): { bin: string; args: string[]; cwd: string; trust: string } | { error: string } {
+const MERGE_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GH_PROMPT_DISABLED"];
+
+export function agentSpawnEnv(id: AgentId, env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  if (id === "shell") return { ...env };
+  const next: NodeJS.ProcessEnv = { ...env, TINKERBOT_NEVER_MERGE: "1" };
+  for (const key of MERGE_ENV_KEYS) delete next[key];
+  return next;
+}
+
+export function agentArgsForbidMerge(args: string[]): boolean {
+  return !/\bgh(\.exe)?(\s+|$)|\bpr\s+merge\b/.test(args.join(" "));
+}
+
+export function spawnSpec(id: AgentId, cwd: string, env: NodeJS.ProcessEnv = process.env): { bin: string; args: string[]; cwd: string; trust: string; env: NodeJS.ProcessEnv } | { error: string } {
   const bin = resolveAgentBin(id, env);
   if (!bin) return { error: `${id} CLI was not found on PATH. Tinkerbot does not log you into vendor accounts.` };
+  const args: string[] = [];
+  if (!agentArgsForbidMerge(args)) return { error: "Nested agent arguments cannot include merge." };
   return {
     bin,
-    args: [],
+    args,
     cwd,
-    trust: "Nested PTY is user-owned. Tinkerbot will not merge. A raw terminal can still run gh pr merge if you could. tb check remains the only verdict.",
+    env: agentSpawnEnv(id, env),
+    trust: id === "shell"
+      ? "Nested PTY is user-owned. Tinkerbot will not merge. A raw terminal can still run gh pr merge if you could. tb check remains the only verdict."
+      : "Nested agent PTY has merge tokens stripped. Tinkerbot will not merge. tb check remains the only verdict.",
   };
 }

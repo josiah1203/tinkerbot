@@ -222,6 +222,8 @@ export interface WorkCell {
   status: "free" | "leased" | "held" | "abandoned";
   leasedBy?: string;
   heldBy?: string;
+  productionAccess?: "denied" | "allowed";
+  observability?: "read-only" | "bounded-write";
   credentialScope: string;
   cleanupAt: string;
   createdAt: string;
@@ -363,7 +365,10 @@ export function acquireWorkCellLease(input: {
   now: string;
   ttlMs?: number;
   concurrencyLimit?: number;
-}): { ok: true; cell: WorkCell } | { ok: false; reason: "collision" | "concurrency" } {
+  wipLimit?: number;
+  inProgressCount?: number;
+}): { ok: true; cell: WorkCell } | { ok: false; reason: "collision" | "concurrency" | "wip" } {
+  if ((input.inProgressCount ?? 0) >= (input.wipLimit ?? 32)) return { ok: false, reason: "wip" };
   const active = input.cells.filter((cell) => cell.factoryId === input.factoryId && (cell.status === "leased" || cell.status === "held"));
   if (active.length >= (input.concurrencyLimit ?? 8)) return { ok: false, reason: "concurrency" };
   const collision = input.cells.find((cell) => cell.repository === input.repository && cell.branch === input.branch && (cell.status === "leased" || cell.status === "held") && cell.workOrderId !== input.workOrderId);
@@ -380,6 +385,8 @@ export function acquireWorkCellLease(input: {
     pinSha: input.pinSha ?? existing?.pinSha,
     allowedTools: input.allowedTools ?? existing?.allowedTools ?? ["git", "test"],
     secretRefs: input.secretRefs ?? existing?.secretRefs ?? [],
+    productionAccess: "denied",
+    observability: "read-only",
     status: "leased",
     leasedBy: input.actor,
     credentialScope: `repo:${input.repository}:contents:write:tinkerbot/*`,
@@ -406,13 +413,15 @@ export function cellCredentialScope(cell: Pick<WorkCell, "repository" | "branch"
   return { ok: true, scope: `repo:${cell.repository}:contents:write:${cell.branch}` };
 }
 
-export function checkWorkCell(cell: Pick<WorkCell, "repository" | "branch" | "status" | "cleanupAt" | "credentialScope">, now: string): { ok: boolean; issues: string[] } {
+export function checkWorkCell(cell: Pick<WorkCell, "repository" | "branch" | "status" | "cleanupAt" | "credentialScope" | "productionAccess" | "observability">, now: string): { ok: boolean; issues: string[] } {
   const issues: string[] = [];
   const scope = cellCredentialScope(cell);
   if (!scope.ok) issues.push(scope.reason);
   if (cell.status === "abandoned") issues.push("Cell lease expired.");
   if (Date.parse(cell.cleanupAt) <= Date.parse(now) && cell.status !== "free") issues.push("Cell cleanup is due.");
   if (!cell.credentialScope.includes("tinkerbot/") && !cell.branch.startsWith("tinkerbot/")) issues.push("Cell is not scoped to a tinkerbot/* branch.");
+  if ((cell.productionAccess ?? "denied") !== "denied") issues.push("productionAccess must be denied.");
+  if (cell.observability && cell.observability !== "read-only" && cell.observability !== "bounded-write") issues.push("observability must be read-only or bounded-write.");
   return { ok: issues.length === 0, issues };
 }
 

@@ -4,6 +4,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import {
   calculateVerdict,
+  classifyUnknowns,
   combineVerification,
   finalizeReport,
   FEATURE_CAPABILITIES,
@@ -66,7 +67,7 @@ import { runDoctor, renderDoctor } from "./doctor";
 import { clearStoredCredentials, hostedSession, saveStoredCredentials } from "./credentials";
 import { loadFactoryDefinition, validateAgentReceipt, buildFactoryStarter } from "../../factory/src";
 import { evalCli, evalCliAsync, executeLocalRun, factoryPlanPayload, localDashboardPayload } from "./runtime-cli";
-import { cellCheckPayload, factoryCheckPayload, factoryInitPayload, localWorkNewPayload, outcomeCheckPayload } from "./factory-os";
+import { cellCheckPayload, factoryCheckPayload, factoryInitPayload, localFactoryGraphStatusPayload, localIntentPayload, localWorkNewPayload, outcomeCheckPayload } from "./factory-os";
 import { createLocalDashboardServer, localDashboardUrl } from "./local-dashboard";
 import { formatCostTab, formatEvalTab, formatPlanTab } from "../../local-runtime/src";
 import { isInteractiveTty, runTui, TUI_HELP, type TuiDeps, type TuiOptions } from "./tui/index";
@@ -205,7 +206,7 @@ function parseArgs(argv: string[]): CliOptions {
     else if (token === "--profile") options.profile = valueAfter(rest, index++, token);
     else if (token === "--allow-process-runner") options.allowProcessRunner = true;
     else if (token.startsWith("--")) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown option: ${token}`);
-    else if (["policy", "history", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "org", "github", "factory", "work", "run", "receipt", "cell", "product", "skill", "evolution", "billing", "tui", "eval"].includes(command) && !options.positional) options.positional = token;
+    else if (["intent", "policy", "history", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "org", "github", "factory", "work", "run", "receipt", "cell", "product", "skill", "evolution", "billing", "tui", "eval"].includes(command) && !options.positional) options.positional = token;
     else throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unexpected argument: ${token}`);
   }
   if (!["terminal", "json", "markdown", "sarif", "review-context", "receipt", "change-assurance", "release-manifest"].includes(options.format)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown report format: ${options.format}`);
@@ -225,7 +226,7 @@ function parseArgs(argv: string[]): CliOptions {
   if (command === "org" && options.subcommand === "switch" && !options.positional) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "org switch requires an organization identifier");
   if (command === "billing" && options.subcommand && !["summary", "catalog", "portal"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown billing command: ${options.subcommand}`);
   if (command === "github" && options.subcommand && options.subcommand !== "run") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown github command: ${options.subcommand}`);
-  if (command === "factory" && options.subcommand && !["list", "show", "validate", "sync", "mcp", "new", "plan", "init", "check"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown factory command: ${options.subcommand}`);
+  if (command === "factory" && options.subcommand && !["list", "show", "status", "validate", "sync", "mcp", "new", "plan", "init", "check"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown factory command: ${options.subcommand}`);
   if (command === "work" && options.subcommand && !["list", "show", "retry", "approve", "cancel", "take", "return", "new"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown work command: ${options.subcommand}`);
   if (command === "run" && options.subcommand && !["show", "logs"].includes(options.subcommand) && !options.local) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown run command: ${options.subcommand}`);
   if (command === "eval" && options.subcommand && !["init", "add", "run", "compare", "baseline", "export"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown eval command: ${options.subcommand}`);
@@ -407,7 +408,7 @@ export function createReport(run: RunOptions = {}): PrProofReport {
   }] : [];
   const sortedFindings = sortFindings([...policyApply.findings, ...policyFindings]);
   const findings = sortedFindings.slice(0, config.limits.max_findings);
-  const limitations = [...new Set([...policyUnknowns, ...(sortedFindings.length > findings.length ? [`Finding output was capped at ${config.limits.max_findings}; review the full analysis in smaller bounded runs.`] : [])])];
+  const limitations = classifyUnknowns([...new Set([...policyUnknowns, ...(sortedFindings.length > findings.length ? [`Finding output was capped at ${config.limits.max_findings}; review the full analysis in smaller bounded runs.`] : [])])]);
   const summary = {
     assertionsWeakened: testIntegrity?.findings.filter((finding) => /assertion|matcher|tolerance|disabled|deleted/.test(finding.ruleId)).length ?? 0,
     newTests: testIntegrity?.newTests ?? 0,
@@ -451,7 +452,7 @@ export function createReport(run: RunOptions = {}): PrProofReport {
     : config;
   const combined = combineVerification({ findings: baselineFindings, config: verdictConfig, unknowns: finalLimitations });
   const verdict = combined.verificationVerdict;
-  return finalizeReport({ ...preliminary, verdict, findings: baselineFindings, testIntegrity: baselineTestIntegrity, impact: baselineImpact, fixtures: baselineFixtures, baseline, limitations: finalLimitations });
+  return finalizeReport({ ...preliminary, verdict, reviewAssessment: combined.reviewAssessment, findings: baselineFindings, testIntegrity: baselineTestIntegrity, impact: baselineImpact, fixtures: baselineFixtures, baseline, limitations: classifyUnknowns(finalLimitations) });
 }
 
 function versionText(root = process.cwd()): string {
@@ -465,7 +466,7 @@ function help(command?: string): string {
   if (command === "agents") return "Usage: tb agents\n\nList local agent CLIs on PATH. OAuth stays in the child CLI. Tinkerbot does not store vendor tokens.\n";
   if (command === "dashboard") return "Usage: tb dashboard [--local] [--port 4174]\n\nOpen the authenticated Tinkerbot dashboard, or serve a local SQLite adapter on 127.0.0.1 with --local (not `tb serve`).\n";
   if (command === "login") return "Usage: tb login --token SESSION [--url https://control.example]\n\nStore a short-lived control-plane session. Browser login opens the public website.\n";
-  if (command === "factory") return "Usage: tb factory list|show|validate|check|sync|mcp|new|init|plan\n\n`tb factory init` inspects the repo and writes a conservative .tinkerbot tree (no LLM). `tb factory check` compiles an immutable FactoryPlan. `tb factory validate` parses only.\n";
+  if (command === "factory") return "Usage: tb factory list|show|validate|check|sync|mcp|new|init|plan\n\n`tb factory init` inspects the repo and writes a conservative .tinkerbot tree (no LLM). `tb factory check` compiles an immutable FactoryPlan. `tb factory new` writes a named starter. `tb factory validate` parses only.\n";
   if (command === "work") return "Usage: tb work list|show|new|retry|approve|cancel|take|return [id]\n\n`tb work new` creates a local WorkOrder without an LLM.\n";
   if (command === "cell") return "Usage: tb cell list|show|check\n\n`tb cell check` reproduces lease/branch/credential scope. It is not tb check.\n";
   if (command === "product") return "Usage: tb product list|show [id]\n";
@@ -551,7 +552,7 @@ function usageCommand(options: CliOptions): number {
   let usage: UsageSummary;
   try {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<UsageSummary>;
-    if (!parsed || typeof parsed !== "object" || !Number.isFinite(parsed.durationMs) || !Number.isFinite(parsed.filesAnalyzed) || !Number.isFinite(parsed.symbolsAnalyzed) || !Number.isFinite(parsed.mutantsAttempted) || !["hit", "miss", "disabled", "not_run"].includes(String(parsed.mutationCache)) || !["available", "unavailable"].includes(String(parsed.coverage)) || !["PASS", "NEEDS_REVIEW", "UNKNOWN", "FAIL"].includes(String(parsed.verdict)) || !Array.isArray(parsed.unknownReasons) || !parsed.findingsByRule || typeof parsed.findingsByRule !== "object") throw new Error("usage report shape is invalid");
+    if (!parsed || typeof parsed !== "object" || !Number.isFinite(parsed.durationMs) || !Number.isFinite(parsed.filesAnalyzed) || !Number.isFinite(parsed.symbolsAnalyzed) || !Number.isFinite(parsed.mutantsAttempted) || !["hit", "miss", "disabled", "not_run"].includes(String(parsed.mutationCache)) || !["available", "unavailable"].includes(String(parsed.coverage)) || !["PASS", "UNKNOWN", "FAIL"].includes(String(parsed.verdict)) || !Array.isArray(parsed.unknownReasons) || !parsed.findingsByRule || typeof parsed.findingsByRule !== "object") throw new Error("usage report shape is invalid");
     usage = parsed as UsageSummary;
   } catch {
     throw new CliFailure(EXIT_CODES.UNKNOWN, "Usage report is malformed and cannot be trusted; run pr-proof check again.");
@@ -575,7 +576,7 @@ function writeOutput(root: string, options: CliOptions, content: string): void {
 }
 
 function reportExitCode(report: PrProofReport, config: PrProofConfig, options: CliOptions): number {
-  if (report.verdict === "FAIL" || ((options.mode === "blocking" || config.test_integrity.mode === "blocking") && report.verdict === "NEEDS_REVIEW")) return EXIT_CODES.FAIL;
+  if (report.verdict === "FAIL") return EXIT_CODES.FAIL;
   if (report.verdict === "UNKNOWN" && config.output.fail_on_unknown) return EXIT_CODES.UNKNOWN;
   return EXIT_CODES.PASS;
 }
@@ -593,7 +594,8 @@ function standaloneReport(root: string, options: CliOptions, base: string, head:
   const reportFindings = uncappedFindings.slice(0, config.limits.max_findings);
   const reportLimitations = [...new Set([...limitations, ...(uncappedFindings.length > reportFindings.length ? [`Finding output was capped at ${config.limits.max_findings}; review the analysis in smaller bounded runs.`] : [])])];
   const verdictConfig = (policyResult.unknownHandling === "fail" && reportLimitations.length) || (pack.id !== "default" && pack.id !== "agent-authored-change") ? { ...config, test_integrity: { ...config.test_integrity, mode: "blocking" as const } } : config;
-  const report = { schemaVersion: 1 as const, toolVersion: TOOL_VERSION, repository: repositoryLabel(root), base, head, verdict: calculateVerdict(reportFindings, verdictConfig, reportLimitations), summary: zeroSummary(), findings: reportFindings, limitations: reportLimitations, policy: { pack: pack.id, rationale: pack.rationale, unknownHandling: policyResult.unknownHandling }, ...extra };
+  const combined = combineVerification({ findings: reportFindings, config: verdictConfig, unknowns: reportLimitations });
+  const report = { schemaVersion: 1 as const, toolVersion: TOOL_VERSION, repository: repositoryLabel(root), base, head, verdict: combined.verificationVerdict, reviewAssessment: combined.reviewAssessment, summary: zeroSummary(), findings: reportFindings, limitations: classifyUnknowns(reportLimitations), policy: { pack: pack.id, rationale: pack.rationale, unknownHandling: policyResult.unknownHandling }, ...extra };
   return finalizeReport(report);
 }
 
@@ -910,6 +912,10 @@ export function runCli(argv = process.argv.slice(2)): number {
     }
     if (options.command === "tui") return tuiCommand(options);
     if (options.command === "login") return loginCommand(options);
+    if (options.command === "intent") {
+      try { process.stdout.write(`${JSON.stringify(localIntentPayload(options.positional), null, 2)}\n`); return EXIT_CODES.PASS; }
+      catch (error) { throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error)); }
+    }
     if (options.command === "factory" && options.subcommand === "validate") return factoryValidateCommand();
     if (options.command === "factory" && options.subcommand === "check") {
       try {
@@ -918,6 +924,10 @@ export function runCli(argv = process.argv.slice(2)): number {
       } catch (error) {
         throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error));
       }
+    }
+    if (options.command === "factory" && options.subcommand === "status") {
+      try { process.stdout.write(`${JSON.stringify(localFactoryGraphStatusPayload(getRepoRoot(process.cwd()), options.positional), null, 2)}\n`); return EXIT_CODES.PASS; }
+      catch (error) { throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error)); }
     }
     if (options.command === "factory" && options.subcommand === "init") {
       try {
@@ -1001,7 +1011,7 @@ export function runCli(argv = process.argv.slice(2)): number {
     }
     let config: PrProofConfig;
     try { config = loadConfig(root, options.config); } catch { config = loadConfig(root); }
-    if (report.verdict === "FAIL" || ((options.mode === "blocking" || config.test_integrity.mode === "blocking") && report.verdict === "NEEDS_REVIEW")) return EXIT_CODES.FAIL;
+    if (report.verdict === "FAIL") return EXIT_CODES.FAIL;
     if (report.verdict === "UNKNOWN" && config.output.fail_on_unknown) return EXIT_CODES.UNKNOWN;
     return EXIT_CODES.PASS;
   } catch (error) {
@@ -1144,7 +1154,7 @@ function makeTuiDeps(): TuiDeps {
     reportExitCode: (report) => {
       try {
         const config = loadConfig(getRepoRoot(process.cwd()));
-        if (report.verdict === "FAIL" || (config.test_integrity.mode === "blocking" && report.verdict === "NEEDS_REVIEW")) return EXIT_CODES.FAIL;
+        if (report.verdict === "FAIL") return EXIT_CODES.FAIL;
         if (report.verdict === "UNKNOWN" && config.output.fail_on_unknown) return EXIT_CODES.UNKNOWN;
         return EXIT_CODES.PASS;
       } catch {

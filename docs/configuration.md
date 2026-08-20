@@ -78,4 +78,4 @@ Use `pr-proof config validate` to validate the file and `pr-proof config explain
 
 `validation.toolchain_checks` enables bounded, read-only syntax/front-end checks for Python, Go, Rust, C, and C++ files when the corresponding validator is installed. These checks do not run repository code, tests, builds, or package scripts. A missing validator is reported as unavailable rather than treated as a parser failure; validation is capped at 250 files per graph.
 
-Exit codes are stable: `0` PASS, `1` FAIL or blocking NEEDS_REVIEW, `2` UNKNOWN when `output.fail_on_unknown` is enabled, `3` configuration error, `4` execution error, and `5` internal error.
+Exit codes are stable: `0` PASS, `1` FAIL, `2` UNKNOWN when `output.fail_on_unknown` is enabled, `3` configuration error, `4` execution error, and `5` internal error.

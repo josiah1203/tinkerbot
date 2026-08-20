@@ -6,7 +6,8 @@ Top-level fields:
 
 - `schemaVersion`, `schemaId`, `toolVersion`
 - `repository`, `base`, `head`
-- `verdict`: `PASS`, `NEEDS_REVIEW`, `UNKNOWN`, or `FAIL`
+- `verdict`: `PASS`, `UNKNOWN`, or `FAIL`
+- `reviewAssessment` (advisory): `CLEAR`, `NEEDS_HUMAN_REVIEW`, or `REVISE`
 - `summary`
 - `findings`
 - `testIntegrity` and/or `impact`
