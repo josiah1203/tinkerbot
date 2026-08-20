@@ -16,6 +16,17 @@ import type { InferenceProvider } from "./inference";
 import { factoryAiFromProvider } from "./inference";
 import type { FactoryAi, FactoryDefinition, FactoryRunStepResult, FactoryStageId, WorkOrder, WorkOrderState } from "./index";
 
+const AGENT_OUTPUT_SECRET_PATTERNS = [
+  /(?:sk-[A-Za-z0-9_-]{8,}|sk_(?:live|test)_[A-Za-z0-9_-]{8,}|gh(?:p|s|o|u|r)_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{8,}|whsec_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|hf_[A-Za-z0-9_-]{8,}|npm_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,}|(?:xai|pplx)-[A-Za-z0-9_-]{8,})/gi,
+  /((?:password|secret|token|api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|private[_-]?key|signing[_-]?secret|webhook[_-]?secret)\s*[:=]\s*)\S+/gi,
+];
+
+function sanitizeAgentOutput(value: string, limit = 2_000): string {
+  let result = value;
+  for (const pattern of AGENT_OUTPUT_SECRET_PATTERNS) result = result.replace(pattern, (match, prefix?: string) => prefix ? `${prefix}[redacted]` : "[redacted]");
+  return result.slice(0, limit);
+}
+
 export async function executeFactoryRun(input: {
   definition: FactoryDefinition;
   sourceType: WorkOrder["sourceType"];
@@ -28,6 +39,10 @@ export async function executeFactoryRun(input: {
   pullRequestSha?: string;
   verificationIngested?: boolean;
   reviewRequestsRevision?: boolean;
+  /** Previously persisted stages when resuming an implementation handoff. */
+  priorStages?: FactoryRunStepResult[];
+  /** The durable execution plan for a resumed run, when one exists. */
+  priorPlan?: ExecutionPlan;
   workOrderId?: string;
   factoryId?: string;
   organizationId?: string;
@@ -59,17 +74,20 @@ export async function executeFactoryRun(input: {
     profile,
     workOrderId: input.workOrderId,
   });
-  const { plan, decision, autonomyMode, lineId } = built;
+  const plan = input.priorPlan ?? built.plan;
+  const { decision, autonomyMode, lineId } = built;
   const estimatedTokens = plan.cost.estimatedInputTokens + plan.cost.estimatedOutputTokens;
   const estimatedCents = plan.cost.byokSpendCents + plan.cost.managedCogsCents;
-  let eventSequence = 0;
   const appendGraph = async (
     type: FactoryEvent["type"],
     payload: Record<string, unknown>,
     overrides: Partial<Pick<FactoryEvent, "actorId" | "actorType" | "provenance">> = {},
   ): Promise<void> => {
     if (!input.workOrderId || !input.store?.appendFactoryEvent) return;
-    const eventId = `${plan.planId}:${eventSequence++}:${type}`;
+    // Graph events are keyed by plan and semantic event type so a queue
+    // redelivery or self-hosted completion retry cannot create a second copy
+    // merely because the in-process event ordering changed.
+    const eventId = `${plan.planId}:${type}`;
     await input.store.appendFactoryEvent({
       eventId,
       type,
@@ -91,12 +109,14 @@ export async function executeFactoryRun(input: {
     || input.definition.budgets.usdCents <= 0
     || estimatedTokens > input.definition.budgets.tokens
     || estimatedCents > input.definition.budgets.usdCents;
-  if (input.store) {
+  if (input.store && !input.priorPlan) {
     await input.store.putExecutionPlan(plan);
     await input.store.putCostEstimate(plan.planId, plan.cost);
   }
-  await appendGraph("task.decomposed", { planId: plan.planId, selectedPipeline: plan.selectedPipeline, stages: plan.stages.map((stage) => stage.id), skip: plan.skip });
-  if (estimatedCents > 0) await appendGraph("cost.recorded", { costCents: estimatedCents, category: "cogs", planId: plan.planId });
+  if (!input.priorPlan) {
+    await appendGraph("task.decomposed", { planId: plan.planId, selectedPipeline: plan.selectedPipeline, stages: plan.stages.map((stage) => stage.id), skip: plan.skip });
+    if (estimatedCents > 0) await appendGraph("cost.recorded", { costCents: estimatedCents, category: "cogs", planId: plan.planId });
+  }
   const product = resolveProduct(input.definition, input.definition.repositories[0] ?? "unknown/unknown");
   const skip = plan.skip.filter((stage) => stage !== "verification" && autonomyAllowsSkip(autonomyMode ?? "approval_gated", stage as FactoryStageId));
   const planned = runForeman(input.definition, input.sourceType, skip as FactoryStageId[], lineId);
@@ -114,22 +134,29 @@ export async function executeFactoryRun(input: {
   const ai = input.inference ? factoryAiFromProvider(input.inference) : input.ai;
   const inline = mayUseInlineSelfReview({ approval: profile.approval, autonomyMode, lineId, actorKind: input.actorKind ?? "agent" });
   const specApproved = Boolean(input.specApproved || inline.allowed);
-  const stages: FactoryRunStepResult[] = [];
+  // A self-hosted completion resumes the same run. Reuse the durable stages
+  // already emitted before the handoff so triage/specification (and their AI
+  // calls/costs) are not executed and billed a second time.
+  const stages: FactoryRunStepResult[] = [...(input.priorStages ?? [])];
   let escalated = Boolean(plan.escalated);
   if (plan.selectedPipeline === "single_agent") {
-    const composite = await runSingleAgentPipeline(ai, input.untrustedText, input.paths, sanitizeUntrustedPromptInput, reviewRequestsRevision);
-    stages.push({ stage: "foreman", status: "ok", summary: `single_agent composite line=${lineId} autonomy=${autonomyMode}` });
-    stages.push(...composite.stages);
-    if (composite.escalate) {
-      escalated = true;
-      plan.escalated = true;
-      plan.escalationReason = composite.escalateReason;
-      if (input.store) await input.store.putExecutionPlan(plan);
-    } else if (!planned.includes("implementation") || input.sandboxComplete) {
-      return completeFactoryStages(stages, { definition: input.definition, verificationVerdict: input.verificationVerdict, verificationIngested: input.verificationIngested }, planned, autonomyMode, lineId, plan, false);
+    if (!input.priorStages?.length) {
+      const composite = await runSingleAgentPipeline(ai, input.untrustedText, input.paths, sanitizeUntrustedPromptInput, reviewRequestsRevision);
+      stages.push({ stage: "foreman", status: "ok", summary: `single_agent composite line=${lineId} autonomy=${autonomyMode}` });
+      stages.push(...composite.stages);
+      if (composite.escalate) {
+        escalated = true;
+        plan.escalated = true;
+        plan.escalationReason = composite.escalateReason;
+        if (input.store) await input.store.putExecutionPlan(plan);
+      } else if (!planned.includes("implementation") || input.sandboxComplete) {
+        return completeFactoryStages(stages, { definition: input.definition, verificationVerdict: input.verificationVerdict, verificationIngested: input.verificationIngested }, planned, autonomyMode, lineId, plan, false);
+      }
+    } else if (input.sandboxComplete) {
+      return completeFactoryStages(stages, { definition: input.definition, verificationVerdict: input.verificationVerdict, verificationIngested: input.verificationIngested }, planned, autonomyMode, lineId, plan, escalated);
     }
   } else {
-    stages.push({ stage: "foreman", status: "ok", summary: `${decision.summary || planned.join(",")} line=${lineId} autonomy=${autonomyMode} pipeline=${plan.selectedPipeline}` });
+    if (!stages.some((stage) => stage.stage === "foreman")) stages.push({ stage: "foreman", status: "ok", summary: `${decision.summary || planned.join(",")} line=${lineId} autonomy=${autonomyMode} pipeline=${plan.selectedPipeline}` });
   }
   const agentById = new Map(input.definition.agents.map((agent) => [agent.id, agent]));
   if (planned.includes("triage") && !stages.some((stage) => stage.stage === "triage")) {
@@ -150,13 +177,17 @@ export async function executeFactoryRun(input: {
     stages.push({ stage: "architecture", status: architecture.status, summary: architecture.summary });
   }
   if (decision.requestRevision || planned.includes("implementation")) {
+    const existingImplementation = stages.findIndex((stage) => stage.stage === "implementation");
     if (overBudget) {
-      stages.push({ stage: "implementation", status: "skipped", summary: "Budget exceeded. Implementation skipped. Verification still runs." });
+      if (existingImplementation < 0) stages.push({ stage: "implementation", status: "skipped", summary: "Budget exceeded. Implementation skipped. Verification still runs." });
     } else if (lineId !== "release" && !input.sandboxComplete) {
-      stages.push({ stage: "implementation", status: "ok", summary: "Queued Cloudflare Sandbox implement in a leased work cell. GitHub Actions remains verification-only. No application code has been written yet." });
+      if (existingImplementation < 0) stages.push({ stage: "implementation", status: "ok", summary: "Queued Cloudflare Sandbox implement in a leased work cell. GitHub Actions remains verification-only. No application code has been written yet." });
       return { stages, terminal: "implementation", wait: decision.requestRevision ? "revision" : "sandbox", lineId, autonomyMode, plan, escalated };
     }
-    if (lineId !== "release" && !stages.some((stage) => stage.stage === "implementation")) stages.push({ stage: "implementation", status: "ok", summary: "Sandbox pushed a tinkerbot/* branch. Merge is forbidden." });
+    if (lineId !== "release") {
+      if (existingImplementation >= 0 && input.sandboxComplete) stages[existingImplementation] = { stage: "implementation", status: "ok", summary: "Self-hosted harness pushed a tinkerbot/* branch. Merge is forbidden." };
+      else if (existingImplementation < 0) stages.push({ stage: "implementation", status: "ok", summary: "Sandbox pushed a tinkerbot/* branch. Merge is forbidden." });
+    }
   }
   if (planned.includes("security")) {
     const security = runAssuranceCheckpoint("security", { securityChecked: true, verdict: input.verificationVerdict });
@@ -194,12 +225,12 @@ async function runSingleAgentPipeline(
     const text = typeof result.response === "string" ? result.response : "";
     const parsed = text.match(/\{[\s\S]*\}/);
     const body = parsed ? JSON.parse(parsed[0]) as Record<string, string> : { triage: text, implementation: text, review: text };
-    if (body.escalate === "true" || reviewRevision(String(body.review ?? ""))) return { stages: [{ stage: "triage", status: "ok", summary: String(body.triage ?? text).slice(0, 2_000) }], escalate: true, escalateReason: "repeated_corrections" };
+    if (body.escalate === "true" || reviewRevision(String(body.review ?? ""))) return { stages: [{ stage: "triage", status: "ok", summary: sanitizeAgentOutput(String(body.triage ?? text)) }], escalate: true, escalateReason: "repeated_corrections" };
     return {
       stages: [
-        { stage: "triage", status: "ok", summary: String(body.triage ?? "triage").slice(0, 2_000) },
-        { stage: "specification", status: "ok", summary: String(body.implementation ?? "implementation notes").slice(0, 2_000) },
-        { stage: "review", status: "ok", summary: String(body.review ?? "advisory self-review").slice(0, 2_000) },
+        { stage: "triage", status: "ok", summary: sanitizeAgentOutput(String(body.triage ?? "triage")) },
+        { stage: "specification", status: "ok", summary: sanitizeAgentOutput(String(body.implementation ?? "implementation notes")) },
+        { stage: "review", status: "ok", summary: sanitizeAgentOutput(String(body.review ?? "advisory self-review")) },
       ],
       escalate: false,
     };

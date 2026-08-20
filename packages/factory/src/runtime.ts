@@ -119,7 +119,10 @@ export interface ExecutionPlan {
   createdAt: string;
 }
 
-export const CREDENTIAL_REF_PATTERN = /^(env:[A-Z][A-Z0-9_]*|keychain:\/\/[A-Za-z0-9/_.-]+)$/;
+// Credential references are identifiers, not paths. Reject dot segments and
+// empty keychain components so a local resolver cannot be steered toward an
+// unintended service/account namespace.
+export const CREDENTIAL_REF_PATTERN = /^(env:[A-Z][A-Z0-9_]{0,127}|keychain:\/\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?:\/[A-Za-z0-9][A-Za-z0-9._-]{0,127})?)$/;
 
 export function hostedRuntimeDefaults(runnerType: "github_actions" | "tinkerbot-sandbox" | "self_hosted" = "github_actions"): RuntimeProfile {
   return {

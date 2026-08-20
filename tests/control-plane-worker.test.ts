@@ -38,6 +38,8 @@ test("tenant RBAC capabilities are explicit and least-privilege", () => {
   expect(roleHasCapability("viewer", "factory:write")).toBe(false);
   expect(roleHasCapability("viewer", "work:operate")).toBe(false);
   expect(roleHasCapability("viewer", "ops:read")).toBe(false);
+  expect(roleHasCapability("owner", "tenant:admin")).toBe(true);
+  expect(roleHasCapability("viewer", "tenant:admin")).toBe(false);
   expect(roleHasCapability("maintainer", "factory:write")).toBe(true);
   expect(roleHasCapability("owner", "ops:read")).toBe(true);
 });
@@ -522,7 +524,7 @@ test("public catalog, seat summary, and cardless Team trial are server-authorita
     return new Response(JSON.stringify({}), { status: 200 });
   };
   try {
-    const env = { ENVIRONMENT: "staging", WORKOS_CLIENT_ID: "client_test", WORKOS_API_KEY: "workos_test_secret", SESSION_ENCRYPTION_KEY: "session-encryption-test-key", STRIPE_PLANS_JSON: JSON.stringify([{ id: "team", monthlyPriceId: "price_team", annualPriceId: "price_team_year" }]), DB: database };
+    const env = { ENVIRONMENT: "staging", WORKOS_CLIENT_ID: "client_test", WORKOS_API_KEY: "workos_test_secret", SESSION_ENCRYPTION_KEY: "session-encryption-test-key-with-32-bytes-minimum", STRIPE_PLANS_JSON: JSON.stringify([{ id: "team", monthlyPriceId: "price_team", annualPriceId: "price_team_year" }]), DB: database };
     const catalog = await worker.fetch(new Request("https://control.example/billing/catalog"), env);
     expect(catalog.status).toBe(200);
     const catalogBody = await catalog.json() as { plans: Array<{ id: string; monthlyPriceCents: number | null; trialAvailable: boolean }> };

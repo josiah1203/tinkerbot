@@ -25,12 +25,15 @@ This is the remaining work required to make Tinkerbot a production release. It s
 - [ ] Define retention/deletion handling for D1 and R2 data, including organization offboarding.
 - [ ] Test database migrations and rollback/forward-recovery on production-shaped data.
 - [ ] Establish backup, restoration, and incident-response procedures for hosted metadata.
+- [ ] Configure provider-specific HMAC secrets and a signed per-tenant mapping for Slack, Linear, Jira, incident, and support intake; production rejects these public endpoints until both are present.
+- [ ] Add provider replay ledgers/delivery IDs and verify duplicate, stale, invalid-signature, malformed-body, and cross-tenant webhook cases in staging.
 
 ### Optional GitHub adapter and GitHub Action
 
 - [ ] If the optional GitHub adapter is in launch scope, register the GitHub App using the Worker routes in `github-app/manifest.json` (homepage, callback, setup, webhook `/integrations/github/webhook`).
 - [ ] If enabled, complete App authentication/token-minting configuration and restrict permissions to the minimum required scope.
 - [ ] If enabled, test GitHub installation, uninstall, permission change, webhook retry, signature rejection, and replay rejection.
+- [ ] If enabled, deploy the signed GitHub App setup-state/nonce flow and verify that an installation cannot be claimed or rebound by another organization; production callback token-mints the installation before binding it.
 - [ ] If enabled, add repository synchronization and installation state to the hosted app.
 - [ ] Configure customer workflows with `id-token: write` so the Action exchanges GitHub OIDC for a run token; do not paste a developer WorkOS session UUID.
 - [ ] If enabled, run the Action in a real test repository for App-owned Checks, inline comments, retries, failures, and forked PR behavior (Action publish is fallback only).
@@ -70,7 +73,7 @@ See [hosted provisioning](./hosted-provisioning.md) for the operator checklist (
 - [ ] Create **separate** D1 databases for staging and production (wrangler currently uses placeholder `database_id` values; replace them with real IDs after `wrangler d1 create`). Never share one D1 across environments.
 - [ ] Bind a real Cloudflare Sandbox implementation (`env.Sandbox`); the Worker stub returns 501 until the account has the container/SDK.
 - [ ] Verify the newly enabled R2 account, create/confirm the evidence bucket, bind it as `EVIDENCE_BUCKET` in staging and production, apply required migrations, and configure R2 retention/lifecycle rules.
-- [ ] Set Worker core secrets interactively or through the approved secret manager: WorkOS credentials, Stripe credentials, and session encryption key. Add GitHub webhook/App secrets only if that optional adapter is enabled.
+- [ ] Set Worker core secrets interactively or through the approved secret manager: WorkOS credentials, Stripe credentials, and a distinct non-placeholder session encryption key (at least 32 UTF-8 bytes). Add GitHub webhook/App secrets only if that optional adapter is enabled.
 - [ ] Set non-secret production variables, including the final `STRIPE_PLANS_JSON` catalog and approved WorkOS event-sync configuration.
 - [ ] Validate `GET /health` (`ok`/`degraded` only) and authenticated `GET /config/status` after deployment. Never leave provider secret names on the public health route.
 
@@ -111,6 +114,7 @@ See [hosted provisioning](./hosted-provisioning.md) for the operator checklist (
 - [ ] Obtain green GitHub CI on that exact commit.
 - [ ] Deploy to staging and run the full cross-surface acceptance suite: dashboard, Worker, WorkOS, Stripe, CLI, and any optional adapters selected for launch (including GitHub Action/App if enabled).
 - [ ] Verify that no source code, full diffs, credentials, or raw secrets can enter hosted assurance ingestion, logs, artifacts, or comments.
+- [ ] Verify OIDC assurance bundles with a real run token: receipt hashes must match and repository/commit bindings must reject tampered or stale submissions.
 - [ ] Exercise failure paths: unavailable providers, invalid/replayed webhooks, unauthorized org access, expired sessions, failed billing, Action retry, and rollback.
 - [ ] Produce and sign release artifacts; verify them independently on clean machines.
 - [ ] Obtain explicit release-owner approval for pricing, legal/privacy posture, support ownership, and rollback readiness.

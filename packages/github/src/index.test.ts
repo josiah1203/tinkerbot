@@ -81,6 +81,7 @@ describe("GitHub assurance boundary", () => {
 
   test("redacts token-shaped values and emits metadata-only audit events", () => {
     expect(redactGitHubSecrets("token=github_pat_abcdefghijklmnop secret", ["secret"])).toBe("token=[REDACTED] [REDACTED]");
+    expect(redactGitHubSecrets("gho_abcdefghijklmnop ghu_abcdefghijklmnop")).toBe("[REDACTED] [REDACTED]");
     const event = createGitHubAuditEvent({ action: "installation_received", installationId: 7, repositoryId: 11, repository: "Acme/Payments-API", deliveryId: "delivery-1", outcome: "accepted", observedAt: "2026-01-01T00:00:00.000Z" });
     expect(event).toEqual({ eventId: expect.any(String), action: "installation_received", installationId: 7, repositoryId: 11, repository: "acme/payments-api", deliveryId: "delivery-1", outcome: "accepted", observedAt: "2026-01-01T00:00:00.000Z" });
   });

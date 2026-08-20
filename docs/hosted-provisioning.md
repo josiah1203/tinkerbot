@@ -9,7 +9,10 @@ Code in this repository cannot create live Stripe, WorkOS, Cloudflare, or GitHub
 - [ ] Create distinct D1 databases for development, staging, and production; paste real `database_id` values into wrangler; apply migrations to each.
 - [ ] Attach the `Sandbox` Durable Object / platform Sandbox implementation in each environment. The Worker exports a placeholder `Sandbox` class until the account binding is live.
 - [ ] Confirm R2 evidence buckets, queues, Vectorize indexes, Browser Rendering, Workers AI, and DNS already differ for staging where required.
-- [ ] Set core secrets: WorkOS, Stripe, and `SESSION_ENCRYPTION_KEY`.
+- [ ] Set core secrets: WorkOS, Stripe, and a distinct non-placeholder `SESSION_ENCRYPTION_KEY` of at least 32 UTF-8 bytes (production `/health` and `/config/status` stay degraded until session encryption is ready).
+- [ ] If self-hosted workers are in scope, create the `SELF_HOSTED_WORK` queue and set a separate, non-placeholder `SELF_HOSTED_WORK_SECRET` of at least 32 UTF-8 bytes (required in production; never reuse `SESSION_ENCRYPTION_KEY`); the queue envelope is HMAC-signed and never carries provider credentials.
+- [ ] If the customer worker runs outside this Cloudflare account, set `SELF_HOSTED_WORK_ENDPOINT` to its HTTPS intake URL instead of (or alongside) the queue producer. The endpoint receives the same signed, credential-free envelope; HTTP is accepted only for localhost development.
+- [ ] If self-hosted workers are in scope, configure the worker to verify the dispatch envelope, execute the selected customer harness, and POST a signed completion to `/self-hosted/complete` with a branch/commit/PR reference. Completion never submits a verification verdict; it only resumes the normal deterministic `tb check` path.
 - [ ] If enabling the optional GitHub adapter, set `GITHUB_WEBHOOK_SECRET`, `GITHUB_APP_ID`, and `GITHUB_APP_PRIVATE_KEY`; otherwise no Tinkerbot GitHub App installation is needed. `GITLAB_WEBHOOK_SECRET` and evidence-export secrets are also optional (operator-only; never customer copy).
 - [ ] Leave `WORKOS_EVENTS_SYNC_ENABLED` false until production WorkOS webhooks exist.
 - [ ] Set nonempty live `STRIPE_PLANS_JSON` per environment (no `price_REPLACE_*`). Empty catalog → `catalog_unavailable`; nobody can buy a seat.

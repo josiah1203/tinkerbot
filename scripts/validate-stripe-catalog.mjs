@@ -4,7 +4,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const fileArg = process.argv[2] && !process.argv[2].startsWith("-") ? process.argv[2] : undefined;
+// npm/pnpm may preserve the conventional `--` separator in argv. Select the
+// first positional path after it instead of silently falling back to an empty
+// STRIPE_PLANS_JSON value.
+const fileArg = process.argv.slice(2).find((argument) => !argument.startsWith("-"));
 const raw = fileArg
   ? fs.readFileSync(path.resolve(process.cwd(), fileArg), "utf8")
   : process.env.STRIPE_PLANS_JSON ?? "";

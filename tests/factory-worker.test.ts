@@ -1,5 +1,5 @@
 import { createHmac, generateKeyPairSync, createSign } from "node:crypto";
-import { resetOidcJwksCache } from "../packages/factory/src";
+import { createSelfHostedCompletion, implementBranchName, resetOidcJwksCache } from "../packages/factory/src";
 import worker, { FactoryRunWorkflow, handleFactoryQueueMessage } from "../apps/control-plane-worker/src";
 import { D1FactoryStore } from "../apps/control-plane-worker/src/factory-store";
 import { ForemanDurableObject, handleFactoryMcpRequest, intakeFromIntegration, persistTranscript, runFactoryTurn, sweepFactoryOs } from "../apps/control-plane-worker/src/factory-runtime";
@@ -52,6 +52,7 @@ function memoryFactoryDb(seed: {
   const definitions = new Map<string, Record<string, unknown>>();
   const scorers: Array<Record<string, unknown>> = [];
   const selfImprovement: Array<Record<string, unknown>> = [];
+  const factoryEvents: Array<Record<string, unknown>> = [];
 
   const database = {
     prepare: (query: string) => ({
@@ -108,6 +109,7 @@ function memoryFactoryDb(seed: {
           if (query.includes("FROM tinkerbot_scorers")) return { results: scorers.filter((row) => row.factory_id === args[0]) as T[] };
           if (query.includes("FROM tinkerbot_self_improvement_tasks")) return { results: selfImprovement.filter((row) => row.factory_id === args[0]) as T[] };
           if (query.includes("FROM tinkerbot_factory_runs") && query.includes("factory_id")) return { results: [...runs.values()].filter((row) => row.factory_id === args[0]) as T[] };
+          if (query.includes("FROM tinkerbot_factory_graph_events")) return { results: factoryEvents.filter((row) => row.aggregate_id === args[0] && row.organization_id === args[1]).map((row) => ({ ...row, payload_json: row.payload_json })) as T[] };
           return { results: [] as T[] };
         },
         run: async () => {
@@ -117,10 +119,20 @@ function memoryFactoryDb(seed: {
             oidcJti.add(key);
             return { meta: { changes: 1 } };
           }
+          if (query.startsWith("INSERT OR IGNORE INTO tinkerbot_factory_graph_events")) {
+            const eventId = String(args[0]);
+            if (factoryEvents.some((event) => event.event_id === eventId)) return { meta: { changes: 0 } };
+            factoryEvents.push({ event_id: args[0], aggregate_id: args[1], aggregate_type: args[2], organization_id: args[3], factory_id: args[4], event_type: args[5], actor_id: args[6], actor_type: args[7], occurred_at: args[8], correlation_id: args[9], causation_id: args[10], schema_version: args[11], policy_version: args[12], provenance: args[13], external_references_json: args[14], payload_json: args[15] });
+            return { meta: { changes: 1 } };
+          }
           if (query.startsWith("INSERT OR IGNORE INTO tinkerbot_webhook_events")) {
             const key = `${String(args[1])}:${String(args[0])}`;
             if (webhooks.has(key)) return { meta: { changes: 0 } };
             webhooks.add(key);
+            return { meta: { changes: 1 } };
+          }
+          if (query.startsWith("DELETE FROM tinkerbot_webhook_events")) {
+            webhooks.delete(`${String(args[1])}:${String(args[0])}`);
             return { meta: { changes: 1 } };
           }
           if (query.startsWith("INSERT INTO tinkerbot_sessions")) {
@@ -159,6 +171,19 @@ function memoryFactoryDb(seed: {
           }
           if (query.startsWith("INSERT INTO tinkerbot_factory_runs")) {
             runs.set(String(args[0]), { run_id: args[0], work_order_id: args[1], factory_id: args[2], definition_digest: args[3], status: args[4], started_at: args[5], updated_at: args[5] });
+            return { meta: { changes: 1 } };
+          }
+          if (query.startsWith("UPDATE tinkerbot_factory_runs")) {
+            const row = runs.get(String(query.includes("definition_digest =") ? args[2] : args[3]));
+            if (!row) return { meta: { changes: 0 } };
+            if (query.includes("definition_digest =")) {
+              row.definition_digest = args[0];
+              row.updated_at = args[1];
+              return { meta: { changes: 1 } };
+            }
+            row.status = args[0];
+            row.updated_at = args[2];
+            if (args[1] === 1) row.completed_at = args[2];
             return { meta: { changes: 1 } };
           }
           if (query.startsWith("INSERT INTO tinkerbot_run_stages")) {
@@ -261,6 +286,28 @@ function memoryFactoryDb(seed: {
   return database;
 }
 
+test("hosted queue messages are serialized through the Foreman Durable Object", async () => {
+  const names: string[] = [];
+  const env = {
+    FOREMAN: {
+      idFromName: (name: string) => {
+        names.push(name);
+        return name;
+      },
+      get: (_id: unknown) => ({
+        fetch: async (request: Request) => {
+          expect(request.headers.get("x-tinkerbot-internal")).toBe("foreman-v1");
+          expect(await request.json()).toMatchObject({ deliveryId: "delivery-1", sourceId: "source-1" });
+          return Response.json({ workOrderId: "wo-1", runId: "run-1", terminal: "implementation" });
+        },
+      }),
+    },
+  };
+  const result = await handleFactoryQueueMessage(env, { deliveryId: "delivery-1", organizationId: "org-1", sourceType: "manual", sourceId: "source-1", actor: "operator" });
+  expect(names).toEqual(["org-1:source-1"]);
+  expect(result).toMatchObject({ workOrderId: "wo-1", runId: "run-1", terminal: "implementation" });
+});
+
 test("signed GitHub security alerts enqueue factory work and reject forged or replayed deliveries", async () => {
   const queued: unknown[] = [];
   const database = memoryFactoryDb();
@@ -282,6 +329,24 @@ test("signed GitHub security alerts enqueue factory work and reject forged or re
   expect(queued.some((item) => (item as { sourceType?: string }).sourceType === "github_code_scanning")).toBe(true);
 });
 
+test("GitHub webhook remains retryable when queue dispatch fails", async () => {
+  const database = memoryFactoryDb();
+  const payload = JSON.stringify({ action: "created", alert: { number: 12 }, repository: { full_name: "acme/payments" }, installation: { id: 9 } });
+  const signature = createHmac("sha256", "github_webhook_secret").update(payload).digest("hex");
+  let attempts = 0;
+  const env = {
+    DB: database,
+    GITHUB_WEBHOOK_SECRET: "github_webhook_secret",
+    FACTORY_EVENTS: { send: async () => { attempts += 1; if (attempts === 1) throw new Error("queue unavailable"); } },
+  };
+  const request = () => new Request("https://control.example/integrations/github/webhook", { method: "POST", headers: { "x-github-event": "dependabot_alert", "x-github-delivery": "retry_1", "x-hub-signature-256": `sha256=${signature}` }, body: payload });
+  expect((await worker.fetch(request(), env)).status).toBe(500);
+  const retry = await worker.fetch(request(), env);
+  expect(retry.status).toBe(200);
+  expect(await retry.json()).toMatchObject({ received: true, duplicate: false });
+  expect(attempts).toBe(2);
+});
+
 test("incident and support webhooks normalize into factory work orders", async () => {
   const queued: Array<{ sourceType: string; sourceId: string }> = [];
   const env = { DB: memoryFactoryDb(), FACTORY_EVENTS: { send: async (message: { sourceType: string; sourceId: string }) => void queued.push(message) } };
@@ -292,6 +357,22 @@ test("incident and support webhooks normalize into factory work orders", async (
   expect(support.status).toBe(200);
   expect(queued.map((item) => item.sourceType)).toEqual(["incident", "support"]);
   expect(intakeFromIntegration("incident", { incident: { id: "inc_9", title: "Sev1", description: "500s" } }).sourceType).toBe("incident");
+});
+
+test("public integration intake verifies signatures and pins the tenant in production", async () => {
+  const queued: unknown[] = [];
+  const payload = JSON.stringify({ event_id: "evt_slack_1", text: "@tinker fix login", organizationId: "attacker-org" });
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const secret = "slack-webhook-secret-1234";
+  const signature = createHmac("sha256", secret).update(`v0:${timestamp}:${payload}`).digest("hex");
+  const env = { ENVIRONMENT: "staging", DB: memoryFactoryDb(), SLACK_WEBHOOK_SECRET: secret, INTEGRATION_ORGANIZATION_ID: "org_1", FACTORY_EVENTS: { send: async (message: unknown) => void queued.push(message) } };
+  const invalid = await worker.fetch(new Request("https://control.example/integrations/slack/webhook", { method: "POST", headers: { "content-type": "application/json", "x-slack-request-timestamp": timestamp, "x-slack-signature": "v0=invalid" }, body: payload }), env);
+  expect(invalid.status).toBe(401);
+  const accepted = await worker.fetch(new Request("https://control.example/integrations/slack/webhook", { method: "POST", headers: { "content-type": "application/json", "x-slack-request-timestamp": timestamp, "x-slack-signature": `v0=${signature}` }, body: payload }), env);
+  expect(accepted.status).toBe(200);
+  expect(queued[0]).toMatchObject({ organizationId: "org_1" });
+  const production = await worker.fetch(new Request("https://control.example/integrations/slack/webhook", { method: "POST", headers: { "content-type": "application/json" }, body: payload }), { ENVIRONMENT: "production", DB: memoryFactoryDb() });
+  expect(production.status).toBe(503);
 });
 
 test("OIDC exchange verifies JWKS, rejects unsigned helpers, and requires a GitHub App installation", async () => {
@@ -420,6 +501,8 @@ test("runFactoryTurn fails closed without a database, organization, or factory, 
   const inactive = factorySeed();
   inactive._state.installations.set("9", { installation_id: 9, organization_id: "org_1", status: "suspended" });
   expect(await runFactoryTurn({ DB: inactive }, { deliveryId: "d", installationId: 9, sourceType: "github_issue", sourceId: "1", actor: "bot" })).toMatchObject({ terminal: "blocked" });
+  expect(await runFactoryTurn({ DB: factorySeed() }, { deliveryId: "tenant-mismatch", installationId: 9, organizationId: "org_2", repository: "acme/payments", sourceType: "github_issue", sourceId: "1", actor: "bot" })).toMatchObject({ terminal: "blocked" });
+  expect(await runFactoryTurn({ DB: factorySeed() }, { deliveryId: "unknown-work-order", organizationId: "org_1", factoryId: "fac_1", workOrderId: "wo_from_another_tenant", sourceType: "manual", sourceId: "1", actor: "bot" })).toMatchObject({ terminal: "unknown", workOrderId: "wo_from_another_tenant" });
 });
 
 test("runFactoryTurn records stages, waits for spec approval, and keeps PASS from becoming a silent merge", async () => {
@@ -513,7 +596,8 @@ agents:
 `,
   });
   const dispatched: unknown[] = [];
-  const result = await runFactoryTurn({ DB: database, SELF_HOSTED_WORK: { send: async (payload) => void dispatched.push(payload) } }, {
+  let hostedInferenceCalls = 0;
+  const result = await runFactoryTurn({ DB: database, SELF_HOSTED_WORK_SECRET: "self-hosted-test-secret", SELF_HOSTED_WORK: { send: async (payload) => void dispatched.push(payload) }, AI: { run: async () => { hostedInferenceCalls += 1; return { response: "should not run for BYOK" }; } } }, {
     deliveryId: "self-hosted-1",
     organizationId: "org_1",
     factoryId: "fac_1",
@@ -526,8 +610,63 @@ agents:
   });
   expect(result).toMatchObject({ wait: "self_hosted_harness", terminal: "implementation" });
   expect(dispatched).toHaveLength(1);
-  expect(dispatched[0]).toMatchObject({ executionBoundary: "self_hosted", harness: "codex", authority: { mayMerge: false, mayRelease: false, mayWriteVerificationVerdict: false } });
+  expect(dispatched[0]).toMatchObject({ executionBoundary: "self_hosted", harness: "codex", authority: { mayMerge: false, mayRelease: false, mayWriteVerificationVerdict: false }, integrity: { algorithm: "hmac-sha256", signed: true } });
   expect(JSON.stringify(dispatched[0])).not.toContain("OPENAI_API_KEY");
+  expect(hostedInferenceCalls).toBe(0);
+  const redelivered = await runFactoryTurn({ DB: database, SELF_HOSTED_WORK_SECRET: "self-hosted-test-secret", SELF_HOSTED_WORK: { send: async (payload) => void dispatched.push(payload) } }, {
+    deliveryId: "self-hosted-duplicate", organizationId: "org_1", factoryId: "fac_1", repository: "acme/payments", sourceType: "github_issue", sourceId: "42", workOrderId: result.workOrderId, actor: "factory-agent", specApproved: true,
+  });
+  expect(redelivered).toMatchObject({ wait: "self_hosted_harness", terminal: "implementation" });
+  expect(dispatched).toHaveLength(1);
+  const completion = createSelfHostedCompletion({ dispatchId: `selfhost:${result.workOrderId}:${result.runId}`, executionBoundary: "self_hosted", organizationId: "org_1", factoryId: "fac_1", workOrderId: result.workOrderId, runId: result.runId, repository: "acme/payments", definitionDigest: String((dispatched[0] as { definitionDigest: string }).definitionDigest), status: "completed", branch: implementBranchName(result.workOrderId), headSha: "abcdef1234567", secret: "self-hosted-test-secret", completedAt: new Date(Date.now() - 1_000).toISOString() });
+  const completed = await worker.fetch(new Request("https://control.example/self-hosted/complete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(completion) }), { DB: database, SELF_HOSTED_WORK_SECRET: "self-hosted-test-secret" });
+  expect(completed.status).toBe(200);
+  expect(await completed.json()).toMatchObject({ accepted: true, workOrderId: result.workOrderId, runId: result.runId });
+  const replayedCompletion = await worker.fetch(new Request("https://control.example/self-hosted/complete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(completion) }), { DB: database, SELF_HOSTED_WORK_SECRET: "self-hosted-test-secret" });
+  expect(await replayedCompletion.json()).toMatchObject({ accepted: true, replayed: true });
+  const wrongBranch = createSelfHostedCompletion({ dispatchId: completion.dispatchId, executionBoundary: completion.executionBoundary, organizationId: completion.organizationId, factoryId: completion.factoryId, workOrderId: completion.workOrderId, runId: completion.runId, repository: completion.repository, definitionDigest: completion.definitionDigest, status: "completed", branch: "tinkerbot/another-work-order", headSha: completion.headSha, summary: completion.summary, completedAt: new Date(Date.now() - 500).toISOString(), secret: "self-hosted-test-secret" });
+  const wrongBranchResponse = await worker.fetch(new Request("https://control.example/self-hosted/complete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(wrongBranch) }), { DB: database, SELF_HOSTED_WORK_SECRET: "self-hosted-test-secret" });
+  expect(wrongBranchResponse.status).toBe(409);
+  expect(await wrongBranchResponse.json()).toMatchObject({ code: "branch_scope_mismatch" });
+});
+
+test("runFactoryTurn can bridge self-hosted work to an external HTTPS worker endpoint", async () => {
+  const database = factorySeed();
+  await new D1FactoryStore(database).putFactory({
+    factoryId: "fac_1",
+    organizationId: "org_1",
+    name: "payments",
+    yaml: `schemaVersion: v1alpha2
+name: payments
+repositories: [acme/payments]
+runtime:
+  controlPlane: hosted
+  runner:
+    type: self_hosted
+    workerHost: self_hosted:runner-1
+agents:
+  - id: implementation
+    harness: codex
+`,
+  });
+  const requests: Array<{ url: string; body: unknown; headers: Headers }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    requests.push({ url: String(input), body: JSON.parse(String(init?.body ?? "{}")), headers: new Headers(init?.headers) });
+    return new Response("accepted", { status: 202 });
+  }) as typeof fetch;
+  try {
+    const result = await runFactoryTurn({ DB: database, SELF_HOSTED_WORK_ENDPOINT: "https://worker.example/tinkerbot/dispatch", SELF_HOSTED_WORK_SECRET: "self-hosted-test-secret" }, {
+      deliveryId: "self-hosted-http-1", organizationId: "org_1", factoryId: "fac_1", repository: "acme/payments", sourceType: "github_issue", sourceId: "43", issueOrPullRequest: "implement refunds", actor: "factory-agent", specApproved: true,
+    });
+    expect(result.wait).toBe("self_hosted_harness");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toBe("https://worker.example/tinkerbot/dispatch");
+    expect(requests[0]?.headers.get("x-tinkerbot-self-hosted-protocol")).toBe("1");
+    expect(requests[0]?.body).toMatchObject({ executionBoundary: "self_hosted", harness: "codex", integrity: { signed: true } });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("Foreman Durable Object, MCP, queue, and Slack challenge stay on the factory intake path", async () => {
@@ -583,6 +722,9 @@ test("factory store methods persist cells, tokens, publications, products, and r
   expect(await store.hitRateLimit("bucket", 2, 60_000, Date.parse(now) + 2)).toBe(true);
   await store.insertProposal({ proposalId: "prop_ok", factoryId: "fac_1", title: "checklist", evidence: ["8 PRs"], proposedChanges: ["add review"], expectedEffect: "fewer misses", kind: "skill", stewardActor: "steward", now });
   expect(await store.approveProposal("prop_ok", "user_1", now)).toEqual({ ok: true });
+  await store.putFactory({ factoryId: "fac_other", organizationId: "org_2", name: "other", now });
+  await store.insertProposal({ proposalId: "prop_other", factoryId: "fac_other", title: "other tenant", evidence: [], proposedChanges: [], expectedEffect: "none", kind: "skill", now });
+  expect(await store.approveProposal("prop_other", "user_1", now, "org_1")).toEqual({ ok: false, reason: "not_found" });
   await store.insertRun({ runId: "run_1", workOrderId: "wo_1", factoryId: "fac_1", definitionDigest: "sha256:abc", status: "running", now });
   await store.insertStage("run_1", "foreman", "ok", "queued", now);
   expect((await store.listRunStages("run_1")).length).toBeGreaterThan(0);
@@ -656,12 +798,16 @@ test("authenticated factory HTTP lists products, cells, evolution, and MCP witho
     expect((await worker.fetch(new Request("https://control.example/release-assessments", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: "{}" }), env)).status).toBe(200);
     expect((await worker.fetch(new Request("https://control.example/audit/export", { headers }), env)).status).toBe(200);
     expect((await worker.fetch(new Request("https://control.example/notifications", { headers }), env)).status).toBe(200);
-    expect((await worker.fetch(new Request("https://control.example/notifications", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ kind: "slack", webhookUrl: "https://hooks.example/slack" }) }), env)).status).toBe(200);
+    expect((await worker.fetch(new Request("https://control.example/notifications", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ kind: "slack", webhookUrl: "https://hooks.slack.com/services/T000/B000/secret" }) }), env)).status).toBe(200);
+    const invalidNotification = await worker.fetch(new Request("https://control.example/notifications", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ kind: "slack", webhookUrl: "https://127.0.0.1/internal" }) }), env);
+    expect(invalidNotification.status).toBe(400);
     expect((await worker.fetch(new Request("https://control.example/roles", { headers }), env)).status).toBe(200);
     expect((await worker.fetch(new Request("https://control.example/roles", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ slug: "release-lead", capabilities: ["view_audit"] }) }), env)).status).toBe(200);
     const mcp = await worker.fetch(new Request("https://control.example/mcp", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }) }), env);
     expect(mcp.status).toBe(200);
     expect(JSON.stringify(await mcp.json())).not.toContain("cluster execute");
+    const oversizedMcp = await worker.fetch(new Request("https://control.example/mcp", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "send_task", arguments: { title: "x".repeat(1_500_001) } } }) }), env);
+    expect(oversizedMcp.status).toBe(413);
     const sync = await worker.fetch(new Request("https://control.example/runtime/sync", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ kind: "factory-run", origin: "local", runId: "local-run", plan: { planId: "p1", origin: "local", profile: { collaboration: "team", controlPlane: "local", pipeline: "multi_agent", runner: { type: "docker" }, inference: { mode: "managed" }, approval: "human_async", sync: "offline" }, selectedPipeline: "multi_agent", stages: [], skip: [], runner: { type: "docker" }, estimatedDurationSeconds: 1, cost: { catalogVersion: "2026-08-18.seat-v1", plannedStages: [], estimatedInputTokens: 0, estimatedOutputTokens: 0, estimatedDurationSeconds: 1, managedCogsCents: 0, byokSpendCents: 0, platformInvoice: "seats_only", confidence: "low", rangeCents: { low: 0, high: 1 } }, escalationEligible: false, createdAt: "now" } }) }), env);
     expect(sync.status).toBe(200);
     expect(await sync.json()).toMatchObject({ accepted: true, origin: "local" });
@@ -670,6 +816,14 @@ test("authenticated factory HTTP lists products, cells, evolution, and MCP witho
     database._state.memberships.set("user_1:org_1", { organization_id: "org_1", user_id: "user_1", role: "viewer", status: "active" });
     const viewerPost = await worker.fetch(new Request("https://control.example/factories", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ name: "payments" }) }), env);
     expect(viewerPost.status).toBe(403);
+    const viewerChangeSet = await worker.fetch(new Request("https://control.example/change-sets", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ name: "payments", repositories: [] }) }), env);
+    expect(viewerChangeSet.status).toBe(403);
+    const viewerReleaseAssessment = await worker.fetch(new Request("https://control.example/release-assessments", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: "{}" }), env);
+    expect(viewerReleaseAssessment.status).toBe(403);
+    const viewerNotification = await worker.fetch(new Request("https://control.example/notifications", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ kind: "slack", webhookUrl: "https://hooks.slack.com/services/T000/B000/secret" }) }), env);
+    expect(viewerNotification.status).toBe(403);
+    const viewerRole = await worker.fetch(new Request("https://control.example/roles", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ slug: "release-lead", capabilities: ["view_audit"] }) }), env);
+    expect(viewerRole.status).toBe(403);
     database._state.memberships.set("user_1:org_1", { organization_id: "org_1", user_id: "user_1", role: "owner", status: "active" });
     database._state.factories.set("fac_x", { factory_id: "fac_x", organization_id: "org_2", name: "other", status: "active" });
     database._state.runs.set("run_x", { run_id: "run_x", work_order_id: "wo_x", factory_id: "fac_x", definition_digest: "sha256:x", status: "running" });
@@ -677,6 +831,10 @@ test("authenticated factory HTTP lists products, cells, evolution, and MCP witho
     database._state.workOrders.set("wo_x", { work_order_id: "wo_x", factory_id: "fac_x", organization_id: "org_2", status: "implementation", current_stage: "implementation" });
     const crossCancel = await worker.fetch(new Request("https://control.example/work-orders/wo_x/cancel", { method: "POST", headers }), env);
     expect(crossCancel.status).toBe(404);
+    const crossFactoryMutation = await worker.fetch(new Request("https://control.example/factories/fac_x", { method: "PATCH", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ name: "attacker-overwrite" }) }), env);
+    expect(crossFactoryMutation.status).toBe(404);
+    const crossChangeSet = await worker.fetch(new Request("https://control.example/change-sets", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ name: "cross-tenant", workOrderId: "wo_x", repositories: [] }) }), env);
+    expect(crossChangeSet.status).toBe(404);
   } finally {
     globalThis.fetch = originalFetch;
   }

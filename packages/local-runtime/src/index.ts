@@ -4,6 +4,7 @@ export { dockerSandboxPort, processSandboxPort, stubSandboxPort, selectLocalSand
 export { resolveCredentialRef, assertNoSecretInPayload } from "./credentials";
 export { anthropicProvider, openaiProvider, ollamaProvider, stubInferenceProvider, providerForProfile, selectInferenceProvider } from "./providers";
 export { runExternalHarness, type ExternalHarnessInput, type ExternalHarnessResult } from "./harness";
+export { runSelfHostedDispatch, type SelfHostedWorkerInput, type SelfHostedWorkerResult } from "./self-hosted-worker";
 export { runLocalFactory } from "./orchestrator";
 export { replayOutbox } from "./outbox";
 export { localRuntimeView, formatPlanTab, formatCostTab, formatEvalTab, type LocalRuntimeView } from "./view";

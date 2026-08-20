@@ -7,6 +7,10 @@ import {
   factoryTreeDigest,
   handleFactoryMcpTool,
   implementBranchName,
+  containsRawCredentials,
+  applyFactoryTree,
+  parseFactoryDefinition,
+  validateFactoryDefinition,
   type ConversationMessage,
   type FactoryEvent,
   type McpToolContext,
@@ -181,6 +185,20 @@ function assertSafeFactoryPath(root: string, relativePath: string): string {
   const candidate = path.resolve(root, normalized);
   const base = path.resolve(root);
   if (candidate !== base && !candidate.startsWith(`${base}${path.sep}`)) throw new Error("factory file path escapes the repository root");
+  // Do not follow a repository-controlled symlink while creating a factory
+  // tree. A malicious checkout could otherwise redirect an MCP write outside
+  // the selected root even though the normalized path stays inside it.
+  let cursor = path.dirname(candidate);
+  while (cursor.startsWith(`${base}${path.sep}`)) {
+    try { if (fs.lstatSync(cursor).isSymbolicLink()) throw new Error("factory file path traverses a symlink"); } catch (error) {
+      if (error instanceof Error && error.message === "factory file path traverses a symlink") throw error;
+    }
+    if (cursor === base) break;
+    cursor = path.dirname(cursor);
+  }
+  try { if (fs.lstatSync(candidate).isSymbolicLink()) throw new Error("factory file path targets a symlink"); } catch (error) {
+    if (error instanceof Error && error.message.startsWith("factory file path")) throw error;
+  }
   return candidate;
 }
 
@@ -244,11 +262,31 @@ function localMcpEvent(root: string, workOrderId: string, payload: Record<string
 }
 
 function createLocalFactory(root: string, input: { name: string; yaml: string; files: Array<{ path: string; contents: string }> }): { factoryId: string; digest: string; files: string[] } {
+  const bytes = (value: string): number => new TextEncoder().encode(value).byteLength;
+  if (typeof input.name !== "string" || input.name.trim().length === 0 || input.name.length > 200 || /[\u0000-\u001f\u007f]/.test(input.name)) throw new Error("create_factory name is invalid");
+  if (typeof input.yaml !== "string" || input.yaml.length === 0 || bytes(input.yaml) > 512_000) throw new Error("create_factory yaml must be between 1 and 512000 bytes");
+  if (!Array.isArray(input.files) || input.files.length > 128) throw new Error("create_factory accepts at most 128 files");
+  for (const file of input.files) {
+    if (!file || typeof file.path !== "string" || file.path.length === 0 || file.path.length > 512 || bytes(file.path) > 2_048 || typeof file.contents !== "string" || bytes(file.contents) > 512_000) throw new Error("create_factory files require bounded path and contents strings");
+  }
+  const normalizedFiles = input.files.map((file) => ({ ...file, path: file.path.replaceAll("\\", "/") }));
+  const totalBytes = normalizedFiles.reduce((total, file) => total + bytes(file.contents), 0) + (normalizedFiles.some((file) => file.path === ".tinkerbot/factory.yaml") ? 0 : bytes(input.yaml));
+  if (!Number.isFinite(totalBytes) || totalBytes > 4_000_000) throw new Error("create_factory file contents exceed the 4 MB limit");
+  if (new Set(normalizedFiles.map((file) => file.path)).size !== normalizedFiles.length) throw new Error("create_factory file paths must be unique");
+  if (containsRawCredentials({ yaml: input.yaml, files: normalizedFiles })) throw new Error("create_factory inputs must not contain raw credentials; use env:/keychain:// references.");
   const existing = path.join(root, ".tinkerbot", "factory.yaml");
   if (fs.existsSync(existing)) throw new Error("A factory definition already exists; edit it in git instead of replacing it through MCP.");
-  const files = [...input.files];
+  const files = [...normalizedFiles];
   if (!files.some((file) => file.path === ".tinkerbot/factory.yaml")) files.unshift({ path: ".tinkerbot/factory.yaml", contents: input.yaml });
+  const definitionFile = files.find((file) => file.path === ".tinkerbot/factory.yaml");
+  if (!definitionFile || definitionFile.contents !== input.yaml) throw new Error("create_factory yaml must match the .tinkerbot/factory.yaml file payload.");
   const destinations = files.map((file) => assertSafeFactoryPath(root, file.path));
+  // Parse and validate before touching the checkout. MCP input is untrusted;
+  // a malformed definition must not leave behind a partially-created factory.
+  let definition = parseFactoryDefinition(input.yaml);
+  definition = applyFactoryTree(definition, files);
+  const definitionErrors = validateFactoryDefinition(definition, { requireForeman: definition.schemaVersion === "v1alpha1" || definition.agents.some((agent) => agent.agentType === "FOREMAN") });
+  if (definitionErrors.length) throw new Error(`Invalid factory definition: ${definitionErrors.join("; ")}`);
   for (const [index, file] of files.entries()) {
     const destination = destinations[index]!;
     fs.mkdirSync(path.dirname(destination), { recursive: true });
@@ -390,6 +428,10 @@ export async function runPlatformMcpStdio(context: PlatformMcpContext, streams: 
   const input = readline.createInterface({ input: streams.input, crlfDelay: Infinity });
   for await (const line of input) {
     if (!line.trim()) continue;
+    if (Buffer.byteLength(line, "utf8") > 1_500_000) {
+      streams.output.write(`${JSON.stringify(protocolError(null, -32600, "Request is too large"))}\n`);
+      continue;
+    }
     let body: unknown;
     try {
       body = JSON.parse(line);

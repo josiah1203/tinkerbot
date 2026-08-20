@@ -17,6 +17,7 @@ import {
   ProviderError,
   StripeBillingProvider,
   StripePlan,
+  stripeCatalogComplete,
   StripeWebhookEvent,
   TenantBillingAccount,
   TenantEntitlement,
@@ -289,5 +290,5 @@ export async function startTeamTrial(database: D1DatabaseLike, organizationId: s
 }
 
 export function productionCatalogUnavailable(environment: string | undefined, plans: StripePlan[]): boolean {
-  return environment === "production" && plans.length === 0;
+  return environment === "production" && !stripeCatalogComplete(plans);
 }

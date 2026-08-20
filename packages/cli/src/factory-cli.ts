@@ -3,6 +3,7 @@ import { localFactoryGraphStatusPayload } from "./factory-os";
 import { defaultLocalDbPath, formatCostTab, formatEvalTab, formatPlanTab, SqliteFactoryStore } from "../../local-runtime/src";
 import { localDashboardPayload } from "./runtime-cli";
 import { runKitWorkstationInteractive, runKitWorkstationOnce, type KitWorkstationDeps } from "../../tui/src";
+import { mainSelfHostedWorker } from "./self-hosted-worker-cli";
 
 export const FACTORY_CLI_HELP = `Tinkerbot Factory CLI
 
@@ -14,6 +15,7 @@ Usage:
   tinkerbot-factory <tb command>       run any current Tinkerbot command
   tinkerbot-factory tui                open the kit-based workstation
   tinkerbot-factory mcp serve          run the platform MCP over stdio
+  tinkerbot-factory worker --help      run one signed self-hosted harness dispatch
 
 Examples:
   tinkerbot-factory factory status <work-order-id>
@@ -62,6 +64,7 @@ export async function mainFactoryCli(argv = process.argv.slice(2)): Promise<numb
     const { mainPlatformMcp } = await import("../../platform-mcp/src/cli");
     return mainPlatformMcp(argv.slice(2));
   }
+  if (argv[0] === "worker") return mainSelfHostedWorker(argv.slice(1));
   return mainAsync(argv);
 }
 

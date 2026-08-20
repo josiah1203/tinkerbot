@@ -16,7 +16,11 @@ export interface GitHubOidcClaims {
 
 export const GITHUB_ACTIONS_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
 export const GITHUB_ACTIONS_JWKS_URL = "https://token.actions.githubusercontent.com/.well-known/jwks";
-const GITLAB_OIDC_ISSUERS = ["https://gitlab.com", "https://gitlab.com/oidc"];
+// GitLab's public issuer is the only issuer trusted by the built-in verifier.
+// Do not infer trust from a hostname containing "gitlab": doing so would let
+// an attacker choose an arbitrary issuer/JWKS endpoint (for example
+// https://gitlab.attacker.example) and mint a token signed by their own key.
+const GITLAB_OIDC_ISSUERS = ["https://gitlab.com", "https://gitlab.com/oidc"] as const;
 
 const jwksCache = new Map<string, { fetchedAt: number; keys: JsonWebKey[] }>();
 const JWKS_TTL_MS = 60 * 60 * 1000;
@@ -29,13 +33,15 @@ export function resetOidcJwksCache(): void {
 
 export function validateOidcClaims(claims: GitHubOidcClaims, expected: { audience: string; repository: string; sha?: string; workflow?: string }): { ok: true } | { ok: false; reason: string } {
   const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
-  const gitlab = GITLAB_OIDC_ISSUERS.includes(claims.iss) || /^https:\/\/[^/]*gitlab[^/]*$/.test(claims.iss);
+  const gitlab = GITLAB_OIDC_ISSUERS.includes(claims.iss as (typeof GITLAB_OIDC_ISSUERS)[number]);
   if (claims.iss !== GITHUB_ACTIONS_OIDC_ISSUER && !gitlab) return { ok: false, reason: "invalid_issuer" };
   if (!audiences.includes(expected.audience)) return { ok: false, reason: "invalid_audience" };
   const repository = gitlab ? (claims.project_path ?? claims.repository) : claims.repository;
   if (repository !== expected.repository) return { ok: false, reason: "invalid_repository" };
-  if (expected.sha && claims.sha && claims.sha !== expected.sha) return { ok: false, reason: "invalid_sha" };
-  if (expected.workflow && claims.workflow && claims.workflow !== expected.workflow) return { ok: false, reason: "invalid_workflow" };
+  // A caller that supplies an expected binding is asking for an exact
+  // binding. Missing claims must fail closed just like mismatched claims.
+  if (expected.sha && claims.sha !== expected.sha) return { ok: false, reason: "invalid_sha" };
+  if (expected.workflow && claims.workflow !== expected.workflow) return { ok: false, reason: "invalid_workflow" };
   return { ok: true };
 }
 
@@ -53,8 +59,7 @@ export function decodeJwtPayload(token: string): GitHubOidcClaims | undefined {
 
 export function jwksUrlForIssuer(iss: string): string | undefined {
   if (iss === GITHUB_ACTIONS_OIDC_ISSUER) return GITHUB_ACTIONS_JWKS_URL;
-  if (iss === "https://gitlab.com" || iss === "https://gitlab.com/oidc") return "https://gitlab.com/oauth/discovery/keys";
-  if (/^https:\/\/[^/]*gitlab[^/]*$/.test(iss)) return `${iss.replace(/\/$/, "")}/oauth/discovery/keys`;
+  if (GITLAB_OIDC_ISSUERS.includes(iss as (typeof GITLAB_OIDC_ISSUERS)[number])) return "https://gitlab.com/oauth/discovery/keys";
   return undefined;
 }
 
@@ -81,9 +86,11 @@ function validateTimeClaims(claims: GitHubOidcClaims, nowSeconds: number, maxIat
 async function readJwks(url: string, fetchImpl: typeof fetch, forceRefresh: boolean): Promise<Array<JsonWebKey & { kid?: string }>> {
   const cached = jwksCache.get(url);
   if (!forceRefresh && cached && Date.now() - cached.fetchedAt < JWKS_TTL_MS) return cached.keys;
-  const response = await fetchImpl(url, { headers: { accept: "application/json" } });
+  const response = await fetchImpl(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000) });
   if (!response.ok) throw new Error("jwks_unavailable");
-  const body = await response.json() as { keys?: Array<JsonWebKey & { kid?: string }> };
+  const text = await response.text();
+  if (text.length > 1_000_000) throw new Error("jwks_oversized");
+  const body = JSON.parse(text) as { keys?: Array<JsonWebKey & { kid?: string }> };
   const keys = Array.isArray(body.keys) ? body.keys.filter((key): key is JsonWebKey & { kid?: string } => Boolean(key && typeof key === "object")) : [];
   jwksCache.set(url, { fetchedAt: Date.now(), keys });
   return keys;
@@ -105,6 +112,7 @@ export async function verifyOidcJwt(
   expected: { audience: string; repository: string; sha?: string; workflow?: string },
   options: { nowSeconds?: number; fetchImpl?: typeof fetch; maxIatAgeSeconds?: number } = {},
 ): Promise<{ ok: true; claims: GitHubOidcClaims } | { ok: false; reason: string }> {
+  if (typeof token !== "string" || token.length > 64_000) return { ok: false, reason: "malformed_jwt" };
   const parts = token.split(".");
   if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2] || parts[2] === "sig") return { ok: false, reason: "unsigned_or_malformed" };
   let header: { alg?: string; kid?: string; typ?: string };

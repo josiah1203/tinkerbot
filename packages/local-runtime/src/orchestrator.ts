@@ -104,10 +104,12 @@ export async function runLocalFactory(input: LocalRunInput): Promise<{ workOrder
         harnessResult = await runExternalHarness({
           harness: externalHarness,
           worktree: lease.worktree,
+          executionWorktree: sandbox.kind === "docker" ? "/work" : lease.worktree,
           repository: order.repositoryId,
           workOrderId: order.workOrderId,
           prompt: input.untrustedText ?? "Implement the requested change.",
           model: implementationAgent?.model,
+          networkIsolation: sandbox.kind !== "process",
           exec: (argv, options) => sandbox.exec(lease.worktree, argv, options),
         });
       } catch {

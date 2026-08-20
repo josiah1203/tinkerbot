@@ -4,6 +4,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { afterEach, expect, test } from "vitest";
 import { mainAsync, runCli } from "../packages/cli/src";
+import { mainFactoryCli } from "../packages/cli/src/factory-cli";
 import { clearStoredCredentials, hostedSession, saveStoredCredentials } from "../packages/cli/src/credentials";
 
 function git(root: string, args: string[]): void {
@@ -250,6 +251,15 @@ test("factory validate, receipt validate, login, and hosted inspect commands are
   clearStoredCredentials();
   expect(fs.existsSync(credentialFile)).toBe(false);
   clearStoredCredentials();
+});
+
+test("factory CLI exposes a bounded self-hosted worker entrypoint", async () => {
+  const help = await captureAsync(() => mainFactoryCli(["worker", "--help"]));
+  expect(help.code).toBe(0);
+  expect(help.stdout).toContain("--completion-url");
+  const missing = await captureAsync(() => mainFactoryCli(["worker"]));
+  expect(missing.code).toBe(3);
+  expect(missing.stderr).toContain("--completion-url");
 });
 
 test("tb factory new writes a local starter and refuses to overwrite", () => {

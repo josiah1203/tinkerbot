@@ -8,6 +8,7 @@ import {
   assertAllowedHarness,
   mcpServerNames,
   parseAgentDefaults,
+  parseAgentType,
   parseAlias,
   parseCredentialStrategy,
   parseFactorySchemaVersion,
@@ -20,8 +21,17 @@ import {
   type FactoryRunnerDefinition,
   type FactorySchemaVersion,
 } from "./definition";
-import { assertHarnessWorkerHost, defaultHarnessDefinition, isExternalHarness, parseHarnessDefinitions, validateHarnessBindings } from "./harness";
+import { assertHarnessWorkerHost, defaultHarnessDefinition, isExternalHarness, isSelfHostedWorkerHost, parseHarnessDefinitions, validateHarnessBindings } from "./harness";
 export * from "./definition";
+
+const REPOSITORY_NAME_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const RUNNER_IMAGE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._\/\@:-]{0,255}$/;
+
+function assertSafeRunnerImage(value: string): string {
+  const image = value.trim();
+  if (!image || !RUNNER_IMAGE_PATTERN.test(image) || image.includes("..")) throw new Error("runner.image must be a safe container image or local runner identifier.");
+  return image;
+}
 import {
   autonomyAllowsSkip,
   defaultProductionLines,
@@ -66,6 +76,7 @@ export * from "./outcomes";
 export * from "./lifecycle";
 export * from "./control-plane-view";
 export * from "./harness";
+export * from "./self-hosted";
 export { executeFactoryRun } from "./execute";
 import { assertCredentialRef, hostedRuntimeDefaults, parseRuntimeProfile, type RuntimeProfile } from "./runtime";
 import type { AcceptanceCriterionLink, Waiver } from "./authority";
@@ -285,8 +296,14 @@ function isFactorySourceType(value: unknown): value is FactorySourceType {
   return typeof value === "string" && (SOURCE_TYPES as readonly string[]).includes(value);
 }
 
-const SECRET_PATTERN = /(password|secret|token|api[_-]?key|authorization|private[_-]?key)\s*[:=]\s*\S+/gi;
-const CREDENTIAL_KEYS = /credential|secret|token|password|private[_-]?key/i;
+// Keep the detector non-global: a global RegExp's mutable lastIndex can make
+// repeated `.test()` calls alternate between true and false, which is unsafe
+// for a credential gate. Use the separate global pattern only for redaction.
+const SECRET_PATTERN = /((?:password|secret|token|api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|private[_-]?key|signing[_-]?secret|webhook[_-]?secret))\s*[:=]\s*\S+/i;
+const SECRET_REDACTION_PATTERN = /((?:password|secret|token|api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|private[_-]?key|signing[_-]?secret|webhook[_-]?secret))\s*[:=]\s*\S+/gi;
+const RAW_TOKEN_PATTERN = /(?:sk-[A-Za-z0-9_-]{8,}|sk_(?:live|test)_[A-Za-z0-9_-]{8,}|gh(?:p|s|o|u|r)_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{8,}|whsec_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|hf_[A-Za-z0-9_-]{8,}|npm_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,}|(?:xai|pplx)-[A-Za-z0-9_-]{8,})/i;
+const RAW_TOKEN_REDACTION_PATTERN = /(?:sk-[A-Za-z0-9_-]{8,}|sk_(?:live|test)_[A-Za-z0-9_-]{8,}|gh(?:p|s|o|u|r)_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{8,}|whsec_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|hf_[A-Za-z0-9_-]{8,}|npm_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,}|(?:xai|pplx)-[A-Za-z0-9_-]{8,})/gi;
+const CREDENTIAL_KEYS = /credential|secret|token|password|api[_-]?key|access[_-]?key|authorization|private[_-]?key|signing[_-]?secret|webhook[_-]?secret/i;
 
 export function isWorkOrderState(value: string): value is WorkOrderState {
   return (WORK_ORDER_STATES as readonly string[]).includes(value);
@@ -336,7 +353,7 @@ export function factoryDefinitionDigest(definition: FactoryDefinition): string {
 }
 
 export function containsRawCredentials(value: unknown): boolean {
-  if (typeof value === "string") return SECRET_PATTERN.test(value) || /gh[ps]_|sk_live_|sk_test_|whsec_/.test(value);
+  if (typeof value === "string") return SECRET_PATTERN.test(value) || RAW_TOKEN_PATTERN.test(value);
   if (Array.isArray(value)) return value.some(containsRawCredentials);
   if (value && typeof value === "object") {
     return Object.entries(value as Record<string, unknown>).some(([key, nested]) => CREDENTIAL_KEYS.test(key) && typeof nested === "string" && nested.length > 8 && !nested.startsWith("secret://") && !nested.startsWith("env:") && !nested.startsWith("keychain://") || containsRawCredentials(nested));
@@ -385,12 +402,24 @@ export function parseFactoryDefinition(input: unknown): FactoryDefinition {
     const record = item && typeof item === "object" ? item as Record<string, unknown> : {};
     if (schemaVersion === "v1alpha1" && record.model != null && record.harness != null) throw new Error("An agent cannot set both model and harness.");
     const id = typeof record.id === "string" ? record.id : `agent-${index}`;
+    if (!/^[a-z][a-z0-9._-]{0,63}$/i.test(id)) throw new Error(`Agent ${id} has an invalid id.`);
     const provider = record.provider === "gateway" || record.provider === "none" ? record.provider : "workers-ai";
     const harness = assertAllowedHarness(record.harness, `Agent ${id}`) ?? (id === "implement" || id === "implementation" ? "tinkerbot-sandbox" : agentDefaults.harness ?? "default");
     if (isExternalHarness(harness) && !harnesses[harness]) harnesses[harness] = defaultHarnessDefinition(harness);
     const modelRaw = typeof record.model === "string" ? record.model : agentDefaults.model;
-    return { id, model: modelRaw === "auto" || !modelRaw ? defaultModelForAgent(id) : modelRaw, provider, harness, timeoutSeconds: Number(record.timeoutSeconds ?? 60), agentType: typeof record.agentType === "string" ? record.agentType.toUpperCase() as FactoryAgentType : undefined, description: typeof record.description === "string" ? record.description : undefined, workerHost: typeof record.workerHost === "string" ? record.workerHost : agentDefaults.workerHost, secretRefs: asStringArray(record.secrets), mcpServers: mcpServerNames(record.mcpServers) };
+    const timeoutSeconds = Number(record.timeoutSeconds ?? 60);
+    if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 86_400) throw new Error(`Agent ${id} timeoutSeconds must be between 1 and 86400.`);
+    const agentType = record.agentType == null ? undefined : parseAgentType(record.agentType);
+    return { id, model: modelRaw === "auto" || !modelRaw ? defaultModelForAgent(id) : modelRaw, provider, harness, timeoutSeconds, agentType, description: typeof record.description === "string" ? record.description : undefined, workerHost: typeof record.workerHost === "string" ? record.workerHost : agentDefaults.workerHost, secretRefs: asStringArray(record.secrets), mcpServers: mcpServerNames(record.mcpServers) };
   });
+  if (new Set(agents.map((agent) => agent.id)).size !== agents.length) throw new Error("Factory agents must have unique ids.");
+  // `agentDefaults.harness` is also the implementation binding when a factory
+  // uses the compact YAML shape. Materialize that binding so local and
+  // self-hosted runners execute the same agent rather than silently falling
+  // back to the built-in default harness.
+  if (!agents.some((agent) => agent.id === "implement" || agent.id === "implementation") && agentDefaults.harness && isExternalHarness(agentDefaults.harness)) {
+    agents.push({ id: "implementation", model: defaultModelForAgent("implementation"), provider: "none", harness: agentDefaults.harness, timeoutSeconds: 60, agentType: "IMPLEMENT", workerHost: agentDefaults.workerHost, secretRefs: [], mcpServers: [] });
+  }
   const defaultStages: FactoryStageDefinition[] = FACTORY_STAGES.map((id) => ({ id, agent: ["foreman", "triage", "specification", "review", "implement"].includes(id) || id === "implementation" ? (id === "implementation" ? "implement" : id) : undefined, required: id === "verification" || id === "foreman", approvalRequired: id === "specification" || id === "release" }));
   const stages = Array.isArray(raw.stages) && raw.stages.length
     ? raw.stages.map((item) => {
@@ -400,14 +429,27 @@ export function parseFactoryDefinition(input: unknown): FactoryDefinition {
       return { id, agent: typeof record.agent === "string" ? record.agent : undefined, required: record.required !== false, approvalRequired: record.approvalRequired === true || id === "release" };
     })
     : defaultStages;
+  if (new Set(stages.map((stage) => stage.id)).size !== stages.length) throw new Error("Factory stages must have unique ids.");
   const policies = raw.policies && typeof raw.policies === "object" ? raw.policies as Record<string, unknown> : {};
   const runner = raw.runner && typeof raw.runner === "object" ? raw.runner as Record<string, unknown> : {};
   const timeouts = raw.timeouts && typeof raw.timeouts === "object" ? raw.timeouts as Record<string, unknown> : {};
   const budgets = raw.budgets && typeof raw.budgets === "object" ? raw.budgets as Record<string, unknown> : {};
   const approvals = raw.approvals && typeof raw.approvals === "object" ? raw.approvals as Record<string, unknown> : {};
   const runnerWorkerHost = assertHarnessWorkerHost(runner.workerHost, "runner");
-  const runnerType = runner.type === "self_hosted" || runnerWorkerHost?.startsWith("self_hosted") || agentDefaults.workerHost?.startsWith("self_hosted") ? "self_hosted" : runner.type === "tinkerbot-sandbox" || agentDefaults.workerHost === "warp" ? "tinkerbot-sandbox" : "github_actions";
-  const runtime = parseRuntimeProfile(raw.runtime, { ...hostedRuntimeDefaults(runnerType), workerHost: runnerWorkerHost ?? agentDefaults.workerHost });
+  if (runner.type != null && runner.type !== "github_actions" && runner.type !== "tinkerbot-sandbox" && runner.type !== "self_hosted") throw new Error("runner.type must be github_actions, tinkerbot-sandbox, or self_hosted.");
+  const runnerImage = assertSafeRunnerImage(typeof runner.image === "string" && runner.image.trim() ? runner.image : "cloudflare/sandbox:next");
+  const stageSeconds = Number(timeouts.stageSeconds ?? 900);
+  const runSeconds = Number(timeouts.runSeconds ?? 3600);
+  const budgetTokens = Number(budgets.tokens ?? 100_000);
+  const budgetUsdCents = Number(budgets.usdCents ?? 500);
+  const wipLimit = Number(raw.wipLimit ?? budgets.wipLimit ?? 8);
+  if (![stageSeconds, runSeconds].every((value) => Number.isFinite(value) && value >= 1 && value <= 86_400)) throw new Error("Factory timeouts must be finite values between 1 and 86400 seconds.");
+  if (![budgetTokens, budgetUsdCents].every((value) => Number.isFinite(value) && value >= 0 && value <= 1_000_000_000)) throw new Error("Factory budgets must be finite, non-negative values.");
+  if (!Number.isInteger(wipLimit) || wipLimit < 1 || wipLimit > 100_000) throw new Error("wipLimit must be an integer between 1 and 100000.");
+  const agentWorkerHost = agents.find((agent) => isSelfHostedWorkerHost(agent.workerHost))?.workerHost;
+  const inferredSelfHosted = runner.type == null && Boolean(agentWorkerHost);
+  const runnerType = runner.type === "self_hosted" || runnerWorkerHost?.startsWith("self_hosted") || agentDefaults.workerHost?.startsWith("self_hosted") || inferredSelfHosted ? "self_hosted" : runner.type === "tinkerbot-sandbox" || agentDefaults.workerHost === "warp" ? "tinkerbot-sandbox" : "github_actions";
+  const runtime = parseRuntimeProfile(raw.runtime, { ...hostedRuntimeDefaults(runnerType), workerHost: runnerWorkerHost ?? agentWorkerHost ?? agentDefaults.workerHost });
   return {
     version: 1,
     schemaVersion,
@@ -427,7 +469,7 @@ export function parseFactoryDefinition(input: unknown): FactoryDefinition {
     runner: {
       type: runnerType,
       workflow: typeof runner.workflow === "string" ? runner.workflow : "tinkerbot.yml",
-      image: typeof runner.image === "string" ? runner.image : "cloudflare/sandbox:next",
+      image: runnerImage,
       workerHost: runnerWorkerHost,
     },
     harnesses,
@@ -436,9 +478,9 @@ export function parseFactoryDefinition(input: unknown): FactoryDefinition {
     agentInstructions: raw.agentInstructions && typeof raw.agentInstructions === "object" && !Array.isArray(raw.agentInstructions) ? Object.fromEntries(Object.entries(raw.agentInstructions as Record<string, unknown>).filter((entry): entry is [string, string] => typeof entry[1] === "string")) : {},
     permissions: asStringArray(raw.permissions),
     secretRefs: asStringArray(raw.secretRefs ?? raw.secrets).map((item) => item.startsWith("secret://") || item.startsWith("env:") ? item : `secret://${item}`),
-    timeouts: { stageSeconds: Number(timeouts.stageSeconds ?? 900), runSeconds: Number(timeouts.runSeconds ?? 3600) },
-    budgets: { tokens: Number(budgets.tokens ?? 100_000), usdCents: Number(budgets.usdCents ?? 500) },
-    wipLimit: Math.max(1, Number(raw.wipLimit ?? budgets.wipLimit ?? 8)),
+    timeouts: { stageSeconds, runSeconds },
+    budgets: { tokens: budgetTokens, usdCents: budgetUsdCents },
+    wipLimit,
     approvals: { required: approvals.required !== false, roles: asStringArray(approvals.roles).length ? asStringArray(approvals.roles) : ["maintainer", "admin", "owner"] },
     lines: defaultProductionLines(),
     skills: [],
@@ -452,14 +494,22 @@ export function validateFactoryDefinition(definition: FactoryDefinition, options
   const errors: string[] = [];
   if (containsRawCredentials(definition)) errors.push("raw credentials are forbidden");
   if (!definition.repositories.length) errors.push("at least one repository is required");
+  if (definition.repositories.some((repository) => !REPOSITORY_NAME_PATTERN.test(repository))) errors.push("repositories must use owner/name identifiers");
   if (!definition.stages.some((stage) => stage.id === "verification")) errors.push("verification stage is required");
-  if (definition.timeouts.stageSeconds <= 0 || definition.timeouts.runSeconds <= 0) errors.push("timeouts must be positive");
-  if (definition.budgets.tokens < 0 || definition.budgets.usdCents < 0) errors.push("budgets cannot be negative");
+  if (![definition.timeouts.stageSeconds, definition.timeouts.runSeconds].every((value) => Number.isFinite(value) && value >= 1 && value <= 86_400)) errors.push("timeouts must be finite values between 1 and 86400 seconds");
+  if (![definition.budgets.tokens, definition.budgets.usdCents].every((value) => Number.isFinite(value) && value >= 0 && value <= 1_000_000_000)) errors.push("budgets must be finite, non-negative values");
+  if (!Number.isInteger(definition.wipLimit) || definition.wipLimit < 1 || definition.wipLimit > 100_000) errors.push("wipLimit must be an integer between 1 and 100000");
+  for (const agent of definition.agents) if (!Number.isFinite(agent.timeoutSeconds) || agent.timeoutSeconds < 1 || agent.timeoutSeconds > 86_400) errors.push(`agent ${agent.id} timeoutSeconds is invalid`);
   const trackers = definition.integrations.filter((item) => item.type === "linear" || item.type === "jira");
   if (trackers.length > 1) errors.push("Linear and Jira cannot both be attached");
   const foremen = definition.agents.filter((agent) => agent.agentType === "FOREMAN");
   if (options?.requireForeman && foremen.length !== 1) errors.push("exactly one FOREMAN agent is required");
   if (foremen.length > 1) errors.push("exactly one FOREMAN agent is required");
+  const implementation = definition.agents.find((agent) => agent.id === "implement" || agent.id === "implementation" || agent.agentType === "IMPLEMENT");
+  const implementationHarness = implementation?.harness ?? definition.agentDefaults?.harness;
+  if (definition.runtime.runner.type === "self_hosted" && (!implementationHarness || !isExternalHarness(implementationHarness))) {
+    errors.push("self_hosted runners require an explicitly configured external implementation harness (for example codex or claude-code)");
+  }
   errors.push(...validateHarnessBindings({ agents: definition.agents, harnesses: definition.harnesses, controlPlane: definition.runtime.controlPlane, runnerType: definition.runtime.runner.type, runtimeWorkerHost: definition.runtime.workerHost }));
   return errors;
 }
@@ -539,7 +589,7 @@ export function createWorkOrder(input: Omit<WorkOrder, "workOrderId" | "createdA
 }
 
 export function sanitizeUntrustedPromptInput(value: string, limit = 8_000): string {
-  return value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ").replace(SECRET_PATTERN, "[redacted]").replace(/gh[ps]_[A-Za-z0-9_]{8,}/g, "[redacted]").slice(0, limit);
+  return value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ").replace(SECRET_REDACTION_PATTERN, "[redacted]").replace(RAW_TOKEN_REDACTION_PATTERN, "[redacted]").slice(0, limit);
 }
 
 export interface AgentStageResult {
@@ -551,6 +601,17 @@ export interface AgentStageResult {
 
 export interface FactoryAi {
   run(model: string, input: { messages: Array<{ role: string; content: string }> }, options?: { gateway?: { id: string; collectLog?: boolean; metadata?: Record<string, string> } }): Promise<{ response?: string }>;
+}
+
+const AGENT_OUTPUT_SECRET_PATTERNS = [
+  RAW_TOKEN_REDACTION_PATTERN,
+  /((?:password|secret|token|api[_-]?key)\s*[:=]\s*)\S+/gi,
+];
+
+function sanitizeAgentOutput(value: string, limit = 2_000): string {
+  let result = value;
+  for (const pattern of AGENT_OUTPUT_SECRET_PATTERNS) result = result.replace(pattern, (match, prefix?: string) => prefix ? `${prefix}[redacted]` : "[redacted]");
+  return result.slice(0, limit);
 }
 
 export function runForeman(definition: FactoryDefinition, sourceType: WorkOrder["sourceType"], skip: FactoryStageId[] = [], lineId?: ProductionLineId): FactoryStageId[] {
@@ -568,7 +629,7 @@ async function invokeAgent(ai: FactoryAi | undefined, agent: FactoryAgentDefinit
   try {
     const result = await ai.run(agent.model, { messages: [{ role: "system", content: instruction }, { role: "user", content: sanitizeUntrustedPromptInput(untrusted) }] }, workersAiGatewayOptions({ stage: agent.id }));
     const text = typeof result.response === "string" ? result.response.trim() : "";
-    return text ? { status: "ok", summary: text.slice(0, 2_000), usage: { tokens: Math.ceil(text.length / 4), costCents: 0 } } : { status: "unknown", summary: "The model returned an empty response." };
+    return text ? { status: "ok", summary: sanitizeAgentOutput(text), usage: { tokens: Math.ceil(text.length / 4), costCents: 0 } } : { status: "unknown", summary: "The model returned an empty response." };
   } catch {
     return { status: "unknown", summary: "The model invocation failed." };
   }

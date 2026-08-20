@@ -14,10 +14,11 @@ import {
   soloRuntimeOverlay,
   validateInlineApproval,
   mergeRuntimeProfile,
+  createSelfHostedDispatch,
   type FactoryEvent,
 } from "../packages/factory/src";
 import { publicCapabilities } from "../packages/control-plane/src/entitlements";
-import { anthropicProvider, assertNoSecretInPayload, LOCAL_DB_SCHEMA_VERSION, replayOutbox, resolveCredentialRef, runExternalHarness, runLocalFactory, selectInferenceProvider, selectLocalSandbox, SQLITE_MAGIC, SqliteFactoryStore, stubInferenceProvider, stubSandboxPort } from "../packages/local-runtime/src";
+import { anthropicProvider, assertNoSecretInPayload, dockerSandboxPort, LOCAL_DB_SCHEMA_VERSION, processSandboxPort, replayOutbox, resolveCredentialRef, runExternalHarness, runLocalFactory, runSelfHostedDispatch, selectInferenceProvider, selectLocalSandbox, SQLITE_MAGIC, SqliteFactoryStore, stubInferenceProvider, stubSandboxPort } from "../packages/local-runtime/src";
 import { evalCli, evalCliAsync, factoryPlanPayload } from "../packages/cli/src/runtime-cli";
 import { localDashboardApi } from "../packages/cli/src/local-dashboard";
 import fs from "node:fs";
@@ -42,6 +43,10 @@ describe("runtime contracts", () => {
     const selfHosted = parseFactoryDefinition(`schemaVersion: v1alpha2\nname: pay\nrepositories: [acme/pay]\nruntime:\n  controlPlane: hosted\n  runner:\n    type: self_hosted\n    workerHost: self_hosted:runner-1\n  inference:\n    mode: byok\n    provider: openai\n    credentialRef: env:OPENAI_API_KEY\nagents:\n  - id: implementation\n    harness: codex\n`);
     expect(selfHosted.runtime).toMatchObject({ controlPlane: "hosted", runner: { type: "self_hosted" }, workerHost: "self_hosted:runner-1", inference: { mode: "byok" } });
     expect(validateFactoryDefinition(selfHosted)).toEqual([]);
+    const agentBoundWorker = parseFactoryDefinition(`schemaVersion: v1alpha2\nname: pay\nrepositories: [acme/pay]\nruntime:\n  controlPlane: hosted\nagents:\n  - id: implementation\n    harness: codex\n    workerHost: self_hosted:runner-2\n`);
+    expect(agentBoundWorker.runtime.runner.type).toBe("self_hosted");
+    expect(agentBoundWorker.runtime.workerHost).toBe("self_hosted:runner-2");
+    expect(validateFactoryDefinition(agentBoundWorker)).toEqual([]);
     const hostedExternal = parseFactoryDefinition(`schemaVersion: v1alpha2\nname: pay\nrepositories: [acme/pay]\nagents:\n  - id: implementation\n    harness: codex\n`);
     expect(validateFactoryDefinition(hostedExternal).some((error) => /self_hosted|local control plane/.test(error))).toBe(true);
     expect(() => parseFactoryDefinition(`schemaVersion: v1alpha2\nname: pay\nrepositories: [acme/pay]\nruntime:\n  controlPlane: hosted\n  runner:\n    type: docker\n`)).toThrow(/Hosted control planes cannot run/);
@@ -93,6 +98,7 @@ describe("local runtime", () => {
     const reopened = new SqliteFactoryStore(db);
     expect((await reopened.listFactoryEvents("wo_graph"))).toHaveLength(2);
     await expect(reopened.appendFactoryEvent({ ...base, eventId: "event-2", type: "release.requested", occurredAt: "2026-08-20T00:00:02.000Z", payload: {} } as FactoryEvent)).rejects.toThrow();
+    await expect(reopened.appendFactoryEvent({ ...base, eventId: "event-secret", type: "task.decomposed", occurredAt: "2026-08-20T00:00:03.000Z", payload: { apiKey: "an-unprefixed-secret-value" } } as FactoryEvent)).rejects.toThrow(/Secrets/);
   });
 
   test("sqlite work order to stub sandbox receipt without secrets", async () => {
@@ -121,6 +127,7 @@ describe("local runtime", () => {
     expect(() => assertNoSecretInPayload(store.receipts[0])).not.toThrow();
     expect(resolveCredentialRef("env:TB_TEST_KEY", { TB_TEST_KEY: "abc" })).toBe("abc");
     expect(() => resolveCredentialRef("sk-raw")).toThrow();
+    expect(() => resolveCredentialRef("keychain://../outside")).toThrow();
     expect(store.schemaVersion()).toBe(LOCAL_DB_SCHEMA_VERSION);
     expect(fs.readFileSync(db).subarray(0, 15).toString("utf8")).toBe(SQLITE_MAGIC);
     const graphEvents = await store.listFactoryEvents(result.workOrderId);
@@ -173,9 +180,9 @@ describe("local runtime", () => {
 
   test("external harnesses receive a bounded protocol request and never echo credentials", async () => {
     const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "tb-harness-"));
-    let observed: { argv: string[]; options?: { env?: Record<string, string>; stdin?: string } } | undefined;
+    let observed: { argv: string[]; options?: { env?: Record<string, string>; stdin?: string; network?: "none" | "egress" } } | undefined;
     const result = await runExternalHarness({
-      harness: { id: "codex", command: "codex-wrapper", args: ["--request", "${requestFile}", "--worktree", "${worktree}"], protocol: "stdio-json", env: { CODEX_API_KEY: "env:TB_HARNESS_SECRET" }, timeoutSeconds: 30 },
+      harness: { id: "codex", command: "codex-wrapper", args: ["--request", "${requestFile}", "--worktree", "${worktree}"], protocol: "stdio-json", network: "egress", env: { CODEX_API_KEY: "env:TB_HARNESS_SECRET" }, timeoutSeconds: 30 },
       worktree,
       repository: "acme/payments",
       workOrderId: "wo_harness",
@@ -192,9 +199,193 @@ describe("local runtime", () => {
     expect(result.status).toBe("ok");
     expect(result.summary).not.toContain("customer-secret-value");
     expect(observed?.options?.env).toEqual({ CODEX_API_KEY: "customer-secret-value" });
+    expect(observed?.options?.network).toBe("egress");
     expect(observed?.options?.stdin).toContain('"protocolVersion":1');
     expect(fs.readdirSync(worktree)).toHaveLength(0);
     fs.rmSync(worktree, { recursive: true, force: true });
+  });
+
+  test("external harness protocol uses the container-visible worktree path", async () => {
+    const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "tb-harness-container-"));
+    let observed: { argv: string[]; stdin?: string } | undefined;
+    await runExternalHarness({
+      harness: { id: "codex", command: "codex", args: ["--request", "${requestFile}", "--worktree", "${worktree}"], protocol: "stdio-json", env: {}, timeoutSeconds: 30 },
+      worktree,
+      executionWorktree: "/work",
+      repository: "acme/payments",
+      workOrderId: "wo_container",
+      prompt: "Implement the approved change.",
+      exec: async (argv, options) => {
+        observed = { argv, stdin: options?.stdin };
+        return { stdout: "ok", stderr: "", exitCode: 0 };
+      },
+    });
+    expect(observed?.argv).toEqual(["codex", "--request", expect.stringMatching(/^\/work\//), "--worktree", "/work"]);
+    expect(JSON.parse(observed?.stdin ?? "{}")).toMatchObject({ worktree: "/work" });
+    fs.rmSync(worktree, { recursive: true, force: true });
+  });
+
+  test("text harnesses receive the redacted prompt instead of raw credentials", async () => {
+    const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "tb-harness-text-"));
+    let stdin = "";
+    await runExternalHarness({
+      harness: { id: "codex", command: "codex", args: [], protocol: "text", env: {}, timeoutSeconds: 30 },
+      worktree,
+      repository: "acme/payments",
+      workOrderId: "wo_text",
+      prompt: "use token=gho_abcdefghijklmnop",
+      exec: async (_argv, options) => { stdin = options?.stdin ?? ""; return { stdout: "ok", stderr: "", exitCode: 0 }; },
+    });
+    expect(stdin).not.toContain("gho_abcdefghijklmnop");
+    fs.rmSync(worktree, { recursive: true, force: true });
+  });
+
+  test("host-process execution cannot claim network isolation", async () => {
+    const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "tb-harness-process-network-"));
+    await expect(runExternalHarness({
+      harness: { id: "codex", command: "codex", args: [], protocol: "stdio-json", env: {}, timeoutSeconds: 30 },
+      worktree,
+      repository: "acme/payments",
+      workOrderId: "wo_process_network",
+      prompt: "Implement the approved change.",
+      networkIsolation: false,
+      exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+    })).rejects.toThrow(/cannot enforce network=none/);
+    fs.rmSync(worktree, { recursive: true, force: true });
+  });
+
+  test("self-hosted worker verifies dispatch, runs the configured harness, and posts only a signed completion", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tb-self-hosted-worker-"));
+    const secret = "self-hosted-worker-secret";
+    const dispatch = createSelfHostedDispatch({
+      dispatchId: "selfhost:wo_worker:run_worker",
+      executionBoundary: "self_hosted",
+      organizationId: "org_1",
+      factoryId: "fac_1",
+      workOrderId: "wo_worker",
+      runId: "run_worker",
+      repository: "acme/payments",
+      sourceType: "manual",
+      sourceId: "src_worker",
+      definitionDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      harness: "codex",
+      prompt: "Implement the approved change.",
+      secret,
+    });
+    const posted: unknown[] = [];
+    const result = await runSelfHostedDispatch({
+      dispatch,
+      secret,
+      repositoryRoot: root,
+      harnesses: { codex: { id: "codex", command: "codex", args: [], protocol: "stdio-json", network: "egress", env: {}, timeoutSeconds: 30 } },
+      definitionDigest: dispatch.definitionDigest,
+      sandbox: {
+        kind: "process",
+        start: async () => ({ worktree: root, branch: "tinkerbot/wo_worker", cleanup: async () => undefined }),
+        exec: async (_worktree, argv) => argv[0] === "git" ? { stdout: "abcdef1234567\n", stderr: "", exitCode: 0 } : { stdout: "harness complete", stderr: "", exitCode: 0 },
+      },
+      completionUrl: "https://control.example/self-hosted/complete",
+      fetchImpl: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        posted.push(JSON.parse(String(init?.body ?? "{}")));
+        return new Response("ok", { status: 200 });
+      }) as typeof fetch,
+    });
+    expect(result).toMatchObject({ accepted: true, status: "completed", dispatchId: dispatch.dispatchId });
+    expect(posted[0]).toMatchObject({ status: "completed", branch: "tinkerbot/wo_worker", headSha: "abcdef1234567", integrity: { signed: true } });
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test("self-hosted worker refuses stale local definitions and non-isolated sandboxes", async () => {
+    const dispatch = createSelfHostedDispatch({
+      dispatchId: "selfhost:wo_digest:run_digest",
+      executionBoundary: "self_hosted",
+      organizationId: "org_1",
+      factoryId: "fac_1",
+      workOrderId: "wo_digest",
+      runId: "run_digest",
+      repository: "acme/payments",
+      sourceType: "manual",
+      sourceId: "src_digest",
+      definitionDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      harness: "codex",
+      prompt: "Implement the approved change.",
+      secret: "self-hosted-worker-secret",
+    });
+    const result = await runSelfHostedDispatch({
+      dispatch,
+      secret: "self-hosted-worker-secret",
+      repositoryRoot: process.cwd(),
+      harnesses: { codex: { id: "codex", command: "codex", args: [], protocol: "stdio-json", network: "egress", env: {}, timeoutSeconds: 30 } },
+      definitionDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      sandbox: { kind: "stub", start: async () => { throw new Error("must not start"); }, exec: async () => ({ stdout: "", stderr: "", exitCode: 1 }) },
+      completionUrl: "https://control.example/self-hosted/complete",
+      fetchImpl: (async () => new Response("ok", { status: 200 })) as typeof fetch,
+    });
+    expect(result).toMatchObject({ accepted: false, status: "failed", reason: "definition_digest_mismatch" });
+  });
+
+  test("self-hosted worker does not fail a run when the dispatch belongs to another worker", async () => {
+    const dispatch = createSelfHostedDispatch({
+      dispatchId: "selfhost:wo_route:run_route",
+      executionBoundary: "self_hosted",
+      organizationId: "org_1",
+      factoryId: "fac_1",
+      workOrderId: "wo_route",
+      runId: "run_route",
+      repository: "acme/payments",
+      sourceType: "manual",
+      sourceId: "src_route",
+      definitionDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      harness: "codex",
+      prompt: "Implement the approved change.",
+      secret: "self-hosted-worker-secret",
+    });
+    let posted = false;
+    const result = await runSelfHostedDispatch({
+      dispatch,
+      secret: "self-hosted-worker-secret",
+      repositoryRoot: process.cwd(),
+      workerHost: "self_hosted:runner-2",
+      harnesses: { codex: { id: "codex", command: "codex", args: [], protocol: "stdio-json", workerHost: "self_hosted:runner-1", env: {}, timeoutSeconds: 30 } },
+      definitionDigest: dispatch.definitionDigest,
+      sandbox: { kind: "docker", start: async () => { throw new Error("must not start"); }, exec: async () => ({ stdout: "", stderr: "", exitCode: 1 }) },
+      completionUrl: "https://control.example/self-hosted/complete",
+      fetchImpl: (async () => { posted = true; return new Response("ok", { status: 200 }); }) as typeof fetch,
+    });
+    expect(result).toMatchObject({ accepted: false, status: "failed", reason: "harness_not_configured" });
+    expect(posted).toBe(false);
+  });
+
+  test("process runner does not follow repository symlinks into the host", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tb-symlink-root-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "tb-symlink-secret-"));
+    fs.writeFileSync(path.join(outside, "secret.txt"), "do-not-copy");
+    fs.symlinkSync(outside, path.join(root, "linked-outside"));
+    const lease = await processSandboxPort(true).start({ repositoryRoot: root, workOrderId: "wo_symlink", image: "" });
+    expect(fs.existsSync(path.join(lease.worktree, "linked-outside"))).toBe(false);
+    await lease.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  });
+
+  test("Docker sandbox passes only explicit harness env names into the container", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tb-docker-env-root-"));
+    fs.writeFileSync(path.join(root, "README.md"), "safe");
+    const calls: Array<{ command: string; args: string[]; options?: Record<string, unknown> }> = [];
+    const fakeExec = ((command: string, args: string[], options?: Record<string, unknown>) => {
+      calls.push({ command, args, options });
+      return { status: 0, stdout: "", stderr: "" };
+    }) as unknown as typeof import("node:child_process").spawnSync;
+    const sandbox = dockerSandboxPort(fakeExec);
+    const lease = await sandbox.start({ repositoryRoot: root, workOrderId: "wo_env" });
+    await sandbox.exec(lease.worktree, ["codex"], { env: { OPENAI_API_KEY: "sk-test-secret" } });
+    const run = calls.find((call) => call.command === "docker" && call.args[0] === "run");
+    expect(run?.args).toContain("--env");
+    expect(run?.args).toContain("OPENAI_API_KEY");
+    expect(run?.args).not.toContain("sk-test-secret");
+    expect((run?.options?.env as Record<string, string>).OPENAI_API_KEY).toBe("sk-test-secret");
+    await lease.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
   });
 
   test("outbox replay posts local payloads without secrets", async () => {

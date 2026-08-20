@@ -23,8 +23,8 @@ import {
 import { admitWebhook, githubEventKind, githubInstallationAccount, inlineReviewComments, mintInstallationToken, publishCheckRun, publishInlineComments, mapCheckAnnotations } from "../../../packages/github/src";
 import { admitGitlabWebhook } from "../../../packages/gitlab/src";
 import { D1FactoryStore } from "./factory-store";
-import { ForemanDurableObject, Sandbox, handleFactoryMcpRequest, intakeFromIntegration, runFactoryTurn, classifyWorkOrderGroup, githubSecurityIntake, sweepFactoryOs } from "./factory-runtime";
-import { calculateFactoryEconomics, createWorkOrder, projectFactoryEvents, verifyOidcJwt, oidcReplayKey, containsRawCredentials, customerProviderLabel, dispatchTinkerGateway, githubTinkerMention, sameActorApprovalBlocked } from "../../../packages/factory/src";
+import { ForemanDurableObject, Sandbox, handleFactoryMcpRequest, intakeFromIntegration, runFactoryTurn, routeFactoryQueueMessage, classifyWorkOrderGroup, githubSecurityIntake, sweepFactoryOs } from "./factory-runtime";
+import { assertCredentialRef, calculateFactoryEconomics, createWorkOrder, projectFactoryEvents, verifyOidcJwt, oidcReplayKey, containsRawCredentials, customerProviderLabel, dispatchTinkerGateway, githubTinkerMention, sameActorApprovalBlocked, selfHostedSecretReady, verifySelfHostedCompletion, canonicalize, implementBranchName } from "../../../packages/factory/src";
 import { translateLegacyVerdict } from "../../../packages/core/src/verdict";
 import { createChangeSet, assessChangeSet, assessReleaseSafety, createReleaseManifest } from "../../../packages/assurance/src";
 import { calculateEntitlements, type EntitlementKey } from "../../../packages/control-plane/src";
@@ -58,6 +58,12 @@ interface Env extends Record<string, unknown> {
   STRIPE_PLANS_JSON?: string;
   GITHUB_WEBHOOK_SECRET?: string;
   GITLAB_WEBHOOK_SECRET?: string;
+  SLACK_WEBHOOK_SECRET?: string;
+  LINEAR_WEBHOOK_SECRET?: string;
+  JIRA_WEBHOOK_SECRET?: string;
+  INCIDENT_WEBHOOK_SECRET?: string;
+  SUPPORT_WEBHOOK_SECRET?: string;
+  INTEGRATION_ORGANIZATION_ID?: string;
   EVIDENCE_EXPORT_ENDPOINT?: string;
   EVIDENCE_EXPORT_TOKEN?: string;
   GITHUB_APP_ID?: string;
@@ -71,6 +77,8 @@ interface Env extends Record<string, unknown> {
   AI?: { run(model: string, input: { messages: Array<{ role: string; content: string }> }, options?: { gateway?: { id: string; collectLog?: boolean; metadata?: Record<string, string> } }): Promise<{ response?: string }> };
   FACTORY_EVENTS?: { send(body: unknown): Promise<void> };
   SELF_HOSTED_WORK?: { send(body: unknown): Promise<void> };
+  SELF_HOSTED_WORK_ENDPOINT?: string;
+  SELF_HOSTED_WORK_SECRET?: string;
   ASSETS?: { fetch(request: Request): Promise<Response> };
   FOREMAN?: { idFromName(name: string): unknown; get(id: unknown): { fetch(input: Request): Promise<Response> } };
   FACTORY_RUN?: { create(options: { id: string; params: unknown }): Promise<unknown> };
@@ -133,7 +141,8 @@ function publicSession(session: HostedSession): Record<string, unknown> {
 }
 
 function sessionStore(env: Env, config: Awaited<ReturnType<typeof hostedProviderConfig>>): D1AuthSessionStore | null {
-  return env.DB && config.sessionEncryptionKey ? new D1AuthSessionStore(env.DB, config.sessionEncryptionKey) : null;
+  const keyReady = Boolean(config.sessionEncryptionKey) && (config.environment !== "production" || selfHostedSecretReady(config.sessionEncryptionKey));
+  return env.DB && keyReady ? new D1AuthSessionStore(env.DB, config.sessionEncryptionKey!) : null;
 }
 
 async function currentSession(request: Request, store: D1AuthSessionStore, env?: Env): Promise<{ id: string; session: HostedSession } | null> {
@@ -178,11 +187,11 @@ interface AuthorizationFailure {
 
 const INVITATION_ROLES: TenantRole[] = ["maintainer", "reviewer", "viewer"];
 
-type TenantCapability = "tenant:read" | "factory:write" | "work:operate" | "ops:read" | "billing:read" | "billing:manage" | "invitations:read" | "invitations:create" | "assurance:read" | "assurance:write" | "assurance:delete";
+type TenantCapability = "tenant:read" | "tenant:admin" | "factory:write" | "work:operate" | "ops:read" | "billing:read" | "billing:manage" | "invitations:read" | "invitations:create" | "assurance:read" | "assurance:write" | "assurance:delete";
 
 const ROLE_CAPABILITIES: Record<TenantRole, readonly TenantCapability[]> = {
-  owner: ["tenant:read", "factory:write", "work:operate", "ops:read", "billing:read", "billing:manage", "invitations:read", "invitations:create", "assurance:read", "assurance:write", "assurance:delete"],
-  admin: ["tenant:read", "factory:write", "work:operate", "ops:read", "billing:read", "billing:manage", "invitations:read", "invitations:create", "assurance:read", "assurance:write", "assurance:delete"],
+  owner: ["tenant:read", "tenant:admin", "factory:write", "work:operate", "ops:read", "billing:read", "billing:manage", "invitations:read", "invitations:create", "assurance:read", "assurance:write", "assurance:delete"],
+  admin: ["tenant:read", "tenant:admin", "factory:write", "work:operate", "ops:read", "billing:read", "billing:manage", "invitations:read", "invitations:create", "assurance:read", "assurance:write", "assurance:delete"],
   billing_administrator: ["tenant:read", "billing:read", "billing:manage"],
   maintainer: ["tenant:read", "factory:write", "work:operate", "assurance:read", "assurance:write"],
   reviewer: ["tenant:read", "assurance:read"],
@@ -318,6 +327,27 @@ function validateHostedAssuranceBundle(value: unknown): { ok: true; value: Recor
   return { ok: true, value: bundle };
 }
 
+/**
+ * The action bundle is untrusted input even after OIDC admission. Verify the
+ * receipt's content hash and bind it to the repository/commit carried by the
+ * short-lived run token before it can advance a hosted run. This mirrors the
+ * provider-neutral receipt digest without importing the Node-only assurance
+ * package into the Worker bundle.
+ */
+async function verifyHostedReceipt(value: unknown, expected: { repository: string; sha?: string }): Promise<{ ok: true; receipt: Record<string, unknown> } | { ok: false; error: string }> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { ok: false, error: "Assurance receipt must be an object." };
+  const receipt = value as Record<string, unknown>;
+  if (receipt.schemaVersion !== 1 || receipt.schemaId !== "https://tinkerbot.dev/schemas/assurance/v1" || receipt.kind !== "verification-receipt") return { ok: false, error: "Assurance receipt schema is unsupported." };
+  const integrity = receipt.integrity && typeof receipt.integrity === "object" && !Array.isArray(receipt.integrity) ? receipt.integrity as Record<string, unknown> : undefined;
+  if (!integrity || integrity.algorithm !== "sha256" || typeof integrity.digest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(integrity.digest)) return { ok: false, error: "Assurance receipt integrity is invalid." };
+  const { integrity: _ignored, ...payload } = receipt;
+  const digest = `sha256:${hexDigest(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(canonicalize(payload)))))}`;
+  if (!constantTimeTextEqual(integrity.digest, digest)) return { ok: false, error: "Assurance receipt integrity does not match its payload." };
+  if (typeof receipt.repository !== "string" || receipt.repository.toLowerCase() !== expected.repository.toLowerCase()) return { ok: false, error: "Assurance receipt repository does not match the run token." };
+  if (expected.sha && receipt.headSha !== expected.sha) return { ok: false, error: "Assurance receipt commit does not match the run token." };
+  return { ok: true, receipt };
+}
+
 function assuranceMetadataKey(organizationId: string, repository: string): string {
   return `assurance:${encodeURIComponent(organizationId)}:${encodeURIComponent(repository)}`;
 }
@@ -387,6 +417,63 @@ function originAllowed(request: Request, env: Env): boolean {
   const origin = request.headers.get("origin");
   if (!origin) return true;
   try { return origin === new URL(applicationUrl(request, env, "/")).origin; } catch { return false; }
+}
+
+function hexDigest(bytes: ArrayBuffer): string {
+  return [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Text(value: string): Promise<string> {
+  return hexDigest(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
+}
+
+function constantTimeTextEqual(left: string, right: string): boolean {
+  const a = new TextEncoder().encode(left);
+  const b = new TextEncoder().encode(right);
+  if (a.byteLength !== b.byteLength) return false;
+  let difference = 0;
+  for (let index = 0; index < a.length; index += 1) difference |= a[index]! ^ b[index]!;
+  return difference === 0;
+}
+
+/** Verify provider webhook signatures before parsing or dispatching untrusted intake. */
+async function verifyIntegrationWebhook(request: Request, payload: string, kind: "slack" | "linear" | "jira" | "incident" | "support", secret: string): Promise<boolean> {
+  if (!secret || new TextEncoder().encode(secret).byteLength < 16) return false;
+  const signatureHeader = kind === "slack" ? request.headers.get("x-slack-signature") : kind === "linear" ? request.headers.get("linear-signature") : request.headers.get("x-webhook-signature") ?? request.headers.get("x-hub-signature-256");
+  if (!signatureHeader) return false;
+  let signedPayload = payload;
+  let expectedPrefix = "";
+  if (kind === "slack") {
+    const timestamp = Number(request.headers.get("x-slack-request-timestamp"));
+    if (!Number.isSafeInteger(timestamp) || Math.abs(Math.floor(Date.now() / 1000) - timestamp) > 300) return false;
+    signedPayload = `v0:${timestamp}:${payload}`;
+    expectedPrefix = "v0=";
+  }
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const expected = `${expectedPrefix}${hexDigest(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(signedPayload)))}`;
+  const candidate = signatureHeader.trim().split(",")[0]?.trim().replace(/^sha256=/i, "") ?? "";
+  return constantTimeTextEqual(candidate, expected.replace(/^v0=/, "")) || constantTimeTextEqual(signatureHeader.trim(), expected);
+}
+
+/**
+ * Notification destinations are eventually fetched by a server-side delivery
+ * worker. Keep this control-plane write constrained to the two providers the
+ * product actually supports; accepting arbitrary HTTPS URLs would turn a
+ * future retry/delivery path into a tenant-controlled SSRF primitive.
+ */
+function notificationWebhookUrl(value: unknown, kind: "slack" | "teams"): string | undefined {
+  if (typeof value !== "string" || value.length === 0 || value.length > 2_048) return undefined;
+  try {
+    const parsed = new URL(value);
+    const hostname = parsed.hostname.toLowerCase();
+    const slackHost = hostname === "hooks.slack.com" || hostname === "hooks.slack-gov.com";
+    const teamsHost = hostname === "outlook.office.com" || hostname.endsWith(".webhook.office.com") || hostname.endsWith(".logic.azure.com");
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.hash || parsed.port || (kind === "slack" ? !slackHost : !teamsHost)) return undefined;
+    if (parsed.pathname === "/" || /[\u0000-\u001f\u007f]/.test(parsed.pathname) || parsed.pathname.length > 1_500) return undefined;
+    return parsed.toString();
+  } catch {
+    return undefined;
+  }
 }
 
 function base64Url(bytes: ArrayBuffer): string {
@@ -599,8 +686,8 @@ function safeRedirectUri(request: Request, env: Env): string {
   return new URL("/auth/workos/callback", request.url).toString();
 }
 
-export async function handleFactoryQueueMessage(env: Env, message: { deliveryId: string; installationId?: number; repository?: string; sourceType: "github_issue" | "github_pull_request" | "manual" | "mcp" | "slack" | "linear" | "jira" | "github_dependabot" | "github_code_scanning" | "github_secret_scanning" | "incident" | "support" | "roadmap" | "scheduled" | "gitlab_issue" | "gitlab_merge_request"; sourceId: string; issueOrPullRequest?: string; sha?: string; actor: string; organizationId?: string; factoryId?: string; workOrderId?: string; specApproved?: boolean; sandboxComplete?: boolean; verificationVerdict?: string; verificationIngested?: boolean }): Promise<void> {
-  await runFactoryTurn(env, message);
+export async function handleFactoryQueueMessage(env: Env, message: { deliveryId: string; installationId?: number; repository?: string; sourceType: "github_issue" | "github_pull_request" | "manual" | "mcp" | "slack" | "linear" | "jira" | "github_dependabot" | "github_code_scanning" | "github_secret_scanning" | "incident" | "support" | "roadmap" | "scheduled" | "gitlab_issue" | "gitlab_merge_request"; sourceId: string; issueOrPullRequest?: string; sha?: string; actor: string; organizationId?: string; factoryId?: string; workOrderId?: string; specApproved?: boolean; sandboxComplete?: boolean; pullRequestSha?: string; verificationVerdict?: string; verificationIngested?: boolean }): Promise<Awaited<ReturnType<typeof runFactoryTurn>>> {
+  return routeFactoryQueueMessage(env, message);
 }
 
 export class FactoryRunWorkflow {
@@ -630,11 +717,60 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     const calculated = await entitlementsForOrganization(env.DB, installation.organization_id);
     const denied = entitlementDenied(calculated, "verification", true);
     if (denied) return json({ ...denied, checkRun: "unknown" }, 403);
-    const runId = typeof body?.runId === "string" ? body.runId : crypto.randomUUID();
+    const requestedRunId = typeof body?.runId === "string" && /^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$/.test(body.runId) ? body.runId : undefined;
+    let runId: string = crypto.randomUUID();
+    if (requestedRunId) {
+      const candidateRun = await factories.getRun(requestedRunId);
+      const candidateOrder = candidateRun?.work_order_id ? await factories.getWorkOrder(candidateRun.work_order_id) : null;
+      if (!candidateRun || !candidateOrder || candidateOrder.organizationId !== installation.organization_id || candidateOrder.repositoryId.toLowerCase() !== repository.toLowerCase()) return json({ error: "The requested run is not scoped to this repository and installation.", code: "run_scope_mismatch" }, 403);
+      if (candidateRun.status !== "running" && !candidateRun.status.startsWith("waiting:")) return json({ error: "The requested run is no longer active.", code: "run_not_active" }, 409);
+      runId = requestedRunId;
+    }
     const runToken = crypto.randomUUID().replace(/-/g, "");
     const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
     await factories.putRunToken(runToken, runId, repository, sha, expiresAt, new Date().toISOString());
     return json({ runToken, runId, expiresAt, repository });
+  }
+  if (url.pathname === "/self-hosted/complete" && request.method === "POST") {
+    const secret = env.SELF_HOSTED_WORK_SECRET ?? (env.ENVIRONMENT === "production" ? undefined : env.SESSION_ENCRYPTION_KEY);
+    if (!secret || (env.ENVIRONMENT === "production" && !selfHostedSecretReady(secret))) return json({ error: "Self-hosted completion is not configured.", code: "self_hosted_not_configured" }, 503);
+    const body = await jsonBody(request);
+    const checked = verifySelfHostedCompletion(body, secret);
+    if (!checked.ok) return json({ error: "Self-hosted completion was rejected.", code: checked.reason }, 401);
+    const completion = checked.payload;
+    if (completion.dispatchId !== `selfhost:${completion.workOrderId}:${completion.runId}`) return json({ error: "Dispatch identity does not match the work order and run.", code: "dispatch_mismatch" }, 403);
+    const order = await factories.getWorkOrder(completion.workOrderId);
+    if (!order || order.organizationId !== completion.organizationId || order.factoryId !== completion.factoryId || order.repositoryId.toLowerCase() !== completion.repository.toLowerCase()) return json({ error: "Self-hosted completion does not match the persisted work order.", code: "completion_scope_mismatch" }, 403);
+    const run = await factories.getRun(completion.runId);
+    if (!run || run.work_order_id !== order.workOrderId || run.factory_id !== order.factoryId) return json({ error: "Self-hosted completion references an unknown run.", code: "run_not_found" }, 404);
+    if (run.definition_digest !== completion.definitionDigest) return json({ error: "Self-hosted completion was produced from a different factory definition.", code: "definition_digest_mismatch" }, 409);
+    // The local worker's leased cell has one deterministic branch per work
+    // order. A signed customer worker is still untrusted, so do not accept a
+    // valid-looking tinkerbot/* ref that belongs to another work order.
+    if (completion.branch && completion.branch !== implementBranchName(order.workOrderId)) return json({ error: "Self-hosted completion reported the wrong work-order branch.", code: "branch_scope_mismatch" }, 409);
+    // An event is the durable idempotency claim. If a prior request claimed
+    // the dispatch but crashed before advancing the run, retry the resume while
+    // the run is still live; only terminal/non-waiting runs are pure replays.
+    const priorEvents = await factories.listFactoryEvents(order.workOrderId, order.organizationId);
+    const priorCompletionEvent = priorEvents.find((event) => ["task.completed", "task.blocked"].includes(event.type) && (event.payload as Record<string, unknown>).dispatchId === completion.dispatchId);
+    if (priorCompletionEvent && ((completion.status === "completed") !== (priorCompletionEvent.type === "task.completed"))) return json({ error: "Self-hosted completion conflicts with an earlier terminal report.", code: "completion_status_conflict" }, 409);
+    const priorCompletion = Boolean(priorCompletionEvent);
+    if (priorCompletion && run.status !== "running" && run.status !== "waiting:self_hosted_harness") return json({ accepted: true, replayed: true, workOrderId: order.workOrderId, runId: completion.runId });
+    if (run.status !== "running" && run.status !== "waiting:self_hosted_harness") return json({ error: "Self-hosted completion references a run that is no longer awaiting implementation.", code: "run_not_waiting" }, 409);
+    if (!["implementation", "review", "verification", "unknown"].includes(order.status)) return json({ error: "Self-hosted completion arrived outside the implementation boundary.", code: "invalid_work_order_state" }, 409);
+    const now = new Date().toISOString();
+    if (completion.status === "failed") {
+      const claimed = priorCompletion || await factories.appendFactoryEventOnce({ eventId: `selfhost-failed:${completion.dispatchId}`, type: "task.blocked", aggregateId: order.workOrderId, aggregateType: "work_order", organizationId: order.organizationId, factoryId: order.factoryId, actorId: "self-hosted-worker", actorType: "agent", occurredAt: now, correlationId: completion.runId, policyVersion: order.policyVersion, schemaVersion: 1, provenance: "ATTESTED", payload: { dispatchId: completion.dispatchId, reason: completion.summary ?? "Self-hosted worker reported failure." } });
+      if (!claimed) return json({ accepted: true, replayed: true, workOrderId: order.workOrderId, runId: completion.runId });
+      const failed = await factories.applyTransition(order.workOrderId, "failed", `self-hosted-complete:${completion.dispatchId}`, "self-hosted-worker");
+      if (!failed.ok && failed.code !== "idempotent") return json({ error: "The failed completion could not advance the work order.", code: failed.code }, 409);
+      await factories.updateRun(completion.runId, "failed", now);
+      return json({ accepted: true, terminal: "failed", workOrderId: order.workOrderId, runId: completion.runId });
+    }
+    const claimed = priorCompletion || await factories.appendFactoryEventOnce({ eventId: `selfhost-completed:${completion.dispatchId}`, type: "task.completed", aggregateId: order.workOrderId, aggregateType: "work_order", organizationId: order.organizationId, factoryId: order.factoryId, actorId: "self-hosted-worker", actorType: "agent", occurredAt: now, correlationId: completion.runId, policyVersion: order.policyVersion, schemaVersion: 1, provenance: "ATTESTED", payload: { dispatchId: completion.dispatchId, branch: completion.branch, headSha: completion.headSha, pullRequestNumber: completion.pullRequestNumber, summary: completion.summary } });
+    if (!claimed) return json({ accepted: true, replayed: true, workOrderId: order.workOrderId, runId: completion.runId });
+    const resumed = await handleFactoryQueueMessage(env, { deliveryId: `self-hosted-complete:${completion.dispatchId}`, organizationId: order.organizationId, factoryId: order.factoryId, repository: completion.repository, sourceType: order.sourceType, sourceId: order.sourceId, workOrderId: order.workOrderId, actor: "self-hosted-worker", sandboxComplete: true, pullRequestSha: completion.headSha, specApproved: true });
+    return json({ accepted: true, workOrderId: resumed?.workOrderId ?? order.workOrderId, runId: resumed?.runId ?? completion.runId, terminal: resumed?.terminal ?? "unknown", wait: resumed?.wait });
   }
   const store = sessionStore(env, config);
   if (!store) return undefined;
@@ -681,8 +817,12 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     const body = await jsonBody(request) ?? {};
     if (containsRawCredentials(body)) return json({ error: "Secrets must not appear in synced local payloads.", code: "secret_rejected" }, 400);
     const kind = typeof body.kind === "string" ? body.kind : "factory-run";
-    const ingested = await factories.ingestLocalRuntimePayload({ organizationId: access.membership.organizationId, kind, payload: body, now: new Date().toISOString() });
-    return json({ ...ingested, origin: "local", identity: "hosted-session" });
+    try {
+      const ingested = await factories.ingestLocalRuntimePayload({ organizationId: access.membership.organizationId, kind, payload: body, now: new Date().toISOString() });
+      return json({ ...ingested, origin: "local", identity: "hosted-session" });
+    } catch {
+      return json({ error: "The local runtime payload is not scoped to this organization or is invalid.", code: "invalid_runtime_payload" }, 400);
+    }
   }
   if (workGraphMatch && request.method === "GET") {
     const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
@@ -748,14 +888,27 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
       if (!view) return json({ error: "Factory not found.", code: "not_found" }, 404);
       return json(view);
     }
+    if (factoryMatch[1] && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(factoryMatch[1])) return json({ error: "Factory identifier is malformed.", code: "invalid_request" }, 400);
+    if (factoryMatch[1]) {
+      const existing = await factories.getFactory(factoryMatch[1]);
+      // Do not let an organization overwrite another tenant's definition by
+      // guessing a factory UUID. The store repeats this check so non-HTTP
+      // callers cannot bypass the boundary either.
+      if (existing && existing.organizationId !== access.membership.organizationId) return json({ error: "Factory not found.", code: "not_found" }, 404);
+    }
     const body = await jsonBody(request);
     const name = typeof body?.name === "string" ? body.name.trim() : "";
     const yaml = typeof body?.yaml === "string" ? body.yaml : undefined;
     const files = Array.isArray(body?.files) ? body.files.filter((item): item is { path: string; contents: string } => Boolean(item && typeof item === "object" && typeof (item as { path?: unknown }).path === "string" && typeof (item as { contents?: unknown }).contents === "string")) : undefined;
     if (!name && request.method === "POST") return json({ error: "Factory name is required.", code: "invalid_request" }, 400);
     const factoryId = factoryMatch[1] ?? crypto.randomUUID();
-    const saved = await factories.putFactory({ factoryId, organizationId: access.membership.organizationId, name: name || factoryId, yaml, files });
-    return json({ factory: saved }, request.method === "POST" ? 201 : 200);
+    if (name && !/^[A-Za-z0-9][A-Za-z0-9 ._:-]{0,199}$/.test(name)) return json({ error: "Factory name is invalid.", code: "invalid_request" }, 400);
+    try {
+      const saved = await factories.putFactory({ factoryId, organizationId: access.membership.organizationId, name: name || factoryId, yaml, files });
+      return json({ factory: saved }, request.method === "POST" ? 201 : 200);
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : "Invalid factory definition.", code: "invalid_request" }, 400);
+    }
   }
   if (factoryResourceMatch && request.method === "GET") {
     const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
@@ -819,10 +972,15 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
     const body = await jsonBody(request) ?? {};
     const name = typeof body.name === "string" ? body.name.trim() : "";
-    const value = typeof body.value === "string" ? body.value : "";
-    if (!name || !value) return json({ error: "Secret name and value are required.", code: "invalid_request" }, 400);
-    const secret = await factories.createSecretMetadata({ organizationId: access.membership.organizationId, name, owner: access.membership.organizationId, now: new Date().toISOString() });
-    return json({ secret, valueAccepted: true, storage: "metadata_only_external_provider_required" }, 201);
+    // Hosted Workers deliberately never receive or persist customer secret
+    // values. They record only the reference that a local/self-hosted worker
+    // resolves from its own environment or keychain.
+    if (Object.prototype.hasOwnProperty.call(body, "value")) return json({ error: "Raw secret values are not accepted by the hosted control plane; provide secretRef instead.", code: "secret_rejected" }, 400);
+    const reference = typeof body.secretRef === "string" ? body.secretRef.trim() : "";
+    if (!name || !reference) return json({ error: "Secret name and secretRef are required.", code: "invalid_request" }, 400);
+    try { assertCredentialRef(reference, "secretRef"); } catch { return json({ error: "secretRef must be env:VAR or keychain://…; raw secrets are forbidden.", code: "secret_rejected" }, 400); }
+    const secret = await factories.createSecretMetadata({ organizationId: access.membership.organizationId, name, reference, owner: access.membership.organizationId, now: new Date().toISOString() });
+    return json({ secret, valueAccepted: false, referenceStored: true, storage: "reference_only" }, 201);
   }
   if (workMatch) {
     const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), request.method === "GET" ? "tenant:read" : "work:operate");
@@ -920,11 +1078,12 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     const run = await factories.getRunForOrganization(runMatch[1], access.membership.organizationId);
     if (!run) return json({ error: "Run not found.", code: "not_found" }, 404);
     const stages = await factories.listRunStages(runMatch[1]);
-    return json({ run, stages, events: stages });
+    const events = await factories.listFactoryEvents(run.work_order_id, access.membership.organizationId);
+    return json({ run, stages, events });
   }
   const osList = url.pathname.match(/^\/(products|cells|skills|evolution|releases|outcomes)(?:\/([^/]+))?(?:\/(approve))?$/);
   if (osList) {
-    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), osList[1] === "evolution" && osList[3] === "approve" ? "factory:write" : "tenant:read");
     if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
     const listed = await factories.listFactories(access.membership.organizationId);
     const factoryId = listed[0]?.factoryId;
@@ -947,7 +1106,7 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
       const calculated = await calculatedAccess(env, access);
       const denied = entitledFailureFrom(calculated, "factory_improvement", true);
       if (denied) return denied;
-      const result = await factories.approveProposal(osList[2], access.current.session.user.id, new Date().toISOString());
+      const result = await factories.approveProposal(osList[2], access.current.session.user.id, new Date().toISOString(), access.membership.organizationId);
       if (!result.ok) return json({ error: "Improvement activation was rejected.", code: result.reason }, 409);
       return json({ approved: true, autoMerge: false });
     }
@@ -992,7 +1151,7 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     return json({ credentialId, token, tokenShownOnce: true });
   }
   if (url.pathname === "/change-sets" && (request.method === "GET" || request.method === "POST")) {
-    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), request.method === "POST" ? "work:operate" : "tenant:read");
     if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
     const calculated = await calculatedAccess(env, access);
     const denied = entitledFailureFrom(calculated, "change_sets", request.method !== "GET");
@@ -1004,13 +1163,19 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     }
     if (!originAllowed(request, env)) return json({ error: "Cross-origin change-set mutation rejected.", code: "csrf_origin_rejected" }, 403);
     const body = await jsonBody(request);
+    if (!body) return json({ error: "A JSON change-set body is required.", code: "invalid_request" }, 400);
     try {
       const name = typeof body?.name === "string" ? body.name : "change-set";
       const repositories = Array.isArray(body?.repositories) ? body.repositories as Parameters<typeof createChangeSet>[0]["repositories"] : [];
       const changeSet = createChangeSet({ name, repositories, now: new Date().toISOString() });
       const assessment = assessChangeSet(changeSet);
+      const workOrderId = typeof body?.workOrderId === "string" ? body.workOrderId : undefined;
+      if (workOrderId) {
+        const linkedOrder = await factories.getWorkOrderForOrganization(workOrderId, access.membership.organizationId);
+        if (!linkedOrder) return json({ error: "Work order not found.", code: "not_found" }, 404);
+      }
       const changeSetId = crypto.randomUUID();
-      await env.DB.prepare("INSERT INTO tinkerbot_change_sets (change_set_id, work_order_id, payload_json, updated_at) VALUES (?1, ?2, ?3, ?4)").bind(changeSetId, typeof body?.workOrderId === "string" ? body.workOrderId : "unassigned", JSON.stringify({ changeSet, assessment }), new Date().toISOString()).run();
+      await env.DB.prepare("INSERT INTO tinkerbot_change_sets (change_set_id, work_order_id, payload_json, updated_at) VALUES (?1, ?2, ?3, ?4)").bind(changeSetId, workOrderId ?? "unassigned", JSON.stringify({ changeSet, assessment }), new Date().toISOString()).run();
       return json({ changeSetId, changeSet, assessment }, 201);
     } catch {
       return json({ error: "Invalid change set payload.", code: "invalid_request" }, 400);
@@ -1018,12 +1183,13 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
   }
   if (url.pathname === "/release-assessments" && request.method === "POST") {
     if (!originAllowed(request, env)) return json({ error: "Cross-origin release assessment rejected.", code: "csrf_origin_rejected" }, 403);
-    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "work:operate");
     if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
     const calculated = await calculatedAccess(env, access);
     const denied = entitledFailureFrom(calculated, "release_assessments", true);
     if (denied) return denied;
     const body = await jsonBody(request);
+    if (!body) return json({ error: "A JSON release-assessment body is required.", code: "invalid_request" }, 400);
     try {
       const manifest = body?.manifest && typeof body.manifest === "object"
         ? body.manifest as Parameters<typeof assessReleaseSafety>[0]["manifest"]
@@ -1044,7 +1210,7 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     return json({ events: rows, retentionDays: calculated.values });
   }
   if (url.pathname === "/notifications" && (request.method === "GET" || request.method === "POST")) {
-    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), request.method === "POST" ? "factory:write" : "tenant:read");
     if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
     const calculated = await calculatedAccess(env, access);
     const denied = entitledFailureFrom(calculated, "external_notifications", request.method !== "GET");
@@ -1056,13 +1222,13 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     const body = await jsonBody(request);
     const kind = body?.kind === "teams" ? "teams" : "slack";
     if (!originAllowed(request, env)) return json({ error: "Cross-origin notification mutation rejected.", code: "csrf_origin_rejected" }, 403);
-    const webhookUrl = typeof body?.webhookUrl === "string" ? body.webhookUrl : "";
-    if (!/^https:\/\//.test(webhookUrl)) return json({ error: "A https webhook URL is required.", code: "invalid_request" }, 400);
+    const webhookUrl = notificationWebhookUrl(body?.webhookUrl, kind);
+    if (!webhookUrl) return json({ error: "A provider webhook URL is required (Slack or Microsoft Teams).", code: "invalid_request" }, 400);
     await env.DB.prepare("INSERT INTO tinkerbot_notification_destinations (destination_id, organization_id, kind, webhook_url, created_at) VALUES (?1, ?2, ?3, ?4, ?5)").bind(crypto.randomUUID(), access.membership.organizationId, kind, webhookUrl, new Date().toISOString()).run();
     return json({ saved: true, kind });
   }
   if (url.pathname === "/roles" && (request.method === "GET" || request.method === "POST")) {
-    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "tenant:read");
+    const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), request.method === "POST" ? "tenant:admin" : "tenant:read");
     if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
     const calculated = await calculatedAccess(env, access);
     const denied = entitledFailureFrom(calculated, "custom_roles", request.method !== "GET");
@@ -1095,7 +1261,8 @@ export default {
       const config = await hostedProviderConfig(env);
       if (url.pathname === "/health" && request.method === "GET") {
         const statuses = providerStatuses(config);
-        const degraded = !env.DB || statuses.some((item) => item.state !== "configured");
+        const sessionReady = Boolean(config.sessionEncryptionKey) && (config.environment !== "production" || selfHostedSecretReady(config.sessionEncryptionKey));
+        const degraded = !env.DB || !sessionReady || statuses.some((item) => item.state !== "configured");
         return json({ status: degraded ? "degraded" : "ok", service: "tinkerbot-control-plane" });
       }
       if (url.pathname === "/config/status" && request.method === "GET") {
@@ -1103,7 +1270,10 @@ export default {
         if (!store || !env.DB) return json({ error: "Operator status requires an authenticated session store.", code: "session_store_not_configured" }, 501);
         const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "ops:read");
         if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
-        return json({ service: "tinkerbot-control-plane", environment: config.environment, providers: providerStatuses(config), resources: { d1: Boolean(env.DB), r2: Boolean(env.EVIDENCE_BUCKET), evidenceExport: Boolean(env.EVIDENCE_EXPORT_ENDPOINT), stripePlanCount: config.stripe.plans.length, workosEventSync: env.WORKOS_EVENTS_SYNC_ENABLED === "true", aiGateway: env.AI_GATEWAY_ID ?? "tinkerbot-factory" }, localVerification: "independent" });
+        const sessionReady = Boolean(config.sessionEncryptionKey) && (config.environment !== "production" || selfHostedSecretReady(config.sessionEncryptionKey));
+        const selfHostedWork = Boolean(env.SELF_HOSTED_WORK || env.SELF_HOSTED_WORK_ENDPOINT);
+        const selfHostedWorkReady = !selfHostedWork || Boolean(env.SELF_HOSTED_WORK_SECRET ?? (config.environment === "production" ? undefined : config.sessionEncryptionKey)) && (config.environment !== "production" || selfHostedSecretReady(env.SELF_HOSTED_WORK_SECRET));
+        return json({ service: "tinkerbot-control-plane", environment: config.environment, providers: providerStatuses(config), resources: { d1: Boolean(env.DB), r2: Boolean(env.EVIDENCE_BUCKET), evidenceExport: Boolean(env.EVIDENCE_EXPORT_ENDPOINT), sessionEncryption: sessionReady, selfHostedWork, selfHostedWorkReady, stripePlanCount: config.stripe.plans.length, workosEventSync: env.WORKOS_EVENTS_SYNC_ENABLED === "true", aiGateway: env.AI_GATEWAY_ID ?? "tinkerbot-factory" }, localVerification: "independent" });
       }
       if (url.pathname === "/mcp" && request.method === "POST") {
         const store = sessionStore(env, config);
@@ -1117,7 +1287,8 @@ export default {
         if (!store || !env.DB) return json({ error: "The @tinker gateway requires a hosted session.", code: "session_store_not_configured" }, 501);
         const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "factory:write");
         if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
-        const body = await jsonBody(request) ?? {};
+        const body = await jsonBody(request);
+        if (!body) return json({ error: "A JSON command body is required.", code: "invalid_request" }, 400);
         const sourceSystem = body.sourceSystem === "github" || body.sourceSystem === "slack" || body.sourceSystem === "jira" || body.sourceSystem === "linear" || body.sourceSystem === "manual" ? body.sourceSystem : "manual";
         const result = dispatchTinkerGateway({
           text: typeof body.text === "string" ? body.text : "",
@@ -1132,13 +1303,37 @@ export default {
         return json({ ...result, projection: "WorkOrder traveler. Not a verification verdict." });
       }
       if ((url.pathname === "/integrations/slack/webhook" || url.pathname === "/integrations/linear/webhook" || url.pathname === "/integrations/jira/webhook" || url.pathname === "/integrations/incident/webhook" || url.pathname === "/integrations/support/webhook") && request.method === "POST") {
-        const body = await jsonBody(request) ?? {};
-        if (url.pathname.includes("slack") && body.type === "url_verification") return json({ challenge: body.challenge });
         const kind = url.pathname.includes("slack") ? "slack" : url.pathname.includes("linear") ? "linear" : url.pathname.includes("incident") ? "incident" : url.pathname.includes("support") ? "support" : "jira";
+        const secret = kind === "slack" ? env.SLACK_WEBHOOK_SECRET : kind === "linear" ? env.LINEAR_WEBHOOK_SECRET : kind === "jira" ? env.JIRA_WEBHOOK_SECRET : kind === "incident" ? env.INCIDENT_WEBHOOK_SECRET : env.SUPPORT_WEBHOOK_SECRET;
+        const integrationOrganization = typeof env.INTEGRATION_ORGANIZATION_ID === "string" && /^[A-Za-z0-9._:-]{1,200}$/.test(env.INTEGRATION_ORGANIZATION_ID) ? env.INTEGRATION_ORGANIZATION_ID : undefined;
+        if (env.ENVIRONMENT === "production" && (!secret || !integrationOrganization)) return json({ error: "Signed integration webhook and tenant binding are not configured.", code: "integration_not_configured" }, 503);
+        const payload = await boundedRequestText(request, 1_500_000);
+        if (secret && !await verifyIntegrationWebhook(request, payload, kind, secret)) return json({ error: "Integration webhook signature is invalid.", code: "invalid_integration_signature" }, 401);
+        let body: Record<string, unknown>;
+        try {
+          const parsed = JSON.parse(payload) as unknown;
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not_object");
+          body = parsed as Record<string, unknown>;
+        } catch {
+          return json({ error: "Integration webhook body must be a JSON object.", code: "invalid_request" }, 400);
+        }
+        if (url.pathname.includes("slack") && body.type === "url_verification") return json({ challenge: body.challenge });
         const message = intakeFromIntegration(kind, body);
-        if (env.FACTORY_EVENTS) await env.FACTORY_EVENTS.send(message);
-        else await handleFactoryQueueMessage(env, message);
-        return json({ received: true, sourceType: kind, deliveryId: message.deliveryId });
+        if (integrationOrganization) message.organizationId = integrationOrganization;
+        const suppliedDelivery = request.headers.get("x-request-id") ?? request.headers.get("x-event-id") ?? (typeof body.event_id === "string" ? body.event_id : typeof body.id === "string" ? body.id : message.deliveryId);
+        const deliveryId = `${kind}:${suppliedDelivery && /^[A-Za-z0-9:._-]{1,200}$/.test(suppliedDelivery) ? suppliedDelivery : `sha256:${hexDigest(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(payload)))}`}`;
+        const ledger = new D1WebhookLedger(env.DB!, `integration:${kind}`);
+        if (ledger.claim && !await ledger.claim(deliveryId)) return json({ received: true, duplicate: true, sourceType: kind, deliveryId });
+        try {
+          message.deliveryId = deliveryId;
+          if (env.FACTORY_EVENTS) await env.FACTORY_EVENTS.send(message);
+          else await handleFactoryQueueMessage(env, message);
+          await ledger.record(deliveryId);
+        } catch (error) {
+          if (ledger.release) await ledger.release(deliveryId);
+          throw error;
+        }
+        return json({ received: true, sourceType: kind, deliveryId });
       }
       if (url.pathname === "/auth/workos/start" && request.method === "GET") {
         if (env.DB && await new D1FactoryStore(env.DB).hitRateLimit(`auth:${request.headers.get("cf-connecting-ip") ?? "unknown"}`, 30, 60_000)) return json({ error: "Too many authentication attempts.", code: "rate_limited" }, 429);
@@ -1265,10 +1460,16 @@ export default {
         const repository = assuranceRepository(body?.repository);
         if (!repository) return json({ error: "A repository reference is required.", code: "invalid_repository" }, 400);
         if (runToken && runToken.repository !== repository) return json({ error: "Run token repository mismatch.", code: "invalid_repository" }, 403);
+        const metadata = new D1JsonMetadataStore(database);
+        const tokenUseKey = runToken && bearer ? `assurance:run-token:${await sha256Text(bearer)}` : undefined;
+        const tokenPayloadDigest = tokenUseKey ? await sha256Text(JSON.stringify(canonicalize({ repository, assurance: body?.assurance ?? body?.bundle }))) : undefined;
+        const priorTokenUse = tokenUseKey ? await metadata.get<{ payloadDigest?: string }>(tokenUseKey) : null;
+        if (priorTokenUse && priorTokenUse.payloadDigest !== tokenPayloadDigest) return json({ error: "The OIDC run token was already used for different assurance metadata.", code: "run_token_reused" }, 409);
         if (runToken) {
           const installation = await database.prepare("SELECT organization_id FROM tinkerbot_github_repositories r JOIN tinkerbot_github_installations i ON i.installation_id = r.installation_id WHERE lower(r.full_name) = lower(?1) LIMIT 1").bind(repository).first<{ organization_id: string }>();
           const run = await factories.getRun(runToken.runId);
           const order = run?.work_order_id ? await factories.getWorkOrder(run.work_order_id) : null;
+          if (order && (order.repositoryId.toLowerCase() !== repository.toLowerCase() || (installation?.organization_id && order.organizationId !== installation.organization_id))) return json({ error: "The run token is not scoped to this repository and installation.", code: "run_scope_mismatch" }, 403);
           organizationId = order?.organizationId ?? installation?.organization_id;
           if (organizationId) {
             const calculated = await entitlementsForOrganization(database, organizationId);
@@ -1278,9 +1479,33 @@ export default {
         }
         const checked = validateHostedAssuranceBundle(body?.assurance ?? body?.bundle);
         if (!checked.ok) return json({ error: checked.error, code: "invalid_assurance_metadata" }, 400);
+        let boundReceipt: Record<string, unknown> | undefined;
+        const submittedReceipts = Array.isArray(checked.value.receipts) ? checked.value.receipts : [];
+        if (runToken && submittedReceipts.length > 0) {
+          for (const candidate of submittedReceipts) {
+            const verifiedReceipt = await verifyHostedReceipt(candidate, { repository, sha: runToken.sha });
+            if (!verifiedReceipt.ok) return json({ error: verifiedReceipt.error, code: "invalid_assurance_receipt" }, 400);
+            boundReceipt = verifiedReceipt.receipt;
+          }
+          if (!boundReceipt) return json({ error: "A repository-bound assurance receipt is required.", code: "invalid_assurance_receipt" }, 400);
+        }
+        // Claim a run token before any metadata, evidence, Check Run, or
+        // workflow side effect. The read-then-write check above is useful for
+        // ordinary retries, but is not sufficient when two requests arrive at
+        // the same time. D1JsonMetadataStore implements this as INSERT OR
+        // IGNORE, so only one request can win the token-use race.
+        if (tokenUseKey && tokenPayloadDigest && !priorTokenUse) {
+          const claimed = await metadata.putIfAbsent?.(tokenUseKey, { payloadDigest: tokenPayloadDigest, runId: runToken?.runId, repository, expiresAt: runToken?.expiresAt });
+          if (claimed !== true) {
+            const racedTokenUse = await metadata.get<{ payloadDigest?: string }>(tokenUseKey);
+            if (!racedTokenUse) return json({ error: "The assurance run-token claim could not be established.", code: "run_token_claim_unavailable" }, 503);
+            if (racedTokenUse.payloadDigest !== tokenPayloadDigest) return json({ error: "The OIDC run token was already used for different assurance metadata.", code: "run_token_reused" }, 409);
+            return json({ ingested: true, authorized: true, replayed: true, organizationId: organizationId ?? "oidc", repository, sourceUpload: "not_uploaded" });
+          }
+        }
         const org = organizationId ?? "oidc";
-        const metadata = new D1JsonMetadataStore(database);
         const key = assuranceMetadataKey(org, repository);
+        if (priorTokenUse) return json({ ingested: true, authorized: true, replayed: true, organizationId: org, repository, sourceUpload: "not_uploaded" });
         await metadata.put(key, { ...checked.value, repository, organizationId: org, ingestedAt: new Date().toISOString(), sourceUpload: "not_uploaded", runId: runToken?.runId });
         await metadata.put(`assurance:audit:${org}:${crypto.randomUUID()}`, { action: "assurance_ingest", repository, actorId, at: new Date().toISOString() });
         if (env.EVIDENCE_BUCKET) {
@@ -1293,7 +1518,11 @@ export default {
           bundle: checked.value,
           dashboardUrl: applicationUrl(request, env, "/app"),
         });
-        const verdict = translateLegacyVerdict(typeof (checked.value as { receipts?: Array<{ verdict?: string }> }).receipts?.[0]?.verdict === "string" ? (checked.value as { receipts: Array<{ verdict: string }> }).receipts[0].verdict : "UNKNOWN");
+        const verdict = translateLegacyVerdict(typeof boundReceipt?.verdict === "string"
+          ? boundReceipt.verdict
+          : typeof (checked.value as { receipts?: Array<{ verdict?: string }> }).receipts?.[0]?.verdict === "string"
+            ? (checked.value as { receipts: Array<{ verdict: string }> }).receipts[0].verdict
+            : "UNKNOWN");
         if (runToken?.runId && env.DB) {
           const run = await factories.getRun(runToken.runId);
           if (run?.work_order_id) {
@@ -1304,6 +1533,7 @@ export default {
             }
           }
         }
+        if (tokenUseKey && tokenPayloadDigest) await metadata.put(tokenUseKey, { payloadDigest: tokenPayloadDigest, runId: runToken?.runId, repository, expiresAt: runToken?.expiresAt });
         return json({ ingested: true, authorized: true, organizationId: org, repository, sourceUpload: "not_uploaded" });
       }
       if (url.pathname === "/assurance/delete" && request.method === "POST") {
@@ -1408,6 +1638,23 @@ export default {
         if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
         const installationId = Number(url.searchParams.get("installation_id"));
         if (!Number.isSafeInteger(installationId) || installationId <= 0) return json({ error: "A valid GitHub installation_id is required.", code: "invalid_github_installation" }, 400);
+        const existingInstallation = await env.DB.prepare("SELECT organization_id, status FROM tinkerbot_github_installations WHERE installation_id = ?1 LIMIT 1").bind(installationId).first<{ organization_id?: string | null; status?: string }>();
+        // Never allow a user in one tenant to rebind an installation that is
+        // already owned by another tenant. A signed setup-state flow should be
+        // added by the deployment, but this server-side invariant is required
+        // even when the callback is invoked directly.
+        if (existingInstallation?.organization_id && existingInstallation.organization_id !== access.membership.organizationId) return json({ error: "That GitHub installation is already connected to another organization.", code: "github_installation_owned" }, 409);
+        if (env.ENVIRONMENT === "production" && (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY)) return json({ error: "GitHub App verification is not configured.", code: "github_app_not_configured" }, 503);
+        if (env.GITHUB_APP_ID && env.GITHUB_APP_PRIVATE_KEY) {
+          try {
+            // Minting an installation token proves that this installation is
+            // actually attached to this GitHub App; an arbitrary integer is
+            // not sufficient to establish an integration binding.
+            await mintInstallationToken({ appId: env.GITHUB_APP_ID, privateKeyPem: env.GITHUB_APP_PRIVATE_KEY, installationId });
+          } catch {
+            return json({ error: "The GitHub installation could not be verified for this App.", code: "github_installation_unverified" }, 403);
+          }
+        }
         const now = new Date().toISOString();
         await env.DB.prepare("INSERT INTO tinkerbot_github_installations (installation_id, organization_id, status, installed_at, updated_at) VALUES (?1, ?2, 'active', ?3, ?3) ON CONFLICT(installation_id) DO UPDATE SET organization_id = excluded.organization_id, updated_at = excluded.updated_at")
           .bind(installationId, access.membership.organizationId, now).run();
@@ -1425,7 +1672,6 @@ export default {
         try {
           const persisted = await persistGitHubWebhook(env.DB, admission.payload, eventName);
           await new D1JsonMetadataStore(env.DB).put(`github:audit:${admission.idempotencyKey}`, admission.audit);
-          await ledger.record(admission.idempotencyKey);
           if (persisted.kind === "pull_request" || persisted.kind === "issue") {
             const sourceType: "github_issue" | "github_pull_request" = persisted.kind === "issue" ? "github_issue" : "github_pull_request";
             const message: Parameters<typeof handleFactoryQueueMessage>[1] = { deliveryId: admission.idempotencyKey, installationId: persisted.installationId, repository: persisted.repository, sourceType, sourceId: persisted.sourceId ?? admission.idempotencyKey, issueOrPullRequest: persisted.sourceId, sha: persisted.sha, actor: "github-webhook" };
@@ -1439,10 +1685,15 @@ export default {
             else await handleFactoryQueueMessage(env, message);
           }
           const mention = githubTinkerMention(eventName ?? "", admission.payload as Record<string, unknown>);
-          if (mention) {
+          const githubOrganization = persisted.installationId
+            ? await env.DB.prepare("SELECT organization_id FROM tinkerbot_github_installations WHERE installation_id = ?1 LIMIT 1").bind(persisted.installationId).first<{ organization_id?: string | null }>()
+            : persisted.repository
+              ? await env.DB.prepare("SELECT i.organization_id FROM tinkerbot_github_repositories r JOIN tinkerbot_github_installations i ON i.installation_id = r.installation_id WHERE lower(r.full_name) = lower(?1) LIMIT 1").bind(persisted.repository).first<{ organization_id?: string | null }>()
+              : null;
+          if (mention && githubOrganization?.organization_id) {
             const dispatched = dispatchTinkerGateway({
               text: mention,
-              organizationId: "github",
+              organizationId: githubOrganization.organization_id,
               sourceSystem: "github",
               sourceObjectId: admission.idempotencyKey,
               actorId: "github-webhook",
@@ -1451,6 +1702,9 @@ export default {
             await new D1FactoryStore(env.DB).insertFactoryCommand(dispatched.command);
             await new D1JsonMetadataStore(env.DB).put(`tinker:${admission.idempotencyKey}`, dispatched);
           }
+          // Mark the delivery processed only after every derived queue/command
+          // operation succeeds. A failed dispatch must remain retryable.
+          await ledger.record(admission.idempotencyKey);
           return json({ received: true, duplicate: false });
         } catch (error) {
           if (ledger.release) await ledger.release(admission.idempotencyKey);
@@ -1459,6 +1713,8 @@ export default {
       }
       if (url.pathname === "/integrations/gitlab/webhook" && request.method === "POST") {
         if (!env.DB) return json({ error: "GitLab webhook persistence requires the D1 store.", code: "gitlab_webhook_store_not_configured" }, 501);
+        const integrationOrganization = typeof env.INTEGRATION_ORGANIZATION_ID === "string" && /^[A-Za-z0-9._:-]{1,200}$/.test(env.INTEGRATION_ORGANIZATION_ID) ? env.INTEGRATION_ORGANIZATION_ID : undefined;
+        if (env.ENVIRONMENT === "production" && (!env.GITLAB_WEBHOOK_SECRET || !integrationOrganization)) return json({ error: "Signed GitLab webhook and tenant binding are not configured.", code: "integration_not_configured" }, 503);
         const payload = await boundedRequestText(request, 1_500_000);
         const admission = admitGitlabWebhook({
           payload,
@@ -1472,9 +1728,9 @@ export default {
         if (ledger.claim && !await ledger.claim(admission.idempotencyKey)) return json({ received: true, duplicate: true });
         try {
           await new D1JsonMetadataStore(env.DB).put(`gitlab:audit:${admission.idempotencyKey}`, { sourceType: admission.sourceType, repository: admission.repository, event: request.headers.get("x-gitlab-event"), merge: false });
-          await ledger.record(admission.idempotencyKey);
           const message: Parameters<typeof handleFactoryQueueMessage>[1] = {
             deliveryId: admission.idempotencyKey,
+            organizationId: integrationOrganization,
             repository: admission.repository,
             sourceType: admission.sourceType,
             sourceId: admission.sourceId ?? admission.idempotencyKey,
@@ -1483,6 +1739,9 @@ export default {
           };
           if (env.FACTORY_EVENTS) await env.FACTORY_EVENTS.send(message);
           else await handleFactoryQueueMessage(env, message);
+          // A queue/handler failure must release the processing claim so the
+          // provider can retry instead of losing the delivery permanently.
+          await ledger.record(admission.idempotencyKey);
           return json({ received: true, duplicate: false, merge: false, sourceType: admission.sourceType });
         } catch (error) {
           if (ledger.release) await ledger.release(admission.idempotencyKey);
@@ -1574,7 +1833,9 @@ export default {
         if (url.pathname === "/billing/checkout") {
           const allowed = checkoutPlanAllowed(typeof body?.planId === "string" ? body.planId : "", body?.interval === "year" ? "year" : body?.interval === "month" ? "month" : "", config.stripe.plans);
           if (!allowed) return json({ error: "planId and interval must match the server catalog.", code: "invalid_billing_request" }, 400);
-          if (body?.priceId || body?.quantity || body?.organizationId || body?.entitlements) return json({ error: "Client-submitted price, quantity, organization, and entitlement fields are ignored. Use planId and interval only.", code: "invalid_billing_request" }, 400);
+          // Reject client attempts to smuggle server-owned billing inputs even
+          // when the value is falsy (for example quantity=0 or an empty ID).
+          if (["priceId", "quantity", "organizationId", "entitlements"].some((field) => Object.prototype.hasOwnProperty.call(body ?? {}, field))) return json({ error: "Client-submitted price, quantity, organization, and entitlement fields are ignored. Use planId and interval only.", code: "invalid_billing_request" }, 400);
           if (billingState?.subscriptionId && !["canceled", "cancelled", "incomplete_expired", "free"].includes(billingState.status)) return json({ error: "This organization already has a subscription. Change it in-app or in the billing portal instead.", code: "subscription_already_exists" }, 409);
           const requestKey = request.headers.get("idempotency-key")?.replace(/[^a-zA-Z0-9_.:-]/g, "").slice(0, 120) || crypto.randomUUID();
           const seatQuantity = await new D1TenantStore(database).countSeatUsage(organizationId);

@@ -36,6 +36,16 @@ const requiredStripeEvents = [
   "invoice.finalization_failed",
 ];
 
+// Keep the provider-side catalog aligned with the source entitlement catalog.
+// Price IDs are deployment inputs, but amounts, currency, and billing unit are
+// product invariants and should fail closed if an operator points at the wrong
+// Stripe Price.
+const expectedStripePriceCents = Object.freeze({
+  developer: Object.freeze({ month: 2_000, year: 20_000 }),
+  team: Object.freeze({ month: 4_000, year: 40_000 }),
+  business: Object.freeze({ month: 6_000, year: 60_000 }),
+});
+
 const checks = [];
 const missing = [];
 for (const [name, value] of [
@@ -56,8 +66,9 @@ function record(name, ok, details = {}) {
 }
 
 async function jsonFetch(url, init = {}, label) {
-  const response = await fetch(url, init);
+  const response = await fetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(10_000) });
   const text = await response.text();
+  if (text.length > 2_000_000) throw new Error(`${label} returned an oversized response.`);
   let body = {};
   try {
     body = text ? JSON.parse(text) : {};
@@ -78,6 +89,7 @@ function stripeHeaders() {
 }
 
 function parsePlans() {
+  if (typeof stripePlansRaw !== "string" || stripePlansRaw.length > 1_000_000) throw new Error("STRIPE_PLANS_JSON exceeds the 1 MB configuration limit.");
   let value;
   try {
     value = JSON.parse(stripePlansRaw ?? "");
@@ -106,7 +118,7 @@ function parsePlans() {
       if (typeof plan[key] !== "string" || !/^price_[A-Za-z0-9]+$/.test(plan[key]) || String(plan[key]).includes("REPLACE")) throw new Error(`Stripe plan ${plan.id} has an invalid ${key}.`);
       if (priceIds.has(plan[key])) throw new Error(`Stripe price ${plan[key]} is reused.`);
       priceIds.add(plan[key]);
-      prices.push({ planId: plan.id, priceId: plan[key] });
+      prices.push({ planId: plan.id, priceId: plan[key], interval: key === "annualPriceId" ? "year" : "month" });
     }
   }
   if (versions.size !== 1) throw new Error("Stripe plans must share one catalogVersion.");
@@ -129,7 +141,7 @@ async function run() {
       const unavailable = ["workos", "stripe", "cloudflare"].filter((provider) => providers[provider]?.state !== "configured");
       const resources = body.resources && typeof body.resources === "object" ? body.resources : {};
       if (body.service !== "tinkerbot-control-plane" || unavailable.length > 0) throw new Error(`Worker provider configuration is incomplete: ${unavailable.join(", ") || "service identity"}.`);
-      if (resources.d1 !== true || !Number.isInteger(resources.stripePlanCount) || resources.stripePlanCount < 1 || (requireR2 && resources.r2 !== true)) throw new Error("Worker storage or plan-catalog bindings are incomplete.");
+      if (resources.d1 !== true || resources.sessionEncryption !== true || !Number.isInteger(resources.stripePlanCount) || resources.stripePlanCount < 1 || (requireR2 && resources.r2 !== true)) throw new Error("Worker storage, session encryption, or plan-catalog bindings are incomplete.");
       record("worker_config", true, { environment: body.environment, providers: Object.keys(providers), resources });
     } catch (error) {
       record("worker_config", false, { error: error instanceof Error ? error.message : "request failed" });
@@ -169,9 +181,14 @@ async function run() {
     try {
       const account = await jsonFetch("https://api.stripe.com/v1/account", { headers: stripeHeaders() }, "Stripe account");
       const catalog = parsePlans();
-      for (const { planId, priceId } of catalog.prices) {
+      for (const { planId, priceId, interval } of catalog.prices) {
         const price = await jsonFetch(`https://api.stripe.com/v1/prices/${encodeURIComponent(priceId)}`, { headers: stripeHeaders() }, `Stripe price ${planId}`);
-        if (price.id !== priceId || price.active !== true || price.livemode !== account.livemode) throw new Error(`Stripe price for plan ${planId} is inactive, mismatched, or in the wrong mode.`);
+        const recurring = price.recurring && typeof price.recurring === "object" ? price.recurring : {};
+        const amount = typeof price.unit_amount === "number" ? price.unit_amount : 0;
+        const expectedAmount = expectedStripePriceCents[planId]?.[interval];
+        if (price.id !== priceId || price.active !== true || price.livemode !== account.livemode || price.type !== "recurring" || price.currency !== "usd" || price.billing_scheme !== "per_unit" || price.transform_quantity != null || recurring.usage_type !== "licensed" || amount !== expectedAmount || recurring.interval !== interval || (interval === "year" && recurring.interval_count !== 1) || (interval === "month" && recurring.interval_count !== 1)) {
+          throw new Error(`Stripe price for plan ${planId} is inactive, mismatched, metered, transformed, or not ${expectedAmount} cents per licensed seat for ${interval} billing.`);
+        }
       }
       record("stripe_catalog", true, { livemode: account.livemode === true, planCount: catalog.planCount, priceCount: catalog.prices.length });
     } catch (error) {

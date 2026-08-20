@@ -113,11 +113,14 @@ test("Stripe adapter uses server-configured prices and idempotent requests", asy
     },
   });
 
-  const checkout = await provider.createCheckoutSession({ planId: "developer", interval: "month", organizationId: "org_1", successUrl: "https://tinkerbot.example/success", cancelUrl: "https://tinkerbot.example/cancel", idempotencyKey: "checkout-org_1-developer-month" });
+  const checkout = await provider.createCheckoutSession({ planId: "developer", interval: "month", organizationId: "org_1", successUrl: "https://tinkerbot.example/success", cancelUrl: "https://tinkerbot.example/cancel", seatQuantity: 0, idempotencyKey: "checkout-org_1-developer-month" });
   expect(checkout.id).toBe("cs_test");
   expect(requests[0]?.init?.headers).toMatchObject({ "idempotency-key": "checkout-org_1-developer-month" });
   expect(String(requests[0]?.init?.body)).toContain("price_month");
+  expect(String(requests[0]?.init?.body)).toContain("line_items%5B0%5D%5Bquantity%5D=1");
   expect(String(requests[0]?.init?.body)).not.toContain("stripe_test_secret");
+  await expect(provider.createCheckoutSession({ planId: "developer", interval: "month", organizationId: "org_1", successUrl: "https://tinkerbot.example/success", cancelUrl: "https://tinkerbot.example/cancel", seatQuantity: 1.5, idempotencyKey: "checkout-invalid-quantity" })).rejects.toThrow(/quantity/);
+  await expect(provider.createCheckoutSession({ planId: "developer", interval: "month", organizationId: "org_1", successUrl: "https://tinkerbot.example/success", cancelUrl: "https://tinkerbot.example/cancel", seatQuantity: -1, idempotencyKey: "checkout-negative-quantity" })).rejects.toThrow(/quantity/);
   expect((await provider.createPortalSession({ customerId: "cus_1", returnUrl: "https://tinkerbot.example/app/settings/billing", idempotencyKey: "portal-org_1" })).id).toBe("bps_test");
   expect((await provider.setSubscriptionCancellation({ subscriptionId: "sub_1", cancelAtPeriodEnd: true, idempotencyKey: "cancel-org_1" })).status).toBe("canceled");
   const quantityProvider = new StripeBillingProvider({
@@ -158,13 +161,35 @@ test("Cloudflare secret bindings and portable metadata/evidence stores are provi
     { provider: "stripe", state: "unavailable", missing: ["STRIPE_WEBHOOK_SECRET", "STRIPE_PLANS_JSON"] },
     { provider: "cloudflare", state: "configured", missing: [] },
   ]);
+  const incompleteProduction = await hostedProviderConfig({ ENVIRONMENT: "production", STRIPE_SECRET_KEY: "stripe_test_secret", STRIPE_WEBHOOK_SECRET: "whsec_test", STRIPE_PLANS_JSON: JSON.stringify([{ id: "team", monthlyPriceId: "price_team" }]) });
+  expect(incompleteProduction.stripe.plans).toEqual([]);
+  expect(providerStatuses(incompleteProduction).find((item) => item.provider === "stripe")).toMatchObject({ state: "unavailable", missing: ["STRIPE_PLANS_JSON"] });
+  const completeProduction = await hostedProviderConfig({ ENVIRONMENT: "production", STRIPE_SECRET_KEY: "stripe_test_secret", STRIPE_WEBHOOK_SECRET: "whsec_test", STRIPE_PLANS_JSON: JSON.stringify([
+    { id: "developer", monthlyPriceId: "price_DevMonthly", annualPriceId: "price_DevAnnual", catalogVersion: "seat-v1" },
+    { id: "team", monthlyPriceId: "price_TeamMonthly", annualPriceId: "price_TeamAnnual", catalogVersion: "seat-v1" },
+    { id: "business", monthlyPriceId: "price_BusinessMonthly", annualPriceId: "price_BusinessAnnual", catalogVersion: "seat-v1" },
+  ]) });
+  expect(completeProduction.stripe.plans).toHaveLength(3);
+  expect(providerStatuses(completeProduction).find((item) => item.provider === "stripe")).toMatchObject({ state: "configured" });
   expect(JSON.stringify(providerStatuses(config))).not.toContain("workos_test_secret");
 
   const values = new Map<string, string>();
-  const database = { prepare: (query: string) => ({ bind: (...args: unknown[]) => ({ first: async <T>() => query.startsWith("SELECT") ? (values.has(String(args[0])) ? { value: values.get(String(args[0])) } as T : null) : null, run: async () => { if (query.startsWith("INSERT")) values.set(String(args[0]), String(args[1])); else values.delete(String(args[0])); } }) }) };
+  const database = { prepare: (query: string) => ({ bind: (...args: unknown[]) => ({ first: async <T>() => query.startsWith("SELECT") ? (values.has(String(args[0])) ? { value: values.get(String(args[0])) } as T : null) : null, run: async () => {
+    if (query.startsWith("INSERT OR IGNORE")) {
+      if (values.has(String(args[0]))) return { meta: { changes: 0 } };
+      values.set(String(args[0]), String(args[1]));
+      return { meta: { changes: 1 } };
+    }
+    if (query.startsWith("INSERT")) { values.set(String(args[0]), String(args[1])); return { meta: { changes: 1 } }; }
+    values.delete(String(args[0]));
+    return { meta: { changes: 1 } };
+  } }) }) };
   const metadata = new D1JsonMetadataStore(database);
   await metadata.put("org_1", { plan: "developer" });
   expect(await metadata.get("org_1")).toEqual({ plan: "developer" });
+  expect(await metadata.putIfAbsent("claim_1", { payloadDigest: "sha256:a" })).toBe(true);
+  expect(await metadata.putIfAbsent("claim_1", { payloadDigest: "sha256:b" })).toBe(false);
+  expect(await metadata.get("claim_1")).toEqual({ payloadDigest: "sha256:a" });
   await metadata.delete("org_1");
   expect(await metadata.get("org_1")).toBeNull();
 
@@ -192,6 +217,16 @@ test("Cloudflare secret bindings and portable metadata/evidence stores are provi
   const store = evidenceStoreFromEnv({ bucket, exportEndpoint: "https://export.example" });
   await store?.put("run_3", { primary: true });
   expect(await store?.get("run_3")).toEqual({ primary: true });
+});
+
+test("Stripe catalog rejects reusing one price for monthly and annual billing", async () => {
+  const config = await hostedProviderConfig({ ENVIRONMENT: "production", STRIPE_SECRET_KEY: "stripe_test_secret", STRIPE_WEBHOOK_SECRET: "whsec_test", STRIPE_PLANS_JSON: JSON.stringify([
+    { id: "developer", monthlyPriceId: "price_same", annualPriceId: "price_same", catalogVersion: "seat-v1" },
+    { id: "team", monthlyPriceId: "price_team_month", annualPriceId: "price_team_year", catalogVersion: "seat-v1" },
+    { id: "business", monthlyPriceId: "price_business_month", annualPriceId: "price_business_year", catalogVersion: "seat-v1" },
+  ]) });
+  expect(config.stripe.plans).toEqual([]);
+  expect(providerStatuses(config).find((item) => item.provider === "stripe")).toMatchObject({ state: "unavailable" });
 });
 
 test("D1 sessions encrypt provider tokens and webhook claims are replay-safe", async () => {

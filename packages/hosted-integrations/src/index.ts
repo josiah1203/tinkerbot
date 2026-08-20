@@ -144,6 +144,8 @@ export interface WebhookLedger {
 export interface MetadataStore {
   get<T>(key: string): Promise<T | null>;
   put<T>(key: string, value: T): Promise<void>;
+  /** Atomically claim a key when the backing store supports conditional insert. */
+  putIfAbsent?<T>(key: string, value: T): Promise<boolean>;
   delete(key: string): Promise<void>;
 }
 
@@ -558,6 +560,14 @@ function basicAuth(value: string): string {
   return `Basic ${btoa(`${value}:`)}`;
 }
 
+function stripeSeatQuantity(value: number | undefined): number {
+  const quantity = value == null ? 1 : value;
+  if (!Number.isSafeInteger(quantity) || quantity < 0 || quantity > 1_000_000) {
+    throw new ProviderError("stripe", "Stripe seat quantity must be a non-negative integer no greater than 1000000 (zero is normalized to one).", { code: "invalid_quantity" });
+  }
+  return Math.max(1, quantity);
+}
+
 export async function verifyStripeSignature(payload: string, signatureHeader: string | null | undefined, secret: string, toleranceSeconds = 300, nowSeconds = Math.floor(Date.now() / 1000)): Promise<boolean> {
   if (!signatureHeader || !secret) return false;
   const values = new Map<string, string[]>();
@@ -616,7 +626,7 @@ export class StripeBillingProvider implements BillingProvider {
     if (!price) throw new ProviderError("stripe", `Billing interval ${input.interval} is not configured for plan ${input.planId}.`, { code: "price_not_configured" });
     const subscriptionData: Record<string, unknown> = { metadata: { organization_id: input.organizationId, plan_id: plan.id, billing_interval: input.interval } };
     if (input.trialPeriodDays && input.trialPeriodDays > 0) subscriptionData.trial_period_days = input.trialPeriodDays;
-    const payload = await this.post("/v1/checkout/sessions", { mode: "subscription", success_url: input.successUrl, cancel_url: input.cancelUrl, client_reference_id: input.organizationId, customer: input.customerId, customer_email: input.customerEmail, "line_items": [{ price, quantity: Math.max(0, Math.floor(input.seatQuantity ?? 0)) }], "subscription_data": subscriptionData, metadata: { organization_id: input.organizationId, plan_id: plan.id } }, input.idempotencyKey);
+    const payload = await this.post("/v1/checkout/sessions", { mode: "subscription", success_url: input.successUrl, cancel_url: input.cancelUrl, client_reference_id: input.organizationId, customer: input.customerId, customer_email: input.customerEmail, "line_items": [{ price, quantity: stripeSeatQuantity(input.seatQuantity) }], "subscription_data": subscriptionData, metadata: { organization_id: input.organizationId, plan_id: plan.id } }, input.idempotencyKey);
     if (typeof payload.id !== "string") throw new ProviderError("stripe", "Stripe returned an incomplete checkout session.", { code: "provider_invalid_response" });
     return { id: payload.id, url: typeof payload.url === "string" ? payload.url : undefined };
   }
@@ -645,7 +655,7 @@ export class StripeBillingProvider implements BillingProvider {
     const first = data[0] && typeof data[0] === "object" ? data[0] as Record<string, unknown> : undefined;
     const itemId = typeof first?.id === "string" ? first.id : undefined;
     if (!itemId) throw new ProviderError("stripe", "Stripe subscription has no billable item to update.", { code: "subscription_item_missing" });
-    const payload = await this.post(`/v1/subscription_items/${encodeURIComponent(itemId)}`, { quantity: Math.max(0, Math.floor(input.quantity)), proration_behavior: "create_prorations" }, input.idempotencyKey);
+    const payload = await this.post(`/v1/subscription_items/${encodeURIComponent(itemId)}`, { quantity: stripeSeatQuantity(input.quantity), proration_behavior: "create_prorations" }, input.idempotencyKey);
     if (typeof payload.id !== "string") throw new ProviderError("stripe", "Stripe returned an incomplete subscription item.", { code: "provider_invalid_response" });
     return { id: payload.id, quantity: typeof payload.quantity === "number" ? payload.quantity : undefined };
   }
@@ -658,7 +668,7 @@ export class StripeBillingProvider implements BillingProvider {
     const itemId = typeof first?.id === "string" ? first.id : undefined;
     if (!itemId) throw new ProviderError("stripe", "Stripe subscription has no billable item to update.", { code: "subscription_item_missing" });
     const payload = await this.post(`/v1/subscriptions/${encodeURIComponent(input.subscriptionId)}`, {
-      items: [{ id: itemId, price: input.priceId, quantity: Math.max(0, Math.floor(input.quantity)) }],
+      items: [{ id: itemId, price: input.priceId, quantity: stripeSeatQuantity(input.quantity) }],
       proration_behavior: input.prorationBehavior,
       cancel_at_period_end: false,
     }, input.idempotencyKey);
@@ -704,19 +714,23 @@ export async function readCloudflareSecret(env: CloudflareEnv, name: string): Pr
 }
 
 export async function hostedProviderConfig(env: CloudflareEnv): Promise<HostedProviderConfig> {
+  const environment = env.ENVIRONMENT === "production" || env.ENVIRONMENT === "staging" ? env.ENVIRONMENT : "development";
+  const catalog = validateStripePlans(env.STRIPE_PLANS_JSON, { requireAllPlans: environment === "production", requireAnnualPrices: environment === "production" });
   return {
-    environment: env.ENVIRONMENT === "production" || env.ENVIRONMENT === "staging" ? env.ENVIRONMENT : "development",
+    environment,
     workos: { clientId: await readCloudflareSecret(env, "WORKOS_CLIENT_ID"), apiKey: await readCloudflareSecret(env, "WORKOS_API_KEY"), webhookSecret: await readCloudflareSecret(env, "WORKOS_WEBHOOK_SECRET") },
-    stripe: { secretKey: await readCloudflareSecret(env, "STRIPE_SECRET_KEY"), webhookSecret: await readCloudflareSecret(env, "STRIPE_WEBHOOK_SECRET"), plans: parseStripePlans(env.STRIPE_PLANS_JSON) },
+    stripe: { secretKey: await readCloudflareSecret(env, "STRIPE_SECRET_KEY"), webhookSecret: await readCloudflareSecret(env, "STRIPE_WEBHOOK_SECRET"), plans: catalog.plans },
     cloudflare: { accountId: typeof env.CLOUDFLARE_ACCOUNT_ID === "string" ? env.CLOUDFLARE_ACCOUNT_ID : undefined, workerName: typeof env.WORKER_NAME === "string" ? env.WORKER_NAME : undefined },
     sessionEncryptionKey: await readCloudflareSecret(env, "SESSION_ENCRYPTION_KEY"),
   };
 }
 
 export function providerStatuses(config: HostedProviderConfig): ProviderStatus[] {
+  const stripeCatalogReady = config.environment !== "production" || stripeCatalogComplete(config.stripe.plans);
+  const stripePlansPresent = config.stripe.plans.length > 0;
   return [
     { provider: "workos", state: config.workos.clientId && config.workos.apiKey && config.workos.webhookSecret ? "configured" : "unavailable", missing: [!config.workos.clientId ? "WORKOS_CLIENT_ID" : "", !config.workos.apiKey ? "WORKOS_API_KEY" : "", !config.workos.webhookSecret ? "WORKOS_WEBHOOK_SECRET" : ""].filter(Boolean) },
-    { provider: "stripe", state: config.stripe.secretKey && config.stripe.webhookSecret && config.stripe.plans.length > 0 ? "configured" : "unavailable", missing: [!config.stripe.secretKey ? "STRIPE_SECRET_KEY" : "", !config.stripe.webhookSecret ? "STRIPE_WEBHOOK_SECRET" : "", config.stripe.plans.length === 0 ? "STRIPE_PLANS_JSON" : ""].filter(Boolean) },
+    { provider: "stripe", state: config.stripe.secretKey && config.stripe.webhookSecret && stripePlansPresent && stripeCatalogReady ? "configured" : "unavailable", missing: [!config.stripe.secretKey ? "STRIPE_SECRET_KEY" : "", !config.stripe.webhookSecret ? "STRIPE_WEBHOOK_SECRET" : "", !stripePlansPresent || !stripeCatalogReady ? "STRIPE_PLANS_JSON" : ""].filter(Boolean) },
     { provider: "cloudflare", state: config.cloudflare.accountId && config.cloudflare.workerName ? "configured" : "unavailable", missing: [!config.cloudflare.accountId ? "CLOUDFLARE_ACCOUNT_ID" : "", !config.cloudflare.workerName ? "WORKER_NAME" : ""].filter(Boolean) },
   ];
 }
@@ -738,6 +752,13 @@ export class D1JsonMetadataStore implements MetadataStore {
 
   async put<T>(key: string, value: T): Promise<void> {
     await this.database.prepare("INSERT INTO tinkerbot_metadata (key, value, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").bind(key, JSON.stringify(value), new Date().toISOString()).run();
+  }
+
+  async putIfAbsent<T>(key: string, value: T): Promise<boolean> {
+    const result = await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_metadata (key, value, updated_at) VALUES (?1, ?2, ?3)").bind(key, JSON.stringify(value), new Date().toISOString()).run() as { meta?: { changes?: number } };
+    // Cloudflare D1 exposes `meta.changes`. If an adapter cannot report it,
+    // fail closed rather than pretending an atomic claim was acquired.
+    return result.meta?.changes === 1;
   }
 
   async delete(key: string): Promise<void> {
@@ -1124,9 +1145,11 @@ export function evidenceStoreFromEnv(input: { bucket?: R2BucketLike; exportEndpo
 export function validateStripePlans(value: unknown, options: { requireAllPlans?: boolean; requireAnnualPrices?: boolean } = {}): StripeCatalogValidation {
   const errors: string[] = [];
   if (typeof value !== "string" || !value.trim()) return { valid: false, plans: [], errors: ["STRIPE_PLANS_JSON is empty."] };
+  if (value.length > 1_000_000) return { valid: false, plans: [], errors: ["STRIPE_PLANS_JSON exceeds the 1 MB configuration limit."] };
   let parsed: unknown;
   try { parsed = JSON.parse(value) as unknown; } catch { return { valid: false, plans: [], errors: ["STRIPE_PLANS_JSON is not valid JSON."] }; }
   if (!Array.isArray(parsed) || parsed.length === 0) return { valid: false, plans: [], errors: ["STRIPE_PLANS_JSON must be a non-empty array."] };
+  if (parsed.length > 32) return { valid: false, plans: [], errors: ["STRIPE_PLANS_JSON contains too many plan entries."] };
   const prohibited = ["memberLimit", "seatLimit", "privateRepositoryLimit", "repositoryLimit", "additionalRepositoryPrice", "perRepositoryPrice", "perRunPrice", "perTokenPrice", "factoryLimit"];
   const ids = new Set<string>();
   const prices = new Set<string>();
@@ -1144,6 +1167,7 @@ export function validateStripePlans(value: unknown, options: { requireAllPlans?:
     if (!["developer", "team", "business"].includes(id)) errors.push(`${context} has an unsupported id.`);
     if (!monthly || !/^price_[A-Za-z0-9]+$/.test(monthly) || monthly.includes("REPLACE")) errors.push(`${context} has an invalid monthlyPriceId.`);
     if (annual !== undefined && (!annual || !/^price_[A-Za-z0-9]+$/.test(annual) || annual.includes("REPLACE"))) errors.push(`${context} has an invalid annualPriceId.`);
+    if (annual !== undefined && annual === monthly) errors.push(`${context} must use distinct monthlyPriceId and annualPriceId values.`);
     if (options.requireAnnualPrices && annual === undefined) errors.push(`${context} is missing annualPriceId.`);
     for (const field of prohibited) if (Object.prototype.hasOwnProperty.call(plan, field)) errors.push(`${context} must not include ${field}; the catalog is seat-only.`);
     const catalogVersion = plan.catalogVersion;
@@ -1163,6 +1187,14 @@ export function validateStripePlans(value: unknown, options: { requireAllPlans?:
   if (versions.size > 1) errors.push("All Stripe plans must use the same catalogVersion.");
   if (options.requireAllPlans) for (const id of ["developer", "team", "business"]) if (!plans.some((plan) => plan.id === id)) errors.push(`Stripe catalog is missing ${id}.`);
   return { valid: errors.length === 0, plans: errors.length === 0 ? plans : [], errors };
+}
+
+/** Strict production readiness check for the seat catalog. */
+export function stripeCatalogComplete(plans: readonly StripePlan[]): boolean {
+  if (plans.length !== 3) return false;
+  const ids = new Set(plans.map((plan) => plan.id));
+  const versions = new Set(plans.map((plan) => plan.catalogVersion).filter((version): version is string => Boolean(version)));
+  return ids.size === 3 && ["developer", "team", "business"].every((id) => ids.has(id)) && plans.every((plan) => Boolean(plan.monthlyPriceId && plan.annualPriceId)) && versions.size === 1;
 }
 
 export function parseStripePlans(value: unknown): StripePlan[] {

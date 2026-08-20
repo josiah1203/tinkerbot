@@ -34,7 +34,7 @@ test("invoice.paid does not wipe a Tinkerbot trial, and production catalog fails
   expect(stripeStatus({ id: "evt", type: "invoice.payment_failed", data: { object: {} } })).toBe("past_due");
   expect(productionCatalogUnavailable("production", [])).toBe(true);
   expect(productionCatalogUnavailable("staging", [])).toBe(false);
-  expect(productionCatalogUnavailable("production", [{ id: "team", monthlyPriceId: "price_team" }])).toBe(false);
+  expect(productionCatalogUnavailable("production", [{ id: "team", monthlyPriceId: "price_team" }])).toBe(true);
 });
 
 test("entitlement denial fail-closes canceled and past-due premium mutations", () => {

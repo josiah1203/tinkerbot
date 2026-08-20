@@ -6,19 +6,19 @@ Tinkerbot is a broad, mostly implemented software production operating system fo
 
 The source implementation is substantial enough for a controlled staging pilot. It is **not yet a production release**. The remaining work is a mixture of high-impact security corrections, release packaging, configuration alignment, live-provider provisioning, and end-to-end validation. The repository itself should not be described as fully released merely because the local source tests pass.
 
-This summary describes the tree at the audit snapshot:
+This summary began as an audit snapshot and is retained as the executive baseline. The current worktree includes the hardening and self-hosted/BYOK implementation updates described below; release claims still require a real staging deployment and provider checks.
 
 - Commit: `e05a940` (`Refactor application structure and simplify implementation`)
-- Working tree: clean at audit time
-- Audit date: 2026-08-19
+- Working tree: implementation changes are currently uncommitted
+- Audit baseline date: 2026-08-19; hardening update: 2026-08-20
 - Primary runtime: Node.js/TypeScript locally; Cloudflare Workers and D1/R2/Queues/Workflows in hosted mode
 - Primary product name: `tinkerbot`; `tb` is the supported CLI name; `tinkerbot` is an alias; `pr-proof` is a deprecated compatibility alias
 
 ### Release recommendation
 
-Hold the public production release until the P0/P1 items in section 10 are closed and verified in a real staging account. The most important technical blocker is that the Action OIDC exchange currently decodes JWT claims but does not verify the JWT signature against the issuer's JWKS. That is an authenticity failure at the boundary that grants a customer repository a hosted run token. It must be fixed before relying on the hosted admission path.
+Hold the public production release until the provider and deployment gates in section 10 are closed in a real staging account. The source-level OIDC verifier now performs RS256/JWKS validation, issuer allowlisting, time checks, and exact repository/commit/workflow binding. That closes the former source-level authenticity defect; it does not substitute for staging proof of issuer rotation, replay handling, installation identity, and the complete Action ingest loop.
 
-The second class of blocker is release integrity: most of the documented `.tinkerbot/` factory tree is ignored by Git, compiled `dist/` artifacts are not tracked in the checkout, the Action wrapper expects compiled files, and the production Stripe variable is still empty/placeholder-oriented. These are solvable release-engineering issues, but they make a source checkout materially different from the artifact a customer would consume.
+The remaining release-integrity blockers are reproducible factory/action packaging, deployment configuration, real Stripe catalog values, and signed distribution. The checked-in Stripe example is intentionally syntactically valid but fail-closed until real Price IDs are provisioned; inventing live IDs would be unsafe.
 
 ## 2. Product definition and boundaries
 
@@ -154,11 +154,13 @@ The implementation boundary is intentionally split:
 - GitHub Actions remains the customer-controlled verification runner and submits the `tb check` result through Action OIDC.
 - Merge remains outside Tinkerbot's authority.
 
-The source supports the Sandbox protocol, but the current `wrangler.jsonc` does not declare a `Sandbox` binding. The runtime therefore returns an incomplete/unknown implementation result when no binding is present. This is a real deployment prerequisite, not a documentation-only feature.
+The source declares a `Sandbox` Durable Object binding, but the checked-in `Sandbox` class is still a placeholder that returns 501. A supported Cloudflare Sandbox adapter/SDK must be wired, deployed, and stage-tested before hosted implementation is production-ready. Customer-owned self-hosted workers are the usable implementation path today.
 
-### Factory source-integrity issue
+The self-hosted path is now a real executable boundary rather than a design-only option: `tinkerbot-factory worker` consumes a versioned, HMAC-signed, credential-free dispatch, verifies the local factory digest and worker/harness identity, runs the configured external Codex/Claude/Gemini-compatible harness in Docker (or an explicit process mode), and posts a bounded completion. The control plane enforces replay-safe completion, tenant/repository/run scope, digest binding, and resumable stage/event idempotency. GitHub installation callbacks reject cross-tenant rebinds and production verifies the App installation; OIDC assurance receipts are hash-checked and bound to their repository and commit before a run can advance.
 
-The current repository tracks only `.tinkerbot/factory.yaml`. The `.gitignore` rule `.tinkerbot/*` ignores the documented agents, skills, lines, autonomy, and evolution files. This means the documentation and starter model describe a richer factory tree than the main checkout actually carries. Before shipping factory-as-code as a reproducible product contract, either the intended files must be committed explicitly or the ignore rules and packaging model must be redesigned and tested.
+### Factory source-integrity boundary
+
+The repository now has an explicit `.gitignore` allowlist for the documented `.tinkerbot` companion tree (`agents/`, `skills/`, `lines/`, `automations/`, `runners/`, `evals/`, and policy files). A particular customer checkout may still contain only `factory.yaml`, so reproducibility depends on committing the intended companion files and exercising a clean-checkout digest test. The loader also bounds the tree, rejects symlinks, and rejects conflicting YAML copies before execution.
 
 ## 7. Hosted control plane and dashboard
 
@@ -189,11 +191,9 @@ The Worker route surface includes:
 
 The dashboard is intentionally exception-first: operators should see blocked, failed, unknown, awaiting approval, and release-relevant work before a generic activity feed. It has a static SPA shell and local development server; production data and authentication require the Worker and configured providers.
 
-### Hosted authorization findings
+### Hosted authorization status
 
-The Worker currently uses a small `TenantCapability` union. Factory and work-order endpoints authorize with `tenant:read`, including mutation paths. Although many individual operations perform organization-ID checks, the role/capability model does not express a separate factory/work-order mutation capability. That is too coarse for least privilege and should be corrected before a multi-tenant production launch.
-
-The run-detail route checks that a run exists but does not perform the same explicit organization ownership check used by work orders. This is a cross-tenant data-isolation risk and should be covered by a negative authorization test and a store query constrained by organization ID.
+The Worker now separates `tenant:admin` from read access and applies explicit mutation capabilities to tenant administration, factory/work operations, billing, invitations, and assurance. Run, work-order, factory, evolution, and approval reads/writes are constrained by the authenticated organization in both route checks and D1 store queries; negative cross-tenant tests cover the boundary. Remaining authorization work is operational: stage-test every provider callback and integration mapping with real tenant fixtures, and review the capability matrix whenever a new route is added.
 
 ## 8. Authentication, integrations, and execution surfaces
 
@@ -217,7 +217,7 @@ Paid plans intentionally have no seat or repository cap. Team has a 14-day cardl
 
 The source catalog is in `packages/control-plane/src/entitlements.ts`. The JSON configuration is intentionally limited to plan IDs, monthly/annual Stripe Price IDs, and `catalogVersion`; `pnpm validate:stripe` now rejects placeholders, duplicates, unknown fields, missing plans, and version drift. The checked-in example remains an intentionally non-deployable template, and real IDs plus a nonempty production variable are external release requirements.
 
-There is also an internal contract drift: `scripts/validate-live-providers.mjs` still expects legacy fields (`privateRepositoryLimit`, `memberLimit`, `retentionDays`, and a boolean `features` map), while the current billing catalog and example JSON explicitly removed those fields. The provider validation script must be brought into agreement with the seat-based catalog before it can be a trustworthy release gate.
+The live-provider validation script uses the same seat-only shape and rejects legacy cap/feature fields before it calls Stripe. It remains a provider-facing gate: the checked-in template must still be replaced with real Price IDs and the target Worker must expose a nonempty catalog.
 
 ### GitHub Action
 
@@ -292,21 +292,21 @@ The official coverage bar is **94%** statements/functions/lines in `vitest.confi
 - CSRF/origin checks are applied to hosted mutation paths;
 - webhook ledgers and publication dedupe reduce replay/duplicate publication risk;
 - customer-cluster deployment is outside the Worker boundary;
-- WorkOS/Stripe webhook signatures and replay handling are represented in source;
+- WorkOS/Stripe and optional integration webhook signatures are represented in source; production public integration intake additionally requires a tenant binding and provider replay ledger;
 - providers and missing configuration fail closed or return explicit unavailable/unknown states in local tests.
 
 ### Release-blocking findings
 
 | Priority | Finding | Consequence | Required closure |
 | --- | --- | --- | --- |
-| P0 | Action OIDC exchange uses `decodeJwtPayload` plus claim comparison; no JWT signature/JWKS verification is performed | A forged token with acceptable-looking claims could obtain a hosted run token | Verify issuer signature, JWKS rotation, `exp`/`nbf`/`iat`, nonce/run binding, and key-cache failure behavior; add forged-signature tests |
-| P1 | Factory/work-order mutations are authorized by broad `tenant:read` | Viewer/reviewer role boundaries are not expressed at the capability layer | Add explicit factory/work-order read/write/approve/operate capabilities and negative role tests |
-| P1 | Run-detail lookup is not visibly constrained by organization ID | A known run ID may expose another tenant's run/stages | Make the query organization-scoped and test cross-tenant access |
-| P1 | No `Sandbox` binding is declared in `wrangler.jsonc` | Implementation stage cannot execute in the deployed Worker | Provision/configure the supported binding and run a staging work-order through implementation |
-| P1 | `.tinkerbot/*` ignores most factory definition files | Factory definitions are not reproducible from the main Git checkout | Commit the intended tree or change packaging/ignore rules; add a clean-checkout digest test |
+| P0 | Hosted release still lacks a real staging proof of the Action OIDC and self-hosted completion loop | Source-level verification can be correct while deployment wiring, issuer rotation, replay handling, or tenant binding is wrong | Exercise real GitHub/GitLab OIDC, JWKS rotation, installation identity, replay rejection, self-hosted completion, and deterministic verification in staging |
+| P1 | Factory/work-order reads and mutations need a final role matrix review | Explicit capabilities now exist, but broad `tenant:read` is still intentional for some read-only surfaces | Complete negative tests for viewer/reviewer/operator/admin across every hosted route and MCP tool |
+| P1 | Hosted Sandbox binding is declared but the `Sandbox` class remains a 501 placeholder | The deployed Worker cannot perform its built-in implementation path | Wire the supported Sandbox SDK/adapter, enforce its isolation contract, and run a staging work-order through implementation |
+| P1 | Public Slack/Linear/Jira/incident/support intake now has HMAC/replay guards but only a single global tenant binding | A multi-tenant deployment cannot safely infer a tenant from request JSON | Provision provider secrets plus a signed per-tenant mapping/endpoint registry and run live provider contract tests before enabling multi-tenant production intake |
+| P1 | Factory-tree reproducibility is not yet proven in a clean external checkout | A customer can commit a partial tree or package a different definition than the one reviewed | Commit/package the intended companion tree and add a clean-checkout digest test |
 | P1 | Action wrapper requires untracked `dist/action` and `dist/packages` | External `uses: owner/tinkerbot@v1` can fail even when source is correct | Build, package, inspect, and smoke-test the exact release tag |
-| P1 | Stripe provider validator expects removed legacy plan fields | Live-provider gate can reject the current valid seat catalog or provide false confidence | Update validator and add catalog/Stripe API contract tests |
-| P1 | Coverage ratchet is 94% statements/functions/lines | Matches Vitest; not a 98% all-metrics gate | Keep CI at 94%; do not document 98% |
+| P1 | Stripe catalog is still a placeholder template in source | Checkout cannot be production-ready without real, active, correctly recurring Prices | Provision six real Price IDs, load them as a secret/config value, run the live Price API validator, and test Checkout/Portal/webhooks |
+| P1 | Coverage ratchet is 94% statements/functions/lines | The full test suite is green, but coverage is not a substitute for provider/E2E proof | Run `pnpm test:coverage` on the release commit and record the agreed thresholds |
 | P2 | Release artifacts are unsigned | Supply-chain provenance is not established | Add signing, provenance, key custody, verification, and revocation steps |
 | P2 | Browser/TUI visual and live integration paths are not covered by the local suite | Layout, auth redirects, provider callbacks, and real App publication can regress unnoticed | Run Playwright, TTY smoke/resize tests, and staging cross-surface scenarios |
 
@@ -314,16 +314,16 @@ The first finding is the one that changes the security posture of the hosted adm
 
 ## 11. Measured quality status
 
-The following commands were run against the audit snapshot:
+The following commands were run against the current hardening worktree unless marked otherwise:
 
 | Check | Result | Interpretation |
 | --- | --- | --- |
 | `pnpm build` | Passed | TypeScript compilation succeeds |
-| `pnpm test` | Passed: 34 test files, 218 tests | Local unit/integration suite is green; several stderr notices are intentional negative-path fixtures |
-| `pnpm test:coverage` | Failed at coverage ratchet | Tests pass, but the checked-in baseline was regressed in CLI, factory, selection, and hosted integrations |
-| Coverage overall | 94.80% statements, 79.47% branches, 98.05% functions, 94.80% lines | This is not 98% across all metrics |
+| `pnpm test` | Passed: 47 test files, 302 tests | Local unit/integration suite is green; several stderr notices are intentional negative-path fixtures |
+| `pnpm test:coverage` | Not rerun for this hardening pass | Run it on the release commit; the 94% statements/functions/lines bar remains the documented gate |
+| Coverage overall | Not measured in this pass | Do not infer coverage from the green functional suite; branch coverage remains a reported, non-ratcheted metric |
 | Coverage thresholds in `vitest.config.ts` | 94% statements/functions/lines; branches are reported but not thresholded there | The configuration does not implement an all-metrics 98% gate |
-| `scripts/verify-coverage.mjs` | Baseline/long-term ratchet with warnings | It compares package baselines and currently reports regressions |
+| `scripts/verify-coverage.mjs` | Pending release-commit run | It compares package baselines and must be recorded with the final artifact |
 | Playwright/browser E2E | Not run in this audit | Requires browser installation and a running/valid application target |
 | Live provider validation | Not run successfully | Requires real Worker URL, WorkOS, Stripe, webhooks, and nonempty production plan IDs |
 
@@ -366,7 +366,7 @@ These are actions that cannot be completed from a source-only checkout without t
 
 - create live and test products/prices for Developer, Team, and Business monthly/annual seat billing;
 - replace every placeholder Price ID and populate a nonempty `STRIPE_PLANS_JSON` for the target environment;
-- align `validate-live-providers.mjs` with the current catalog schema;
+- run `validate-live-providers.mjs` against the deployed Worker and Stripe account;
 - configure Checkout, Customer Portal, subscription quantity updates, trial, proration, `past_due` grace, cancellation, and webhook replay;
 - register and verify all required Stripe webhook events in both test and live modes;
 - confirm the server-side active-human-seat count is the only billable quantity.
@@ -389,9 +389,9 @@ These are actions that cannot be completed from a source-only checkout without t
 
 ## 13. Recommended closure sequence
 
-1. **Fix the hosted admission boundary:** implement real GitHub/GitLab OIDC signature validation with JWKS caching/rotation and claim lifetime checks; add forged-token and replay tests.
-2. **Close tenant authorization:** introduce dedicated factory/work-order/run capabilities and organization-scoped store methods; add cross-tenant negative tests.
-3. **Make source and configuration reproducible:** resolve `.tinkerbot` tracking, commit/package the intended factory tree, align Stripe catalog and provider validator, and make production variable requirements fail early.
+1. **Prove the hosted admission boundary in staging:** exercise the implemented GitHub/GitLab OIDC signature validation, JWKS rotation, claim lifetime checks, forged-token rejection, replay handling, installation identity, and self-hosted completion loop.
+2. **Finish tenant authorization assurance:** the route/store capability boundary is implemented; complete the negative role matrix across every hosted route and MCP tool, including cross-tenant factory, work-order, run, change-set, and notification cases.
+3. **Make source and configuration reproducible:** commit/package the intended factory tree, add the clean-checkout digest test, align the real Stripe catalog with the validator, and make production variable requirements fail early.
 4. **Keep the Vitest coverage bar at 94%** statements/functions/lines in CI. Do not claim 98% overall.
 5. **Build a real release artifact:** compile Action and CLI outputs, run `pnpm release:dry-run`, inspect the archive contents, and test the Action from a clean tag.
 6. **Provision staging:** deploy Worker resources, apply migrations, configure WorkOS/Stripe/GitHub, attach Sandbox, and run provider validation.
@@ -415,7 +415,7 @@ The current implementation is strongest from local verification through release 
 
 ### 15.1 Runtime foundation (implemented)
 
-`schemaVersion: v1alpha2` adds `runtime` on the factory definition (collaboration, controlPlane, pipeline, runner, inference credentialRef, approval, sync). Older schemas parse with hosted defaults. There is no solo billing tier. Local execution uses `packages/local-runtime` (SQLite-shaped store, Docker runner, BYOK refs) via `tb run --local`, `tb factory plan`, and `tb eval`. `tb check` is unchanged. Hosted P0/P1 items (OIDC JWKS, tenant RBAC, Action `dist/`, Stripe) remain independent.
+`schemaVersion: v1alpha2` adds `runtime` on the factory definition (collaboration, controlPlane, pipeline, runner, inference credentialRef, approval, sync). Older schemas parse with hosted defaults. There is no solo billing tier. Local execution uses `packages/local-runtime` (SQLite-shaped store, Docker runner, BYOK refs) via `tb run --local`, `tb factory plan`, and `tb eval`. `tb check` is unchanged. Source-level OIDC/JWKS, tenant-scoped run/MCP lookups, and Stripe schema drift have been hardened; staging provider wiring, Action artifacts, the real Stripe catalog, and the deployed Sandbox adapter remain independent release gates.
 
 The YAML shape is:
 
@@ -441,7 +441,7 @@ The current substrate and required changes are:
 - `packages/factory/src/warp.ts` already has bounded Foreman actions, heuristic stage skipping, conversations, scoring, and self-improvement hooks. Add a deterministic execution planner that consumes diff size, changed paths, impact, repository history, prior outcomes, and policy.
 - `packages/factory/src/index.ts` already models stages, budgets, autonomy, WorkOrder transitions, and `executeFactoryRun`. Add a persisted `ExecutionPlan`, pipeline mode, approval mode, runtime origin, and cost estimate. Keep verification mandatory and keep restricted paths from being auto-skipped.
 - `packages/factory/src/definition.ts` now parses provider-neutral harnesses, process/Docker/local/self-hosted runner boundaries, and credential references. External commands are explicit no-shell bindings and are never executed by the hosted Worker.
-- `apps/control-plane-worker/src/factory-runtime.ts` now restores the persisted definition tree, validates it before execution, and emits a credential-free `SELF_HOSTED_WORK` handoff for customer workers; the remaining release gate is the deployed worker adapter and its callback/OIDC loop.
+- `apps/control-plane-worker/src/factory-runtime.ts` now restores the persisted definition tree, validates it before execution, and emits a credential-free HMAC-signed `SELF_HOSTED_WORK`/HTTPS handoff for customer workers; the remaining release gate is deploying a queue consumer or HTTPS adapter and proving its callback/OIDC loop.
 - `packages/cli/src/index.ts` currently keeps `tb check` and factory validation local while hosted factory/work/run commands require an HTTPS session. Add a local orchestrator path (`tb run --local`, `tb eval`, and a local state store) without making WorkOS a prerequisite.
 - `packages/control-plane/src/entitlements.ts` exposes self-hosted workers as a portable capability on every plan while keeping `private_execution` as Enterprise dedicated hosted infrastructure. Local execution, BYOK, portable evals, and offline assurance remain distinct capabilities.
 
@@ -690,7 +690,7 @@ Update `docs/architecture.md`, `docs/factories.md`, `docs/control-plane.md`, `do
 
 ## 17. Recommended implementation sequence for these lifecycle insights
 
-1. **Close current release/security blockers first:** OIDC signature verification, tenant isolation/capabilities, reproducible factory files, Action artifacts, Stripe validator drift, and the chosen coverage gate remain prerequisites for hosted production.
+1. **Close current release/security blockers first:** staging-proof OIDC and tenant authorization, reproducible factory files, Action artifacts, the real Stripe catalog, the supported Sandbox adapter, signing, and the chosen coverage gate remain prerequisites for hosted production.
 2. **Add explainable planning:** implement `IntakeAssessment`, `RiskAssessment`, `ExecutionPlan`, duplicate detection, dry-run, confidence/rationale, and upfront cost/complexity estimates. This immediately improves trust for both solo and team users.
 3. **Add adaptive execution:** implement single-agent fallback, risk-scaled review, inline low-risk self-review, optional security sub-review, and a preserved multi-agent escalation path.
 4. **Add implementation integrity:** introduce checkpoints, rollback references, dependency/license assessment, pairing consultations, and typed evidence adapters.
@@ -704,6 +704,6 @@ The first six changes can be delivered without waiting for production Stripe, Wo
 
 ## 18. Bottom line
 
-The repository is no longer just a TUI/CLI prototype. It is a coherent factory-OS codebase with a local assurance engine, hosted orchestration, billing contracts, browser control tower, Action/App publication, and a documented governance model. The implementation breadth is real and the local test suite is healthy, but the release claim must remain narrower than the product vision until hosted identity authenticity, tenant isolation, reproducible factory/action packaging, provider configuration, coverage policy, signing, and live end-to-end validation are closed.
+The repository is no longer just a TUI/CLI prototype. It is a coherent factory-OS codebase with a local assurance engine, hosted orchestration, billing contracts, browser control tower, Action/App publication, a portable self-hosted worker, BYOK/local harness boundaries, and a documented governance model. The implementation breadth is real and the local test suite is healthy, but the release claim must remain narrower than the product vision until staging identity/tenant tests, reproducible packaging, the supported Sandbox adapter, real provider configuration, coverage evidence, signing, and live end-to-end validation are closed.
 
-No external account, key, billing catalog, deployment, or production release was changed during this audit. The changes made here are documentation-only: this summary records the measured state and the remaining closure work.
+No external account, key, billing catalog, deployment, or production release was changed during this pass. The Stripe example remains deliberately non-deployable until the owner supplies real Price IDs. The worktree contains uncommitted source, test, and documentation changes; review and commit them through the normal release process.

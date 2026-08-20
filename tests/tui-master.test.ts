@@ -70,7 +70,10 @@ test("PATH detection uses env overrides and never claims vendor tokens", () => {
   const agents = detectAgents({ PATH: "/no/such/bin", SHELL: "/bin/sh" });
   expect(agents.find((item) => item.id === "cursor")?.present).toBe(false);
   expect(agents.every((item) => item.oauth === "child-cli")).toBe(true);
-  expect(JSON.parse(listAgentsJson(env)).storesVendorTokens).toBe(false);
+  const listed = JSON.parse(listAgentsJson(env));
+  expect(listed.storesVendorTokens).toBe(false);
+  expect(listed.hostedHarnessesRequireExplicitBoundary).toContain("codex");
+  expect(listed.hostedHarnessesForbiddenOnWorkers).toContain("claude");
   expect(spawnSpec("gemini", "/tmp", { PATH: "/no/such" })).toMatchObject({ error: expect.stringMatching(/not found/) });
   expect(spawnSpec("shell", "/tmp", env)).toMatchObject({ bin: "/bin/sh", trust: expect.stringMatching(/user-owned|gh pr merge/) });
   const nested = spawnSpec("claude", "/tmp", { ...env, GH_TOKEN: "ghs_secret", GITHUB_TOKEN: "ghs_secret" });

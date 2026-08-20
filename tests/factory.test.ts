@@ -86,6 +86,7 @@ import {
   ASSURANCE_CHECKPOINTS,
   computerUsePlan,
   createPullRequestBody,
+  conversationTranscript,
   exhaustObjectKey,
   parseAlias,
   parseRepositories,
@@ -105,6 +106,11 @@ import {
   mcpServerNames,
   ACTIVITY_COLUMN_LABELS,
   buildFactoryStarter,
+  createSelfHostedCompletion,
+  createSelfHostedDispatch,
+  selfHostedSecretReady,
+  verifySelfHostedCompletion,
+  verifySelfHostedDispatch,
 } from "../packages/factory/src";
 import fs from "node:fs";
 import os from "node:os";
@@ -142,6 +148,15 @@ describe("factory domain", () => {
     expect(validateFactoryDefinition(definition)).toEqual([]);
     expect(factoryDefinitionDigest(definition)).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(containsRawCredentials({ token: "ghs_abcdefghijklmnopqrstuvwxyz" })).toBe(true);
+    // Credential detection must remain deterministic across repeated calls;
+    // a stateful global RegExp can otherwise skip every other match.
+    expect(containsRawCredentials("token=ghs_abcdefghijklmnopqrstuvwxyz")).toBe(true);
+    expect(containsRawCredentials("token=ghs_abcdefghijklmnopqrstuvwxyz")).toBe(true);
+    expect(containsRawCredentials("sk-proj-abcdefghijklmnop")).toBe(true);
+    expect(containsRawCredentials({ apiKey: "a-long-unprefixed-api-key-value" })).toBe(true);
+    expect(containsRawCredentials("glpat-abcdefghijklmnop")).toBe(true);
+    expect(containsRawCredentials("AIza012345678901234567890123456789")).toBe(true);
+    expect(sanitizeUntrustedPromptInput("use sk-proj-abcdefghijklmnop")).not.toContain("sk-proj-");
     expect(() => parseFactoryDefinition("name: bad\nrepositories: [acme/payments]\nsecret: sk-proj-abcdefghijklmnop")).toThrow(/credentials/);
   });
 
@@ -153,6 +168,8 @@ describe("factory domain", () => {
     expect(loaded.definition.repositories).toEqual(["acme/payments"]);
     expect(loaded.digest).toBe(loaded.treeDigest);
     expect(loaded.definition.agents[0]?.model).toBe("@cf/meta/llama-3.1-8b-instruct");
+    fs.writeFileSync(path.join(root, ".tinkerbot", "oversize.txt"), Buffer.alloc(512_001, "a"));
+    expect(() => loadFactoryDefinition(root)).toThrow(/512000-byte limit/);
   });
 
   test("work-order transitions are append-only, idempotent, and fail closed", () => {
@@ -210,7 +227,18 @@ describe("factory domain", () => {
     expect(ready.stages.find((stage) => stage.stage === "implementation")?.summary).not.toMatch(/Dispatched to GitHub Actions customer runner/);
   });
 
-  test("signed records and OIDC JWKS verification fail closed", async () => {
+  test("agent summaries and persisted transcripts redact the full supported token family", () => {
+    const tokens = [
+      "github_pat_abcdefghijklmnop",
+      "gho_abcdefghijklmnop",
+      "xoxb-abcdefghijklmnop",
+      "hf_abcdefghijklmnop",
+    ];
+    const transcript = conversationTranscript(tokens.map((content, index) => ({ role: "assistant" as const, agentId: `agent-${index}`, content, at: new Date().toISOString() })));
+    expect(transcript.messages.every((message) => !tokens.some((token) => message.content.includes(token)))).toBe(true);
+  });
+
+test("signed records and OIDC JWKS verification fail closed", async () => {
     const record = signRecord({ workOrderId: "wo_1", decision: "approved" }, "unit-test-secret");
     expect(verifySignedRecord(record, "unit-test-secret")).toBe(true);
     expect(verifySignedRecord(record, "other-secret")).toBe(false);
@@ -236,6 +264,8 @@ describe("factory domain", () => {
       return new Response(JSON.stringify({ keys: [jwk] }), { status: 200 });
     }) as typeof fetch;
     expect((await verifyOidcJwt(token, { audience: "tinkerbot", repository: "acme/payments", sha: "abc" }, { fetchImpl, nowSeconds: now })).ok).toBe(true);
+    expect(validateOidcClaims({ ...claims, sha: undefined }, { audience: "tinkerbot", repository: "acme/payments", sha: "abc" })).toEqual({ ok: false, reason: "invalid_sha" });
+    expect(validateOidcClaims({ ...claims, workflow: undefined }, { audience: "tinkerbot", repository: "acme/payments", workflow: "ci.yml" })).toEqual({ ok: false, reason: "invalid_workflow" });
     const forgedHeader = Buffer.from(JSON.stringify({ alg: "RS256", kid: "k1", typ: "JWT" })).toString("base64url");
     const forgedBody = Buffer.from(JSON.stringify({ ...claims, repository: "evil/repo" })).toString("base64url");
     expect((await verifyOidcJwt(`${forgedHeader}.${forgedBody}.${token.split(".")[2]}`, { audience: "tinkerbot", repository: "evil/repo" }, { fetchImpl, nowSeconds: now })).ok).toBe(false);
@@ -261,6 +291,8 @@ describe("factory domain", () => {
       return new Response(JSON.stringify({ keys: [jwk] }), { status: 200 });
     }) as typeof fetch;
     expect((await verifyOidcJwt(gitlabToken, { audience: "tinkerbot", repository: "acme/payments" }, { fetchImpl: gitlabFetch, nowSeconds: now })).ok).toBe(true);
+    const attackerIssuerClaims = { ...gitlabClaims, iss: "https://gitlab.attacker.example", jti: "attacker-issuer" };
+    expect(validateOidcClaims(attackerIssuerClaims, { audience: "tinkerbot", repository: "acme/payments" })).toEqual({ ok: false, reason: "invalid_issuer" });
     const customer = customerCostView({ catalogVersion: "x", plannedStages: ["foreman"], estimatedInputTokens: 1, estimatedOutputTokens: 1, estimatedDurationSeconds: 1, managedCogsCents: 8, byokSpendCents: 12, platformInvoice: "seats_only", confidence: "low", rangeCents: { low: 0, high: 1 }, provider: "anthropic" });
     expect("managedCogsCents" in customer).toBe(false);
     expect(customer.byokNote).toMatch(/not on your Tinkerbot invoice/);
@@ -279,9 +311,15 @@ describe("factory domain", () => {
     expect(planForemanActions({ sourceType: "github_pull_request", untrustedText: "typo" }).skip).toContain("specification");
     expect(assertSandboxPushAllowed("main").ok).toBe(false);
     expect(assertSandboxPushAllowed(implementBranchName("wo_12345678")).ok).toBe(true);
+    expect(implementBranchName("wo_12345678_alpha")).not.toBe(implementBranchName("wo_12345678_beta"));
+    expect(implementBranchName("x".repeat(200))).toMatch(/^tinkerbot\/[A-Za-z0-9_-]{1,64}$/);
     const plan = sandboxImplementPlan({ repository: "acme/payments", workOrderId: "wo_12345678" });
     expect(plan.mergeForbidden).toBe(true);
     expect(plan.steps.some((step) => step.purpose === "push")).toBe(true);
+    expect(plan.steps.find((step) => step.purpose === "clone")?.argv).toEqual(["git", "clone", "--depth", "50", "https://github.com/acme/payments.git", "repo"]);
+    expect(() => sandboxImplementPlan({ repository: "acme/payments;touch /tmp/pwned", workOrderId: "wo_1" })).toThrow(/owner\/name/);
+    expect(assertSandboxPushAllowed("tinkerbot/wo_1234").ok).toBe(true);
+    expect(assertSandboxPushAllowed("tinkerbot/$(touch-pwned)").ok).toBe(false);
     expect(classifyActivityColumn("implementation")).toBe("building");
     expect(classifyActivityColumn("specification")).toBe("planning");
     expect(slackIntake({ event: { text: "<@U1> fix flaky test", ts: "1.2", user: "U2" } }).sourceType).toBe("slack");
@@ -344,6 +382,13 @@ describe("factory domain", () => {
     expect(buildFactoryStarter({ name: "payments", owner: "acme", repository: "pay", harness: "tinkerbot-sandbox", integrations: ["slack"] }).yaml).toContain("harness: tinkerbot-sandbox");
     expect(scoreConversation({ messages: [] }, "ran tests").passed).toBe(false);
     expect(scoreConversation({ messages: [{ role: "assistant", agentId: "review", content: "tb check PASS", at: "now" }] }, "did the agent run tb check?").upgradesVerdict).toBe(false);
+    const symlinkRoot = fs.mkdtempSync(path.join(os.tmpdir(), "tb-factory-tree-"));
+    fs.mkdirSync(path.join(symlinkRoot, ".tinkerbot"), { recursive: true });
+    fs.writeFileSync(path.join(symlinkRoot, ".tinkerbot", "factory.yaml"), "name: safe\nrepositories: [acme/payments]\n");
+    const outside = path.join(symlinkRoot, "outside-secret.txt");
+    fs.writeFileSync(outside, "not factory metadata");
+    fs.symlinkSync(outside, path.join(symlinkRoot, ".tinkerbot", "agent.md"));
+    expect(() => loadFactoryDefinition(symlinkRoot)).toThrow(/symlinks are not allowed/);
   });
 });
 
@@ -594,6 +639,23 @@ describe("factory operating system", () => {
 });
 
 describe("Warp v1alpha1 factory definition", () => {
+  test("self-hosted envelopes are scoped, expiring, and credential-free", () => {
+    expect(selfHostedSecretReady("0123456789abcdef0123456789abcdef")).toBe(true);
+    expect(selfHostedSecretReady("replace_with_a_distinct_hmac_secret_if_self_hosted_workers_are_enabled")).toBe(false);
+    const secret = "self-hosted-secret";
+    const dispatch = createSelfHostedDispatch({ dispatchId: "selfhost:wo:run", executionBoundary: "self_hosted", organizationId: "org_1", factoryId: "fac_1", workOrderId: "wo", runId: "run", repository: "acme/payments", sourceType: "manual", sourceId: "src", definitionDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", harness: "codex", prompt: "Implement it", secret, now: "2030-01-01T00:00:00.000Z" });
+    expect(JSON.stringify(dispatch)).not.toContain(secret);
+    expect(verifySelfHostedDispatch(dispatch, secret, "2030-01-01T00:01:00.000Z")).toMatchObject({ ok: true, payload: { authority: { mayMerge: false } } });
+    expect(verifySelfHostedDispatch(dispatch, "wrong", "2030-01-01T00:01:00.000Z")).toMatchObject({ ok: false, reason: "signature_mismatch" });
+    const completion = createSelfHostedCompletion({ dispatchId: "selfhost:wo:run", executionBoundary: "self_hosted", organizationId: "org_1", factoryId: "fac_1", workOrderId: "wo", runId: "run", repository: "acme/payments", definitionDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", status: "completed", headSha: "abcdef1234567", secret, completedAt: "2030-01-01T00:02:00.000Z" });
+    expect(verifySelfHostedCompletion(completion, secret, "2030-01-01T00:03:00.000Z")).toMatchObject({ ok: true, payload: { status: "completed" } });
+    expect(() => createSelfHostedCompletion({ dispatchId: "selfhost:wo:run", executionBoundary: "self_hosted", organizationId: "org_1", factoryId: "fac_1", workOrderId: "wo", runId: "run", repository: "acme/payments", definitionDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", status: "completed", summary: "sk-test-secret", secret })).toThrow(/invalid/);
+    expect(() => createSelfHostedCompletion({ dispatchId: "selfhost:wo:run", executionBoundary: "self_hosted", organizationId: "org_1", factoryId: "fac_1", workOrderId: "wo", runId: "run", repository: "acme/payments", definitionDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", status: "completed", branch: "main", secret })).toThrow(/invalid/);
+    expect(() => createSelfHostedDispatch({ dispatchId: "selfhost:wo:run", executionBoundary: "self_hosted", organizationId: "org_1", factoryId: "fac_1", workOrderId: "wo", runId: "run", repository: "acme/payments", sourceType: "manual", sourceId: "src", definitionDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", harness: "codex", prompt: "Implement it", secret, ttlSeconds: 0 })).toThrow(/timestamp|TTL/);
+    const unknownField = { ...dispatch, unexpected: "must-not-be-accepted" };
+    expect(verifySelfHostedDispatch(unknownField, secret, "2030-01-01T00:01:00.000Z")).toMatchObject({ ok: false, reason: "unknown_payload_fields" });
+  });
+
   test("parses owner/name repositories, alias, agentDefaults, and declares third-party harnesses safely", () => {
     const definition = parseFactoryDefinition(fs.readFileSync(path.join(process.cwd(), "fixtures/factory/v1alpha1/.tinkerbot/factory.yaml"), "utf8"));
     expect(definition.schemaVersion).toBe("v1alpha1");
@@ -606,6 +668,38 @@ describe("Warp v1alpha1 factory definition", () => {
     expect(external.harnesses.claude).toMatchObject({ id: "claude", command: "claude", protocol: "stdio-json" });
     expect(() => parseFactoryDefinition("schemaVersion: v1alpha1\nname: bad\nrepositories: [acme/pay]\nagentDefaults:\n  model: auto\n  harness:\n    type: oz\n")).toThrow(/both model and harness/);
     expect(() => parseFactoryDefinition("schemaVersion: v1alpha1\nname: dual\nrepositories: [acme/pay]\nintegrations:\n  - type: linear\n  - type: jira\nagentDefaults:\n  model: auto\n")).toThrow(/Linear or Jira/);
+  });
+
+  test("materializes compact external implementation defaults for self-hosted workers", () => {
+    const definition = parseFactoryDefinition(`schemaVersion: v1alpha2
+name: compact
+repositories: [acme/payments]
+agentDefaults:
+  harness: codex
+runtime:
+  controlPlane: hosted
+  runner:
+    type: self_hosted
+    workerHost: self_hosted:runner-1
+`);
+    expect(definition.agents.find((agent) => agent.id === "implementation")).toMatchObject({ harness: "codex", agentType: "IMPLEMENT" });
+    expect(validateFactoryDefinition(definition).filter((error) => /external implementation harness/.test(error))).toHaveLength(0);
+    const mismatched = parseFactoryDefinition(`schemaVersion: v1alpha2
+name: mismatched
+repositories: [acme/payments]
+harnesses:
+  codex:
+    workerHost: self_hosted:runner-2
+runtime:
+  controlPlane: hosted
+  runner:
+    type: self_hosted
+    workerHost: self_hosted:runner-1
+agents:
+  - id: implementation
+    harness: codex
+`);
+    expect(validateFactoryDefinition(mismatched).some((error) => /workerHost/.test(error))).toBe(true);
   });
 
   test("loads agent frontmatter, automations, and linux runners from the tree", () => {

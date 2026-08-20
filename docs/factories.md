@@ -31,6 +31,8 @@ The former GitHub App template is deprecated and retained for historical migrati
 
 `factory.yaml` accepts the current `version: 1` shape, Warp-shaped `schemaVersion: v1alpha1`, and additive `schemaVersion: v1alpha2` with a `runtime` profile (`collaboration`, `controlPlane`, `pipeline`, `runner`, `workerHost`, `inference.credentialRef`, `approval`, `sync`). Older schemas parse with hosted defaults. `agentDefaults` may set `model` or `harness`, not both. Built-in harnesses are `tinkerbot-sandbox`, `github_actions`, `none`, and `default`; customer-owned harness IDs such as Claude Code, Codex, Gemini, Warp, or an internal wrapper are supported only with a local or explicitly self-hosted execution boundary. Hosted Workers never execute customer harness commands. Hosted BYOK/local inference likewise requires `runner.type: self_hosted` plus `workerHost: self_hosted[:worker-id]`; YAML stores credential refs, never raw keys.
 
+For compact definitions, an external `agentDefaults.harness` is materialized as the implementation agent. A `self_hosted` runner without an external implementation binding is rejected during validation instead of dispatching an unexecutable built-in default. This keeps the local CLI, hosted planner, and customer worker on the same harness contract.
+
 Agent Markdown uses YAML frontmatter (`agentType`, `model` or `harness`, `workerHost`, `secrets`, `mcpServers`) plus a durable prompt body. Exactly one `FOREMAN` (`MAIN` is an alias) is required when the tree declares agent types. `VERIFY` review notes cannot change `tb check`.
 
 For a customer harness, define a command without shell interpolation and bind only credential references:
@@ -41,6 +43,7 @@ harnesses:
     command: codex
     args: ["--request", "${requestFile}", "--worktree", "${worktree}"]
     protocol: stdio-json
+    network: egress # optional; default is none
     env:
       OPENAI_API_KEY: env:OPENAI_API_KEY
 agents:
@@ -57,7 +60,15 @@ runtime:
     credentialRef: env:OPENAI_API_KEY
 ```
 
-`tb run --local --allow-external-harness` is the explicit local opt-in. Hosted mode publishes a credential-free handoff to the optional `SELF_HOSTED_WORK` queue; the worker must return through the existing deterministic verification/OIDC path. A queue handoff never grants merge, release, or verdict authority.
+`tb run --local --allow-external-harness` is the explicit local opt-in. Hosted mode publishes a credential-free, HMAC-signed handoff to the optional `SELF_HOSTED_WORK` queue or configured HTTPS `SELF_HOSTED_WORK_ENDPOINT` (development can fall back to the session key; production requires a dedicated, non-placeholder `SELF_HOSTED_WORK_SECRET` of at least 32 UTF-8 bytes); the worker must return through the existing deterministic verification/OIDC path. A handoff never grants merge, release, or verdict authority, and duplicate completion delivery is idempotently claimed by the control plane.
+
+The hosted completion seam is `POST /self-hosted/complete`. A customer worker must verify and sign the versioned envelope with the same HMAC secret (the portable helpers are `createSelfHostedCompletion` and `verifySelfHostedCompletion`), echo the exact `definitionDigest` it executed, identify the deterministic `tinkerbot/<work-order-prefix>` branch (or a commit/pull request), and omit verification verdicts. The control plane rejects tenant/run/definition/branch mismatches, stale signatures, credentials in summaries, and replayed dispatch IDs; it then resumes the normal review → deterministic verification → human release path. Hosted queue, workflow, MCP, and scheduled-maintenance deliveries are serialized through the Foreman Durable Object by organization and work-order/source aggregate before the run mutates durable state. Missing repository bindings fail closed before any implementation runner is opened.
+
+Customer queue/HTTP consumers can use `runSelfHostedDispatch` from `@tinkerbot/local-runtime`: it verifies the dispatch, requires the caller to pass the digest of the fully loaded local factory tree, resolves the locally configured harness, requires an explicit Docker or opted-in process sandbox, captures a bounded commit reference, and posts the signed completion. The consumer should acknowledge its queue message only after this function resolves; a failed completion POST should be retried without treating the harness output as a verification verdict.
+
+For a one-shot worker on a customer host, `tinkerbot-factory worker --root /path/to/repo --completion-url https://control.example/self-hosted/complete --secret-ref env:TINKERBOT_SELF_HOSTED_SECRET` reads one dispatch from stdin (or `--input dispatch.json`), loads the repository's harness definitions, selects Docker, and invokes the same adapter. `--allow-process-runner` is an explicit non-isolated fallback; production workers should use Docker or another independently hardened sandbox.
+
+External harness network access is denied by default. Set `network: egress` only for a harness that must call its provider; Docker still runs read-only, drops all Linux capabilities, uses no-new-privileges, and injects only the credential references declared for that harness. The host process runner is explicitly warned and cannot enforce `network: none`; it refuses a default-denied external harness unless the definition explicitly opts into `network: egress`.
 
 Automations declare `triggers` (`github`, `gitlab`, `slack`, `linear`, `jira`, `schedule`, `mcp`, `manual`). Filters AND together. GitLab **merge request and issue** events are intake only; pipeline, job, deployment, and system hooks are rejected. Tinkerbot never merges a GitLab MR. Linear and Jira cannot both be attached. Filters choose which events start work; they do not expand what a running agent can reach.
 

@@ -7,6 +7,7 @@ import type { CostEstimate, ExecutionPlan, ProviderUsage } from "../../factory/s
 import type { EvalAttempt, EvalSuite } from "../../factory/src/evals";
 import { assertFactoryEventAuthority, graphEventForWorkOrderTransition, projectFactoryEvents, type AftercareRecord, type FactoryCommand, type FactoryEvent, type FactoryProjection, type WorkOrder, type WorkOrderState } from "../../factory/src";
 import { openSqliteDatabase, SQLITE_MAGIC, type SqliteDatabase } from "./sqlite-engine";
+import { assertNoSecretInPayload } from "./credentials";
 
 export const LOCAL_DB_SCHEMA_VERSION = 16;
 
@@ -291,6 +292,7 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
    */
   appendFactoryEventSync(event: FactoryEvent): void {
     assertFactoryEventAuthority(event);
+    assertNoSecretInPayload({ payload: event.payload, externalReferences: event.externalReferences });
     const result = this.database.prepare("INSERT OR IGNORE INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, policy_version, provenance, external_references_json, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
       event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
     ) as { changes?: number };
@@ -585,6 +587,7 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
   }
 
   override async appendFactoryEvent(event: FactoryEvent): Promise<void> {
+    assertNoSecretInPayload({ payload: event.payload, externalReferences: event.externalReferences });
     await super.appendFactoryEvent(event);
     try {
       this.database.prepare("INSERT INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, policy_version, provenance, external_references_json, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(

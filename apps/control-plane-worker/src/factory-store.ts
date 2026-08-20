@@ -8,6 +8,7 @@ import {
   classifyActivityColumn,
   classifyWorkOrderGroup,
   createWorkOrder,
+  containsRawCredentials,
   graphEventForWorkOrderTransition,
   factoryDashboardMetrics,
   factoryDefinitionDigest,
@@ -51,14 +52,27 @@ export class D1FactoryStore {
   async putFactory(input: { factoryId: string; organizationId: string; name: string; yaml?: string; files?: Array<{ path: string; contents: string }>; now?: string }): Promise<{ factoryId: string; digest?: string }> {
     const now = input.now ?? new Date().toISOString();
     let digest: string | undefined;
+    const bytes = (value: string): number => new TextEncoder().encode(value).byteLength;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(input.factoryId)) throw new Error("Factory id is invalid.");
+    if (!/^[A-Za-z0-9][A-Za-z0-9 ._:-]{0,199}$/.test(input.name.trim())) throw new Error("Factory name is invalid.");
+    const existing = await this.getFactory(input.factoryId);
+    if (existing && existing.organizationId !== input.organizationId) throw new Error("Factory belongs to another organization.");
+    if (input.yaml !== undefined && (typeof input.yaml !== "string" || input.yaml.length === 0 || bytes(input.yaml) > 512_000)) throw new Error("Factory YAML must be between 1 and 512000 bytes.");
+    const normalizedFiles = input.files?.map((file) => ({ ...file, path: file.path.replaceAll("\\", "/") }));
+    if (normalizedFiles && (normalizedFiles.length > 128 || normalizedFiles.some((file) => !file || typeof file.path !== "string" || !file.path || file.path.length > 512 || bytes(file.path) > 2_048 || file.path.includes("\0") || file.path.startsWith("/") || file.path.split("/").includes("..") || typeof file.contents !== "string" || bytes(file.contents) > 512_000))) throw new Error("Factory files exceed the allowed count, path, or content limits.");
+    if (normalizedFiles && new Set(normalizedFiles.map((file) => file.path)).size !== normalizedFiles.length) throw new Error("Factory file paths must be unique.");
+    if (normalizedFiles && normalizedFiles.reduce((total, file) => total + bytes(file.contents), 0) > 4_000_000) throw new Error("Factory files exceed the 4 MB content limit.");
+    if ((input.yaml !== undefined || normalizedFiles) && containsRawCredentials({ yaml: input.yaml, files: normalizedFiles })) throw new Error("Factory definitions must not contain raw credentials.");
     if (input.yaml) {
       let definition = parseFactoryDefinition(input.yaml);
-      if (input.files?.length) definition = applyFactoryTree(definition, input.files);
+      const definitionFile = normalizedFiles?.find((file) => file.path === ".tinkerbot/factory.yaml");
+      if (definitionFile && definitionFile.contents !== input.yaml) throw new Error("Factory YAML must match the .tinkerbot/factory.yaml file payload.");
+      if (normalizedFiles?.length) definition = applyFactoryTree(definition, normalizedFiles);
       const definitionErrors = validateFactoryDefinition(definition, { requireForeman: definition.schemaVersion === "v1alpha1" || definition.agents.some((agent) => agent.agentType === "FOREMAN") });
       if (definitionErrors.length) throw new Error(`Invalid factory definition: ${definitionErrors.join("; ")}`);
       digest = factoryDefinitionDigest(definition);
       const definitionId = crypto.randomUUID();
-      await this.database.prepare("INSERT INTO tinkerbot_factory_definitions (definition_id, factory_id, digest, yaml, files_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(definitionId, input.factoryId, digest, input.yaml, input.files?.length ? JSON.stringify(input.files) : null, now).run();
+      await this.database.prepare("INSERT INTO tinkerbot_factory_definitions (definition_id, factory_id, digest, yaml, files_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(definitionId, input.factoryId, digest, input.yaml, normalizedFiles?.length ? JSON.stringify(normalizedFiles) : null, now).run();
       await this.database.prepare("INSERT INTO tinkerbot_factory_definition_versions (version_id, factory_id, definition_id, version, digest, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(crypto.randomUUID(), input.factoryId, definitionId, Date.now(), digest, now).run();
       await this.replaceAutomations(input.factoryId, definition.automations ?? [], now);
     }
@@ -226,10 +240,10 @@ export class D1FactoryStore {
     return (result.results ?? []).map((row) => ({ id: row.secret_id, name: row.name, status: row.status, owner: row.owner ?? undefined, references: row.references_text ?? undefined, updatedAt: row.updated_at }));
   }
 
-  async createSecretMetadata(input: { organizationId: string; name: string; owner: string; now: string }): Promise<WorkspaceSecretMetadata> {
+  async createSecretMetadata(input: { organizationId: string; name: string; reference: string; owner: string; now: string }): Promise<WorkspaceSecretMetadata> {
     const id = crypto.randomUUID();
-    await this.database.prepare("INSERT INTO tinkerbot_secret_metadata (secret_id, organization_id, name, status, owner, references_text, updated_at) VALUES (?1, ?2, ?3, 'managed', ?4, 'External secret provider required', ?5)").bind(id, input.organizationId, input.name, input.owner, input.now).run();
-    return { id, name: input.name, status: "managed", owner: input.owner, references: "External secret provider required", updatedAt: input.now };
+    await this.database.prepare("INSERT INTO tinkerbot_secret_metadata (secret_id, organization_id, name, status, owner, references_text, updated_at) VALUES (?1, ?2, ?3, 'managed', ?4, ?5, ?6)").bind(id, input.organizationId, input.name, input.owner, input.reference, input.now).run();
+    return { id, name: input.name, status: "managed", owner: input.owner, references: input.reference, updatedAt: input.now };
   }
 
   async createIntegrationMetadata(input: { organizationId: string; name: string; kind: string; now: string }): Promise<WorkspaceIntegration> {
@@ -272,6 +286,12 @@ export class D1FactoryStore {
   async getWorkOrder(workOrderId: string): Promise<WorkOrder | null> {
     const row = await this.database.prepare("SELECT work_order_id, factory_id, organization_id, source_type, source_id, repository_id, issue_or_pull_request, intent, acceptance_criteria, policy_version, definition_version, definition_digest, current_stage, status, actor, created_at, updated_at, product_id, line_id, cell_id, owner, risk, autonomy_mode, output_kind, policy_json, dependencies_json, held_by, verification_verdict, review_assessment, release_decision, waiver_json FROM tinkerbot_work_orders WHERE work_order_id = ?1").bind(workOrderId).first<Record<string, string>>();
     return row ? rowToWorkOrder(row) : null;
+  }
+
+  /** Tenant-scoped work-order lookup for control-plane adapters (MCP, API, and workers). */
+  async getWorkOrderForOrganization(workOrderId: string, organizationId: string): Promise<WorkOrder | null> {
+    const order = await this.getWorkOrder(workOrderId);
+    return order && order.organizationId === organizationId ? order : null;
   }
 
   async insertWorkOrder(order: WorkOrder): Promise<void> {
@@ -320,6 +340,19 @@ export class D1FactoryStore {
     await this.database.prepare("INSERT INTO tinkerbot_factory_runs (run_id, work_order_id, factory_id, definition_digest, status, started_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)").bind(run.runId, run.workOrderId, run.factoryId, run.definitionDigest, run.status, run.now).run();
   }
 
+  async updateRun(runId: string, status: string, now: string): Promise<void> {
+    const terminal = status !== "running" && !status.startsWith("waiting");
+    await this.database.prepare("UPDATE tinkerbot_factory_runs SET status = ?1, completed_at = CASE WHEN ?2 = 1 THEN COALESCE(completed_at, ?3) ELSE completed_at END, updated_at = ?3 WHERE run_id = ?4").bind(status, terminal ? 1 : 0, now, runId).run();
+  }
+
+  async updateRunDefinition(runId: string, definitionDigest: string, now: string): Promise<void> {
+    await this.database.prepare("UPDATE tinkerbot_factory_runs SET definition_digest = ?1, updated_at = ?2 WHERE run_id = ?3").bind(definitionDigest, now, runId).run();
+  }
+
+  async updateWorkOrderDefinition(workOrderId: string, definitionDigest: string, now: string): Promise<void> {
+    await this.database.prepare("UPDATE tinkerbot_work_orders SET definition_digest = ?1, updated_at = ?2 WHERE work_order_id = ?3").bind(definitionDigest, now, workOrderId).run();
+  }
+
   async getRun(runId: string): Promise<Record<string, string> | null> {
     return this.database.prepare("SELECT run_id, work_order_id, factory_id, definition_digest, status, started_at, completed_at, updated_at FROM tinkerbot_factory_runs WHERE run_id = ?1").bind(runId).first<Record<string, string>>();
   }
@@ -344,8 +377,17 @@ export class D1FactoryStore {
     return result.results ?? [];
   }
 
-  async insertStage(runId: string, stage: string, status: string, summary: string, now: string): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_run_stages (run_stage_id, run_id, stage, status, summary, started_at, completed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)").bind(crypto.randomUUID(), runId, stage, status, summary, now).run();
+  async insertStage(runId: string, stage: string, status: string, summary: string, now: string): Promise<boolean> {
+    // The stable key makes concurrent queue deliveries converge on one row;
+    // the runtime can then avoid issuing a second receipt/cost record when it
+    // loses the insert race.
+    const result = await this.database.prepare("INSERT INTO tinkerbot_run_stages (run_stage_id, run_id, stage, status, summary, started_at, completed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) ON CONFLICT(run_stage_id) DO NOTHING").bind(`${runId}:${stage}`, runId, stage, status, summary, now).run() as { meta?: { changes?: number } };
+    return result.meta?.changes !== 0;
+  }
+
+  /** Complete an already-persisted stage without appending a duplicate row. */
+  async updateStage(runId: string, stage: string, status: string, summary: string, now: string): Promise<void> {
+    await this.database.prepare("UPDATE tinkerbot_run_stages SET status = ?1, summary = ?2, completed_at = ?3 WHERE run_id = ?4 AND stage = ?5").bind(status, summary, now, runId, stage).run();
   }
 
   async insertUsage(event: { organizationId: string; factoryId?: string; runId?: string; kind: string; tokens: number; costCents: number; now: string }): Promise<void> {
@@ -555,9 +597,13 @@ export class D1FactoryStore {
     await this.database.prepare("INSERT INTO tinkerbot_improvement_proposals (proposal_id, factory_id, title, evidence_json, proposed_changes_json, expected_effect, kind, status, benchmark_json, human_approved, steward_actor, auto_merge, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'draft', '[]', 0, ?8, 0, ?9, ?9)").bind(input.proposalId, input.factoryId, input.title, JSON.stringify(input.evidence), JSON.stringify(input.proposedChanges), input.expectedEffect, input.kind, input.stewardActor ?? null, input.now).run();
   }
 
-  async approveProposal(proposalId: string, actor: string, now: string): Promise<{ ok: true } | { ok: false; reason: string }> {
-    const row = await this.database.prepare("SELECT proposal_id, steward_actor, auto_merge, status FROM tinkerbot_improvement_proposals WHERE proposal_id = ?1").bind(proposalId).first<{ proposal_id: string; steward_actor?: string | null; auto_merge: number; status: string }>();
+  async approveProposal(proposalId: string, actor: string, now: string, organizationId?: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const row = await this.database.prepare("SELECT proposal_id, factory_id, steward_actor, auto_merge, status FROM tinkerbot_improvement_proposals WHERE proposal_id = ?1").bind(proposalId).first<{ proposal_id: string; factory_id: string; steward_actor?: string | null; auto_merge: number; status: string }>();
     if (!row) return { ok: false, reason: "not_found" };
+    if (organizationId) {
+      const factory = await this.getFactory(row.factory_id);
+      if (!factory || factory.organizationId !== organizationId) return { ok: false, reason: "not_found" };
+    }
     if (row.auto_merge) return { ok: false, reason: "auto_merge_forbidden" };
     if (row.steward_actor && row.steward_actor === actor) return { ok: false, reason: "steward_cannot_self_approve" };
     await this.database.prepare("UPDATE tinkerbot_improvement_proposals SET human_approved = 1, status = 'approved', updated_at = ?1 WHERE proposal_id = ?2").bind(now, proposalId).run();
@@ -600,6 +646,17 @@ export class D1FactoryStore {
     await this.database.prepare("INSERT INTO tinkerbot_execution_plans (plan_id, work_order_id, run_id, origin, profile_json, plan_json, selected_pipeline, escalation_reason, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(plan_id) DO UPDATE SET plan_json = excluded.plan_json, escalation_reason = excluded.escalation_reason").bind(plan.planId, plan.workOrderId ?? null, null, plan.origin, JSON.stringify(plan.profile), JSON.stringify(plan), plan.selectedPipeline, plan.escalationReason ?? null, plan.createdAt).run();
   }
 
+  async getExecutionPlanForWorkOrder(workOrderId: string): Promise<import("../../../packages/factory/src/runtime").ExecutionPlan | null> {
+    const row = await this.database.prepare("SELECT plan_json FROM tinkerbot_execution_plans WHERE work_order_id = ?1 ORDER BY created_at DESC LIMIT 1").bind(workOrderId).first<{ plan_json?: string | null }>();
+    if (!row?.plan_json) return null;
+    try {
+      const plan = JSON.parse(row.plan_json) as import("../../../packages/factory/src/runtime").ExecutionPlan;
+      return plan && typeof plan === "object" && typeof plan.planId === "string" && plan.workOrderId === workOrderId ? plan : null;
+    } catch {
+      return null;
+    }
+  }
+
   async putCostEstimate(planId: string, estimate: import("../../../packages/factory/src/runtime").CostEstimate): Promise<void> {
     await this.database.prepare("INSERT INTO tinkerbot_cost_estimates (plan_id, catalog_version, estimate_json, created_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(plan_id) DO UPDATE SET estimate_json = excluded.estimate_json").bind(planId, estimate.catalogVersion, JSON.stringify(estimate), new Date().toISOString()).run();
   }
@@ -614,6 +671,9 @@ export class D1FactoryStore {
     if (kind === "factory-graph-event" || payload.event) {
       const event = (payload.event ?? payload) as FactoryEvent;
       if (!event || typeof event !== "object" || typeof event.eventId !== "string" || typeof event.aggregateId !== "string" || event.organizationId !== input.organizationId) throw new Error("invalid_factory_graph_event");
+      const factory = typeof event.factoryId === "string" ? await this.getFactory(event.factoryId) : null;
+      if (!factory || factory.organizationId !== input.organizationId) throw new Error("factory_not_found_for_organization");
+      if (event.aggregateType === "work_order" && !await this.getWorkOrderForOrganization(event.aggregateId, input.organizationId)) throw new Error("work_order_not_found_for_organization");
       assertFactoryEventAuthority(event);
       await this.appendFactoryEvent(event);
     }
@@ -652,11 +712,22 @@ export class D1FactoryStore {
     return result.results ?? [];
   }
 
-  async appendFactoryEvent(event: FactoryEvent): Promise<void> {
+  private async persistFactoryEvent(event: FactoryEvent): Promise<boolean> {
     assertFactoryEventAuthority(event);
-    await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, schema_version, policy_version, provenance, external_references_json, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)").bind(
+    if (containsRawCredentials({ payload: event.payload, externalReferences: event.externalReferences })) throw new Error("Factory graph events must not contain raw credentials.");
+    const result = await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, schema_version, policy_version, provenance, external_references_json, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)").bind(
       event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.schemaVersion, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
-    ).run();
+    ).run() as { meta?: { changes?: number } };
+    return result.meta?.changes !== 0;
+  }
+
+  async appendFactoryEvent(event: FactoryEvent): Promise<void> {
+    await this.persistFactoryEvent(event);
+  }
+
+  /** Insert an event and report whether this request won the idempotency race. */
+  async appendFactoryEventOnce(event: FactoryEvent): Promise<boolean> {
+    return this.persistFactoryEvent(event);
   }
 
   async listFactoryEvents(aggregateId: string, organizationId: string): Promise<FactoryEvent[]> {

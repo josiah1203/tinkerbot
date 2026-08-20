@@ -68,7 +68,7 @@ Slash (master, not the child CLI):
   /merge and /pass are rejected.
 
 Nested CLIs use their own OAuth. Tinkerbot does not store vendor tokens.
-Hosted factory inference is included on your plan. YAML harness claude/codex/gemini/oz stay forbidden.
+Hosted factory inference is included on your plan. Customer harnesses (Claude Code, Codex, Gemini, Warp, or an internal wrapper) require an explicit local or self-hosted execution boundary; hosted Workers never execute them.
 `;
 
 export function createMasterState(input: { repo: string; base: string; head: string; org?: string; workOrderId?: string; agent?: AgentId }): MasterState {

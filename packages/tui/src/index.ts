@@ -141,5 +141,13 @@ export async function runMasterTuiInteractive(input: { workOrderId?: string; age
 }
 
 export function listAgentsJson(env: NodeJS.ProcessEnv = process.env): string {
-  return `${JSON.stringify({ agents: detectAgents(env), storesVendorTokens: false, hostedHarnessesForbidden: ["claude", "codex", "gemini", "oz"] }, null, 2)}\n`;
+  return `${JSON.stringify({
+    agents: detectAgents(env),
+    storesVendorTokens: false,
+    // Customer-owned CLIs are supported through an explicitly configured
+    // local/self-hosted boundary. The hosted control-plane Worker never runs
+    // these binaries, so “available” is not the same as “hosted execution”.
+    hostedHarnessesRequireExplicitBoundary: ["claude", "codex", "gemini", "oz"],
+    hostedHarnessesForbiddenOnWorkers: ["claude", "codex", "gemini", "oz"],
+  }, null, 2)}\n`;
 }

@@ -7,6 +7,7 @@ export const BUILTIN_HARNESSES = ["tinkerbot-sandbox", "github_actions", "none",
 export const EXTERNAL_HARNESSES = ["codex", "claude", "claude-code", "gemini", "oz", "warp", "warp-agent"] as const;
 
 export type HarnessProtocol = "stdio-json" | "text";
+export type HarnessNetwork = "none" | "egress";
 
 export interface FactoryHarnessDefinition {
   id: string;
@@ -14,6 +15,8 @@ export interface FactoryHarnessDefinition {
   command: string;
   args: string[];
   protocol: HarnessProtocol;
+  /** Network is denied by default; `egress` is an explicit customer opt-in for provider-backed CLIs. */
+  network?: HarnessNetwork;
   /** `local` or `self_hosted[:worker-id]`; hosted Workers reject external harness execution. */
   workerHost?: string;
   /** Environment variable -> credential reference. Values are never stored in a definition. */
@@ -62,7 +65,7 @@ export function defaultHarnessDefinition(idInput: string): FactoryHarnessDefinit
 
 function parseCommand(value: unknown, context: string, fallback: string): string {
   const command = typeof value === "string" && value.trim() ? value.trim() : fallback;
-  if (command.length > 256 || !COMMAND_PATTERN.test(command)) throw new Error(`${context} command must be a single executable token without control characters or shell syntax.`);
+  if (command.length > 256 || command.startsWith("-") || !COMMAND_PATTERN.test(command)) throw new Error(`${context} command must be a single executable token without control characters or shell syntax.`);
   return command;
 }
 
@@ -82,6 +85,7 @@ function parseEnvironment(value: unknown, context: string): Record<string, strin
   const env: Record<string, string> = {};
   for (const [name, ref] of Object.entries(raw)) {
     if (!/^[A-Z][A-Z0-9_]{0,127}$/.test(name)) throw new Error(`${context} environment key '${name}' is invalid.`);
+    if (["PATH", "HOME", "PWD", "LD_PRELOAD", "NODE_OPTIONS"].includes(name)) throw new Error(`${context} environment key '${name}' is reserved by the sandbox.`);
     if (typeof ref !== "string") throw new Error(`${context}.${name} must be a credential reference.`);
     env[name] = assertCredentialRef(ref, `${context}.${name}`) ?? "";
   }
@@ -94,6 +98,8 @@ export function parseHarnessDefinition(idInput: string, rawInput: unknown): Fact
   const fallback = defaultHarnessDefinition(id);
   const protocol = raw.protocol == null ? fallback.protocol : raw.protocol;
   if (protocol !== "stdio-json" && protocol !== "text") throw new Error(`Harness ${id} protocol must be stdio-json or text.`);
+  const network = raw.network == null ? "none" : raw.network;
+  if (network !== "none" && network !== "egress") throw new Error(`Harness ${id} network must be none or egress.`);
   const timeoutSeconds = Number(raw.timeoutSeconds ?? fallback.timeoutSeconds);
   if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 86_400) throw new Error(`Harness ${id} timeoutSeconds must be between 1 and 86400.`);
   return {
@@ -101,6 +107,7 @@ export function parseHarnessDefinition(idInput: string, rawInput: unknown): Fact
     command: parseCommand(raw.command, `Harness ${id}`, fallback.command),
     args: parseArgs(raw.args, `Harness ${id}`),
     protocol,
+    network,
     workerHost: assertHarnessWorkerHost(raw.workerHost, `Harness ${id}`),
     env: parseEnvironment(raw.env ?? raw.environment, `Harness ${id}.env`),
     timeoutSeconds,
@@ -152,6 +159,15 @@ export function validateHarnessBindings(input: { agents: Array<{ id: string; har
     }
     const selfHosted = input.controlPlane === "local" || (input.runnerType === "self_hosted" && isSelfHostedWorkerHost(input.runtimeWorkerHost));
     if (!selfHosted) errors.push(`Agent ${agent.id} uses customer harness '${agent.harness}'; hosted Workers require runner.type self_hosted or a local control plane.`);
+    // A hosted self-hosted factory has one explicit worker identity. Reject a
+    // harness/agent binding that points at a different worker so a queue or
+    // HTTPS adapter cannot execute the reviewed definition on the wrong host.
+    if (input.controlPlane === "hosted" && input.runnerType === "self_hosted") {
+      const target = input.runtimeWorkerHost;
+      if (!isSelfHostedWorkerHost(target)) continue;
+      if (agent.workerHost && agent.workerHost !== target) errors.push(`Agent ${agent.id} workerHost must match runtime workerHost '${target}'.`);
+      if (binding.workerHost && binding.workerHost !== target) errors.push(`Harness '${agent.harness}' workerHost must match runtime workerHost '${target}'.`);
+    }
   }
   return errors;
 }

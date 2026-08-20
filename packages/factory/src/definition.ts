@@ -72,6 +72,10 @@ export interface FactoryDashboardMetrics {
   merged: number;
   blocked: number;
   waiting: number;
+  /** Read-model counts used by the control-plane UI. Kept optional for legacy callers. */
+  inProgress?: number;
+  awaitingReview?: number;
+  released?: number;
   autonomyShare: number | null;
   caption: string;
 }

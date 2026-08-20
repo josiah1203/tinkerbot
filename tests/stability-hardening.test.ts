@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { DEFAULT_CONFIG, calculateVerdict, finalizeReport, findingFingerprint, resolveRepositoryPath, tokenizeCommand } from "../packages/core/src";
+import { DEFAULT_CONFIG, calculateVerdict, finalizeReport, findingFingerprint, redactSecrets, resolveRepositoryPath, tokenizeCommand } from "../packages/core/src";
 import { makeTempWorktree, parseUnifiedDiff, runCommandAtRevision } from "../packages/git/src";
 import { parseIstanbulJson, parseLcov } from "../packages/coverage/src";
 import { parseArtifact, loadArtifact } from "../packages/artifacts/src";
@@ -52,6 +52,7 @@ test("safe command tokenization preserves quoted arguments and rejects shell ope
   expect(tokenizeCommand("pnpm test --run")).toEqual(["pnpm", "test", "--run"]);
   expect(() => tokenizeCommand("node -e 'process.exit(1)'; touch leaked")).toThrow(/shell control/);
   expect(() => tokenizeCommand('node -e "unterminated')).toThrow(/unterminated/);
+  expect(redactSecrets("github_pat_abcdefghijklmnop xoxb-abcdefghijklmnop")).toBe("[REDACTED] [REDACTED]");
 });
 
 test("repository paths reject traversal and symlink escapes", () => {

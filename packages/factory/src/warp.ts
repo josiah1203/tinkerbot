@@ -38,7 +38,10 @@ interface WorkOrder {
 }
 
 function sanitizeUntrustedPromptInput(value: string, limit = 8_000): string {
-  return value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ").replace(/(password|secret|token|api[_-]?key)\s*[:=]\s*\S+/gi, "[redacted]").replace(/gh[ps]_[A-Za-z0-9_]{8,}/g, "[redacted]").slice(0, limit);
+  return value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
+    .replace(/(password|secret|token|api[_-]?key)\s*[:=]\s*\S+/gi, "[redacted]")
+    .replace(/(?:sk-[A-Za-z0-9_-]{8,}|sk_(?:live|test)_[A-Za-z0-9_-]{8,}|gh(?:p|s|o|u|r)_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|whsec_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|hf_[A-Za-z0-9_-]{8,})/gi, "[redacted]")
+    .slice(0, limit);
 }
 
 export const AI_GATEWAY_ID = "tinkerbot-factory";
@@ -212,36 +215,52 @@ export function sandboxIdForWorkOrder(workOrderId: string): string {
 }
 
 export function implementBranchName(workOrderId: string): string {
-  return `${IMPLEMENT_BRANCH_PREFIX}${workOrderId.slice(0, 8)}`;
+  // Preserve the work-order identity. A short prefix is readable but lets
+  // unrelated UUIDs collide after enough cells have been created. Normal IDs
+  // fit under Git's ref limit; long caller-supplied IDs receive a stable hash
+  // suffix so the branch remains deterministic without becoming unbounded.
+  const normalized = workOrderId.replace(/[^A-Za-z0-9_-]/g, "");
+  const suffix = normalized.length <= 48
+    ? normalized
+    : `${normalized.slice(0, 31)}-${crypto.createHash("sha256").update(workOrderId).digest("hex").slice(0, 16)}`;
+  return `${IMPLEMENT_BRANCH_PREFIX}${suffix || "work"}`;
 }
 
 export function assertSandboxPushAllowed(ref: string): { ok: true } | { ok: false; reason: string } {
   if (ref === "main" || ref === "master" || ref === "production" || ref.startsWith("release/")) return { ok: false, reason: "Agents cannot push to a protected default or release branch." };
-  if (!ref.startsWith(IMPLEMENT_BRANCH_PREFIX)) return { ok: false, reason: "Sandbox git push is limited to tinkerbot/* branches." };
+  if (!/^tinkerbot\/[A-Za-z0-9_-]{1,64}$/.test(ref)) return { ok: false, reason: "Sandbox git push is limited to safe tinkerbot/* branches." };
   return { ok: true };
 }
 
 export interface SandboxExecStep {
   argv: string[];
   cwd?: string;
+  /** Explicit non-secret environment additions for a step; never interpolated into a shell command. */
+  env?: Record<string, string>;
   timeout?: number;
   purpose: "clone" | "branch" | "edit" | "test" | "commit" | "push" | "preview";
 }
 
 export function sandboxImplementPlan(input: { repository: string; workOrderId: string; baseRef?: string; intent?: string }): { sandboxId: string; branch: string; steps: SandboxExecStep[]; mergeForbidden: true } {
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(input.repository)) throw new Error("Sandbox repository must be an owner/name identifier.");
+  const baseRef = input.baseRef ?? "main";
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(baseRef) || baseRef.includes("..")) throw new Error("Sandbox baseRef is invalid.");
   const branch = implementBranchName(input.workOrderId);
+  const [owner, name] = input.repository.split("/");
+  const remote = `https://github.com/${encodeURIComponent(owner!)}/${encodeURIComponent(name!)}.git`;
   const cwd = "/workspace/repo";
   return {
     sandboxId: sandboxIdForWorkOrder(input.workOrderId),
     branch,
     mergeForbidden: true,
     steps: [
-      { purpose: "clone", argv: ["/bin/bash", "-lc", `git clone --depth 50 https://github.com/${input.repository}.git repo`], cwd: "/workspace" },
-      { purpose: "branch", argv: ["/bin/bash", "-lc", `git checkout -B ${branch} origin/${input.baseRef ?? "main"}`], cwd },
-      { purpose: "edit", argv: ["/bin/bash", "-lc", `printf '%s\\n' ${JSON.stringify(sanitizeUntrustedPromptInput(input.intent ?? "implement the approved spec"))} > /tmp/tinkerbot-task.txt`] },
+      { purpose: "clone", argv: ["git", "clone", "--depth", "50", remote, "repo"], cwd: "/workspace" },
+      { purpose: "branch", argv: ["git", "checkout", "-B", branch, `origin/${baseRef}`], cwd },
+      { purpose: "edit", argv: ["/bin/sh", "-c", "printf '%s\\n' \"$TINKERBOT_TASK\" > /tmp/tinkerbot-task.txt"], env: { TINKERBOT_TASK: sanitizeUntrustedPromptInput(input.intent ?? "implement the approved spec") } },
       { purpose: "test", argv: ["/bin/bash", "-lc", "if [ -f package.json ]; then pnpm test --if-present; elif [ -f pytest.ini ] || [ -d tests ]; then python -m pytest -q; else true; fi"], cwd, timeout: 900_000 },
-      { purpose: "commit", argv: ["/bin/bash", "-lc", `git add -A && git commit -m "tinkerbot: ${input.workOrderId.slice(0, 8)}" --allow-empty`], cwd },
-      { purpose: "push", argv: ["/bin/bash", "-lc", `git push -u origin ${branch}`], cwd },
+      { purpose: "commit", argv: ["git", "add", "-A"], cwd },
+      { purpose: "commit", argv: ["git", "commit", "-m", `tinkerbot: ${branch.slice("tinkerbot/".length)}`, "--allow-empty"], cwd },
+      { purpose: "push", argv: ["git", "push", "-u", "origin", branch], cwd },
     ],
   };
 }
@@ -252,13 +271,15 @@ export interface SandboxPort {
 
 export async function runImplementSandbox(port: SandboxPort, plan: ReturnType<typeof sandboxImplementPlan>, env: Record<string, string> = {}): Promise<{ status: "ok" | "unknown" | "blocked"; summary: string; logs: string; branch: string }> {
   const logs: string[] = [];
+  const branchAllowed = assertSandboxPushAllowed(plan.branch);
+  if (!branchAllowed.ok) return { status: "blocked", summary: branchAllowed.reason, logs: "", branch: plan.branch };
   for (const step of plan.steps) {
     if (step.purpose === "push") {
       const allowed = assertSandboxPushAllowed(plan.branch);
       if (!allowed.ok) return { status: "blocked", summary: allowed.reason, logs: logs.join("\n"), branch: plan.branch };
     }
     try {
-      const result = await port.exec(step.argv, { cwd: step.cwd, env, timeout: step.timeout });
+      const result = await port.exec(step.argv, { cwd: step.cwd, env: { ...env, ...(step.env ?? {}) }, timeout: step.timeout });
       logs.push(`$ ${step.argv.join(" ")}\n${result.stdout}`.slice(0, 4_000));
       if (result.exitCode !== 0 && step.purpose !== "test") return { status: "unknown", summary: `Sandbox ${step.purpose} failed (${result.exitCode}).`, logs: logs.join("\n"), branch: plan.branch };
     } catch {
@@ -294,8 +315,19 @@ export interface ConversationMessage {
   at: string;
 }
 
+const TRANSCRIPT_SECRET_PATTERNS = [
+  /(?:sk-[A-Za-z0-9_-]{8,}|sk_(?:live|test)_[A-Za-z0-9_-]{8,}|gh(?:p|s|o|u|r)_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|whsec_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|hf_[A-Za-z0-9_-]{8,})/gi,
+  /((?:password|secret|token|api[_-]?key)\s*[:=]\s*)\S+/gi,
+];
+
+function redactTranscriptText(value: string): string {
+  let result = value;
+  for (const pattern of TRANSCRIPT_SECRET_PATTERNS) result = result.replace(pattern, (match, prefix?: string) => prefix ? `${prefix}[redacted]` : "[redacted]");
+  return result.slice(0, 16_000);
+}
+
 export function conversationTranscript(messages: ConversationMessage[]): { messages: ConversationMessage[]; zdr: true; training: false } {
-  return { messages, zdr: true, training: false };
+  return { messages: messages.map((message) => ({ ...message, content: redactTranscriptText(message.content) })), zdr: true, training: false };
 }
 
 export function scoreConversation(transcript: { messages: ConversationMessage[] }, criteria: string, judge?: { passed: boolean; reason: string }): { passed: boolean; reason: string; upgradesVerdict: false } {
@@ -321,13 +353,32 @@ export interface FactoryTreeFile {
 export function collectFactoryTreeFiles(root: string): FactoryTreeFile[] {
   const files: FactoryTreeFile[] = [];
   const base = path.join(root, ".tinkerbot");
+  // Factory metadata is loaded from a customer checkout and can be reached by
+  // the self-hosted worker before any harness isolation exists. Bound both the
+  // number of entries and the decoded bytes so a generated/configured tree
+  // cannot turn definition loading into an unbounded memory or CPU operation.
+  const maxFiles = 512;
+  const maxFileBytes = 512_000;
+  const maxTotalBytes = 8_000_000;
+  let totalBytes = 0;
   const walk = (directory: string, relative: string) => {
     if (!fs.existsSync(directory)) return;
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const rel = relative ? `${relative}/${entry.name}` : entry.name;
       const full = path.join(directory, entry.name);
+      // Factory metadata is configuration, not an arbitrary filesystem
+      // crawler. A repository-controlled symlink could otherwise make a
+      // digest, prompt, or agent definition read a secret outside `.tinkerbot`.
+      if (entry.isSymbolicLink()) throw new Error(`Factory tree symlinks are not allowed: .tinkerbot/${rel}`);
       if (entry.isDirectory()) walk(full, rel);
-      else files.push({ path: `.tinkerbot/${rel}`, contents: fs.readFileSync(full, "utf8") });
+      else {
+        if (files.length >= maxFiles) throw new Error(`Factory tree contains more than ${maxFiles} files.`);
+        const stat = fs.statSync(full);
+        if (!stat.isFile() || stat.size > maxFileBytes) throw new Error(`Factory tree file .tinkerbot/${rel} exceeds the ${maxFileBytes}-byte limit.`);
+        totalBytes += stat.size;
+        if (totalBytes > maxTotalBytes) throw new Error(`Factory tree exceeds the ${maxTotalBytes}-byte content limit.`);
+        files.push({ path: `.tinkerbot/${rel}`, contents: fs.readFileSync(full, "utf8") });
+      }
     }
   };
   walk(base, "");
@@ -335,7 +386,9 @@ export function collectFactoryTreeFiles(root: string): FactoryTreeFile[] {
 }
 
 export function factoryTreeDigest(files: FactoryTreeFile[]): string {
-  const canonical = files.map((file) => `${file.path}\n${file.contents}`).join("\n---\n");
+  // Upload order is not semantic. Canonical sorting prevents two clients from
+  // producing different definition digests for the same file tree.
+  const canonical = [...files].sort((left, right) => left.path.localeCompare(right.path)).map((file) => `${file.path}\n${file.contents}`).join("\n---\n");
   return `sha256:${crypto.createHash("sha256").update(canonical).digest("hex")}`;
 }
 
@@ -351,7 +404,7 @@ export interface McpToolContext {
   actor: string;
   sendTask(input: { factoryId?: string; title: string; note: string; repositoryId?: string }): Promise<{ workOrderId: string }>;
   getTask(workOrderId: string): Promise<{ workOrder?: WorkOrder; conversation?: ConversationMessage[]; git?: { branch: string; commands: string[] } }>;
-  messageForeman(workOrderId: string, note: string): Promise<{ accepted: true }>;
+  messageForeman(workOrderId: string, note: string): Promise<{ accepted: true } | { accepted: false; reason: string }>;
   createFactory?(input: { name: string; yaml: string; files: Array<{ path: string; contents: string }> }): Promise<{ factoryId: string }>;
 }
 

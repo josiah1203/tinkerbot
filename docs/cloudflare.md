@@ -21,4 +21,6 @@ Optional source-control adapter secrets:
 
 Core factory use does not require a Tinkerbot GitHub App installation or any GitHub App credentials.
 
-Vars: `CONTROL_PLANE_URL`, `WORKOS_REDIRECT_URI`, `ACTION_OIDC_AUDIENCE`, nonempty production `STRIPE_PLANS_JSON`. Copy [`apps/control-plane-worker/.env.example`](../apps/control-plane-worker/.env.example) to `.dev.vars` locally.
+Vars: `CONTROL_PLANE_URL`, `WORKOS_REDIRECT_URI`, `ACTION_OIDC_AUDIENCE`, nonempty production `STRIPE_PLANS_JSON`. Self-hosted execution additionally uses a distinct `SELF_HOSTED_WORK_SECRET` and either the `SELF_HOSTED_WORK` Queue or an HTTPS-only `SELF_HOSTED_WORK_ENDPOINT`; neither path carries provider credentials. Copy [`apps/control-plane-worker/.env.example`](../apps/control-plane-worker/.env.example) to `.dev.vars` locally.
+
+Production integration intake also requires the provider-specific `*_WEBHOOK_SECRET` and `INTEGRATION_ORGANIZATION_ID`. The latter is a deliberate single-tenant deployment binding; a multi-tenant rollout needs a signed per-tenant endpoint/token registry before exposing these public webhook paths. Authenticated `/config/status` reports `selfHostedWorkReady` separately from the presence of a queue/endpoint so an operator cannot mistake a producer binding for a runnable worker boundary.

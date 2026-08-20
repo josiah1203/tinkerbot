@@ -170,7 +170,7 @@ export function canAccessInstallationRepository(records: readonly InstallationRe
 export function redactGitHubSecrets(value: string, secrets: readonly string[] = []): string {
   let output = value;
   for (const secret of secrets) if (secret.length >= 4) output = output.split(secret).join("[REDACTED]");
-  return output.replace(/(?:gh[ps]_|github_pat_)[A-Za-z0-9_]{8,}/g, "[REDACTED]");
+  return output.replace(/(?:gh(?:p|s|o|u|r)_|github_pat_)[A-Za-z0-9_]{8,}/gi, "[REDACTED]");
 }
 
 export function createGitHubAuditEvent(input: Omit<GitHubAuditEvent, "eventId" | "observedAt"> & { eventId?: string; observedAt?: string }): GitHubAuditEvent {

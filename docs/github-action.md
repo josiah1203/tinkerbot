@@ -7,8 +7,8 @@ The Action runs `tb check` on the customer runner and submits a source-minimized
 Hosted admission is signature-verified and fail-closed. Unsigned JWT helpers (`e30.*.sig`) are rejected.
 
 1. Workflow `permissions: id-token: write`
-2. Action requests a GitHub OIDC token with audience `tinkerbot` (GitLab CI OIDC is a peer issuer)
-3. `POST /actions/oidc/exchange` verifies RS256 against the issuer JWKS (`https://token.actions.githubusercontent.com/.well-known/jwks` or the GitLab issuer JWKS), then `exp` / `nbf` / `iat`, `iss`, `aud`, `repository`, optional `sha`, and consumes `jti` (or a token fingerprint) against replay
+2. Action requests a GitHub OIDC token with audience `tinkerbot` (GitLab CI is supported only for the explicitly allowlisted public `https://gitlab.com` issuer)
+3. `POST /actions/oidc/exchange` verifies RS256 against the issuer JWKS (`https://token.actions.githubusercontent.com/.well-known/jwks` or the fixed GitLab.com JWKS), then `exp` / `nbf` / `iat`, `iss`, `aud`, `repository`, optional `sha`, and consumes `jti` (or a token fingerprint) against replay. Self-managed GitLab issuers require a separately reviewed allowlist/adapter; arbitrary issuer hostnames are rejected.
 4. Exchange fails closed when the repository has no GitHub App installation
 5. Worker returns a short-lived run token
 6. Action `POST /assurance/ingest` with that token
