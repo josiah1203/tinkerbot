@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { HistoryRecord, PrProofReport, TestSelectionPlan } from "../../core/src/types";
 import { TOOL_VERSION } from "../../core/src/version";
+import { translateLegacyVerdict } from "../../core/src/verdict";
 
 export const HISTORY_FILE = ".pr-proof/history.jsonl";
 
@@ -38,7 +39,7 @@ function isHistoryRecord(value: unknown): value is HistoryRecord {
     && typeof record.head === "string"
     && typeof record.toolVersion === "string"
     && typeof record.recordedAt === "string"
-    && ["PASS", "NEEDS_REVIEW", "UNKNOWN", "FAIL"].includes(String(record.verdict))
+    && ["PASS", "UNKNOWN", "FAIL", "NEEDS_REVIEW"].includes(String(record.verdict))
     && Boolean(record.findingsByRule && typeof record.findingsByRule === "object" && !Array.isArray(record.findingsByRule));
 }
 
@@ -58,7 +59,7 @@ export function readHistoryDetails(root: string): HistoryReadResult {
   for (const line of content.split(/\r?\n/).filter(Boolean)) {
     try {
       const parsed = JSON.parse(line) as unknown;
-      if (isHistoryRecord(parsed)) records.push(parsed);
+      if (isHistoryRecord(parsed)) records.push({ ...parsed, verdict: translateLegacyVerdict(parsed.verdict) });
       else ignoredSchemaLines += 1;
     } catch {
       malformedLines += 1;

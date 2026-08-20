@@ -74,7 +74,7 @@ inputs:
     required: false
     default: ""
   session-token:
-    description: Optional short-lived Tinkerbot session or service credential for hosted evidence submission.
+    description: "Deprecated fallback credential. Prefer GitHub OIDC (`id-token: write`) which the Action exchanges for a short-lived run token."
     required: false
     default: ""
 outputs:

@@ -1,11 +1,19 @@
-# Hosted assurance control-plane boundary
+# Hosted factory control plane
 
-The paid hosted control plane is the system of record for authorized repository metadata, history, policies, teams, receipts, graph snapshots, contracts, releases, and outcomes. It is not a self-hosted web verifier and does not replace GitHub, deployment systems, feature-flag systems, observability, issue tracking, or security scanners.
+The control plane is the system of record for products, factories, production lines, work cells, work orders, specifications, evidence, release candidates, outcomes, skills, and improvement proposals. It does not replace `tb check` or GitHub merge controls.
 
-The Worker exposes server-authorized assurance metadata routes:
+Worker routes:
 
-- `GET /assurance/summary?repository=...` returns a repository-scoped assurance bundle or an explicit empty state.
-- `POST /assurance/ingest` accepts a versioned, source-minimized assurance bundle for an entitled organization and authorized maintainer-level actor.
-- `POST /assurance/delete` removes repository-scoped assurance metadata for an authorized owner/admin and records a deletion audit event.
+- `GET/POST /factories`, `GET/PATCH /factories/:id` (operator view: activity columns, scorers, self-improvement, definition files)
+- `GET/POST /work-orders`, `GET /work-orders/:id`, `POST /work-orders/:id/retry|approve|cancel|steer|take|return`
+- `GET /products`, `GET /cells`, `GET /skills`, `GET /evolution`, `POST /evolution/:id/approve`
+- `GET /releases`, `GET /outcomes`
+- `GET /runs/:id`, `GET /runs/:id/events`
+- `GET /usage`, `GET /integrations/github`
+- `POST /actions/oidc/exchange` (RS256 JWKS, installation required) then `POST /assurance/ingest` with the short-lived run token
+- Intake: GitHub, Slack, Linear, Jira, incident, and support webhooks
+- `POST /tinker/commands` — typed `@tinker` gateway (idempotent; high-risk actions require confirmation; never a verification verdict)
+- WorkOS `/auth/workos/start|callback`, `/auth/session`, `/auth/signout`
+- Stripe `/billing/summary|checkout|portal`
 
-Free local verification remains free. Hosted assurance entitlement is decided from the server-side tenant entitlement snapshot, never browser state. Missing provider credentials, membership, repository authorization, entitlement, evidence, or runtime adapters are visible as unavailable/unknown states.
+Public site routes (`/`, `/product`, `/pricing`, `/changelog`, `/docs`, `/login`) are marketing and auth entry. Authenticated product lives under `/app`. See [information architecture](./control-plane-information-architecture.md).

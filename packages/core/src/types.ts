@@ -2,7 +2,8 @@ import type { AssuranceBundle, EvidenceContract } from "./assurance-types";
 
 export type Severity = "info" | "warning" | "high" | "critical";
 export type Confidence = "low" | "medium" | "high";
-export type Verdict = "PASS" | "NEEDS_REVIEW" | "UNKNOWN" | "FAIL";
+export type Verdict = "PASS" | "FAIL" | "UNKNOWN";
+export type ReviewAssessment = "CLEAR" | "NEEDS_HUMAN_REVIEW" | "REVISE";
 export type LanguageId = "typescript" | "javascript" | "python" | "go" | "rust" | "c" | "cpp";
 export type LanguageMode = "auto" | "explicit";
 
@@ -465,6 +466,8 @@ export interface PrProofReport {
   head: string;
   generatedAt?: string;
   verdict: Verdict;
+  /** Advisory only. Never copied into `verdict`. */
+  reviewAssessment?: ReviewAssessment;
   summary: ReportSummary;
   findings: Finding[];
   testIntegrity?: TestIntegrityReport;

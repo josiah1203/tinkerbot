@@ -1,19 +1,21 @@
 {
   "name": "Tinkerbot Verify",
-  "url": "https://example.invalid/tinkerbot-verify",
+  "url": "https://control.tinkerbot.dev",
   "hook_attributes": {
     "active": true,
-    "url": "https://example.invalid/tinkerbot-verify/github/webhooks"
+    "url": "https://control.tinkerbot.dev/integrations/github/webhook"
   },
-  "redirect_url": "https://example.invalid/tinkerbot-verify/github/install/callback",
+  "redirect_url": "https://control.tinkerbot.dev/integrations/github/install/callback",
   "public": false,
   "default_permissions": {
     "metadata": "read",
-    "pull_requests": "read",
+    "contents": "read",
+    "pull_requests": "write",
     "issues": "write",
     "checks": "write"
   },
   "default_events": [
+    "issues",
     "pull_request",
     "installation",
     "installation_repositories"

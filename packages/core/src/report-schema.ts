@@ -3,7 +3,7 @@ import type { Finding, PrProofReport } from "./types";
 
 export const REPORT_SCHEMA_VERSION = 1;
 export const REPORT_SCHEMA_ID = "https://pr-proof.dev/schemas/report/v1";
-const VALID_VERDICTS = new Set(["PASS", "NEEDS_REVIEW", "UNKNOWN", "FAIL"]);
+const VALID_VERDICTS = new Set(["PASS", "UNKNOWN", "FAIL"]);
 const MAX_EVIDENCE_TEXT = 8_192;
 
 export function findingStartLine(finding: Finding): number | undefined {

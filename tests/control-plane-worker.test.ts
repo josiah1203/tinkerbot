@@ -1,14 +1,28 @@
-import worker, { roleHasCapability } from "../apps/control-plane-worker/src";
+import worker, { roleHasCapability, workOSRoleToTenantRole } from "../apps/control-plane-worker/src";
 import { createHmac } from "node:crypto";
 
-test("Cloudflare Worker exposes non-secret provider status and keeps local verification independent", async () => {
+function cookieFrom(response: Response, name: string): string {
+  const raw = typeof response.headers.getSetCookie === "function" ? response.headers.getSetCookie().join("; ") : (response.headers.get("set-cookie") ?? "");
+  const match = raw.match(new RegExp(`${name}=([^;]+)`));
+  if (!match) throw new Error(`Missing cookie ${name} in ${raw}`);
+  return decodeURIComponent(match[1]);
+}
+
+function oauthCookieHeader(response: Response): string {
+  return `tinkerbot_oauth_state=${encodeURIComponent(cookieFrom(response, "tinkerbot_oauth_state"))}; tinkerbot_pkce=${encodeURIComponent(cookieFrom(response, "tinkerbot_pkce"))}`;
+}
+
+test("Cloudflare Worker health is a public liveness signal without provider oracles", async () => {
   const response = await worker.fetch(new Request("https://control.example/health"), { ENVIRONMENT: "staging", WORKER_NAME: "tinkerbot-staging" });
   expect(response.status).toBe(200);
-  const body = await response.json() as { service: string; environment: string; providers: Array<{ provider: string; state: string; missing: string[] }> };
+  const body = await response.json() as { service: string; status: string };
   expect(body.service).toBe("tinkerbot-control-plane");
-  expect(body.environment).toBe("staging");
-  expect(body.providers.find((provider) => provider.provider === "workos")?.state).toBe("unavailable");
-  expect(JSON.stringify(body)).not.toContain("secret");
+  expect(body.status).toBe("degraded");
+  expect(JSON.stringify(body)).not.toContain("STRIPE");
+  expect(JSON.stringify(body)).not.toContain("WORKOS");
+  expect(JSON.stringify(body)).not.toMatch(/secret/i);
+  const status = await worker.fetch(new Request("https://control.example/config/status"), { ENVIRONMENT: "staging", WORKER_NAME: "tinkerbot-staging" });
+  expect(status.status).toBeGreaterThanOrEqual(401);
 });
 
 test("tenant RBAC capabilities are explicit and least-privilege", () => {
@@ -21,6 +35,19 @@ test("tenant RBAC capabilities are explicit and least-privilege", () => {
   expect(roleHasCapability("reviewer", "assurance:read")).toBe(true);
   expect(roleHasCapability("reviewer", "assurance:write")).toBe(false);
   expect(roleHasCapability("viewer", "billing:read")).toBe(false);
+  expect(roleHasCapability("viewer", "factory:write")).toBe(false);
+  expect(roleHasCapability("viewer", "work:operate")).toBe(false);
+  expect(roleHasCapability("viewer", "ops:read")).toBe(false);
+  expect(roleHasCapability("owner", "tenant:admin")).toBe(true);
+  expect(roleHasCapability("viewer", "tenant:admin")).toBe(false);
+  expect(roleHasCapability("maintainer", "factory:write")).toBe(true);
+  expect(roleHasCapability("owner", "ops:read")).toBe(true);
+});
+
+test("SCIM/WorkOS roles map through the versioned Tinkerbot role table", () => {
+  expect(workOSRoleToTenantRole(["admin"])).toBe("admin");
+  expect(workOSRoleToTenantRole(["maintainer"])).toBe("maintainer");
+  expect(workOSRoleToTenantRole([])).toBe("viewer");
 });
 
 test("Cloudflare Worker accepts only signed GitHub installation webhooks and persists them replay-safely", async () => {
@@ -51,6 +78,34 @@ test("Cloudflare Worker accepts only signed GitHub installation webhooks and per
   const duplicate = await worker.fetch(new Request("https://control.example/integrations/github/webhook", { method: "POST", headers: { "x-github-event": "installation", "x-github-delivery": "delivery_1", "x-hub-signature-256": `sha256=${signature}` }, body: payload }), env);
   expect(duplicate.status).toBe(200);
   expect(await duplicate.json()).toEqual({ received: true, duplicate: true });
+});
+
+test("GitLab webhooks admit MR and issue hooks and reject pipeline jobs", async () => {
+  const events = new Set<string>();
+  const metadata = new Map<string, string>();
+  const database = {
+    prepare: (query: string) => ({
+      bind: (...args: unknown[]) => ({
+        first: async <T>() => query.includes("FROM tinkerbot_webhook_events") && events.has(`${String(args[1])}:${String(args[0])}`) ? { event_id: args[0] } as T : null,
+        run: async () => {
+          if (query.startsWith("INSERT OR IGNORE INTO tinkerbot_webhook_events")) {
+            const key = `${String(args[1])}:${String(args[0])}`;
+            if (events.has(key)) return { meta: { changes: 0 } };
+            events.add(key);
+          }
+          if (query.startsWith("INSERT INTO tinkerbot_metadata") || query.includes("tinkerbot_metadata")) metadata.set(String(args[0]), String(args[1] ?? ""));
+          return { meta: { changes: 1 } };
+        },
+      }),
+    }),
+  };
+  const env = { DB: database, GITLAB_WEBHOOK_SECRET: "gitlab-secret", FACTORY_EVENTS: { send: async () => undefined } };
+  const payload = JSON.stringify({ object_attributes: { iid: 4, title: "Fix", action: "open" }, project: { path_with_namespace: "acme/pay" } });
+  const pipeline = await worker.fetch(new Request("https://control.example/integrations/gitlab/webhook", { method: "POST", headers: { "x-gitlab-event": "Pipeline Hook", "x-gitlab-token": "gitlab-secret", "x-gitlab-event-uuid": "g1" }, body: payload }), env);
+  expect(pipeline.status).toBe(401);
+  const first = await worker.fetch(new Request("https://control.example/integrations/gitlab/webhook", { method: "POST", headers: { "x-gitlab-event": "Merge Request Hook", "x-gitlab-token": "gitlab-secret", "x-gitlab-event-uuid": "g2" }, body: payload }), env);
+  expect(first.status).toBe(200);
+  expect(await first.json()).toMatchObject({ received: true, merge: false, sourceType: "gitlab_merge_request" });
 });
 
 test("Stripe webhooks resolve invoice tenants, fail closed on payment failure, and ignore stale state", async () => {
@@ -108,7 +163,7 @@ test("Stripe webhooks resolve invoice tenants, fail closed on payment failure, a
     }),
   };
   metadata.set("billing:checkout:cs_1", JSON.stringify({ organizationId: "org_1", planId: "team", interval: "month", createdAt: "2030-01-01T00:00:00.000Z" }));
-  const env = { STRIPE_SECRET_KEY: "stripe_test_secret", STRIPE_WEBHOOK_SECRET: "whsec_test", STRIPE_PLANS_JSON: JSON.stringify([{ id: "team", monthlyPriceId: "price_team", privateRepositoryLimit: 10, memberLimit: 5, retentionDays: 30, features: { team_invitations: true } }]), DB: database };
+  const env = { STRIPE_SECRET_KEY: "stripe_test_secret", STRIPE_WEBHOOK_SECRET: "whsec_test", STRIPE_PLANS_JSON: JSON.stringify([{ id: "team", monthlyPriceId: "price_team" }]), DB: database };
   const send = async (event: Record<string, unknown>) => {
     const payload = JSON.stringify(event);
     const timestamp = Math.floor(Date.now() / 1000);
@@ -205,13 +260,13 @@ test("Cloudflare Worker completes WorkOS session persistence and server-side Str
   };
 
   try {
-    const env = { ENVIRONMENT: "staging", WORKER_NAME: "tinkerbot-staging", WORKOS_CLIENT_ID: "client_test", WORKOS_API_KEY: "workos_test_secret", STRIPE_SECRET_KEY: "stripe_test_secret", STRIPE_WEBHOOK_SECRET: "whsec_test", SESSION_ENCRYPTION_KEY: "session-encryption-test-key", STRIPE_PLANS_JSON: JSON.stringify([{ id: "developer", monthlyPriceId: "price_month", privateRepositoryLimit: 3, memberLimit: 5, retentionDays: 30, features: { assurance_metadata: true } }]), DB: database };
+    const env = { ENVIRONMENT: "staging", WORKER_NAME: "tinkerbot-staging", WORKOS_CLIENT_ID: "client_test", WORKOS_API_KEY: "workos_test_secret", STRIPE_SECRET_KEY: "stripe_test_secret", STRIPE_WEBHOOK_SECRET: "whsec_test", SESSION_ENCRYPTION_KEY: "session-encryption-test-key", STRIPE_PLANS_JSON: JSON.stringify([{ id: "developer", monthlyPriceId: "price_month" }]), DB: database };
     const start = await worker.fetch(new Request("https://control.example/auth/workos/start"), env);
-    const state = decodeURIComponent(start.headers.get("set-cookie")!.match(/tinkerbot_oauth_state=([^;]+)/)![1]);
-    const callback = await worker.fetch(new Request(`https://control.example/auth/workos/callback?code=auth_code&state=${encodeURIComponent(state)}`, { headers: { cookie: `tinkerbot_oauth_state=${encodeURIComponent(state)}` } }), env);
+    const state = cookieFrom(start, "tinkerbot_oauth_state");
+    const callback = await worker.fetch(new Request(`https://control.example/auth/workos/callback?code=auth_code&state=${encodeURIComponent(state)}`, { headers: { cookie: oauthCookieHeader(start) } }), env);
     expect(callback.status).toBe(200);
     expect(await callback.text()).not.toContain("access_secret");
-    const sessionId = decodeURIComponent(callback.headers.get("set-cookie")!.match(/tinkerbot_session=([^;]+)/)![1]);
+    const sessionId = cookieFrom(callback, "tinkerbot_session");
 
     const session = await worker.fetch(new Request("https://control.example/auth/session", { headers: { cookie: `tinkerbot_session=${encodeURIComponent(sessionId)}` } }), env);
     expect(session.status).toBe(200);
@@ -243,7 +298,7 @@ test("Cloudflare Worker completes WorkOS session persistence and server-side Str
 
     const checkout = await worker.fetch(new Request("https://control.example/billing/checkout", { method: "POST", headers: { cookie: `tinkerbot_session=${encodeURIComponent(sessionId)}`, "content-type": "application/json", "idempotency-key": "checkout_1" }, body: JSON.stringify({ planId: "developer", interval: "month" }) }), env);
     expect(checkout.status).toBe(200);
-    expect(await checkout.json()).toEqual({ checkout: { id: "cs_test", url: "https://checkout.stripe.test/session" } });
+    expect(await checkout.json()).toEqual({ pending: true, checkout: { id: "cs_test", url: "https://checkout.stripe.test/session" }, grantedFromRedirect: false });
     expect(JSON.parse(metadata.get("billing:checkout:cs_test")!)).toMatchObject({ organizationId: "org_1", planId: "developer", interval: "month" });
 
     entitlements.set("org_1", { organization_id: "org_1", plan_id: "developer", billing_status: "active", private_repository_limit: 3, member_limit: 5, retention_days: 30, features_json: JSON.stringify({ assurance_metadata: true }), updated_at: "2030-01-01T00:00:00.000Z" });
@@ -417,19 +472,90 @@ test("Cloudflare Worker enforces invitation entitlements before calling WorkOS",
   try {
     const env = { ENVIRONMENT: "staging", WORKOS_CLIENT_ID: "client_test", WORKOS_API_KEY: "workos_test_secret", SESSION_ENCRYPTION_KEY: "session-encryption-test-key", DB: database };
     const start = await worker.fetch(new Request("https://control.example/auth/workos/start"), env);
-    const state = decodeURIComponent(start.headers.get("set-cookie")!.match(/tinkerbot_oauth_state=([^;]+)/)![1]);
-    const callback = await worker.fetch(new Request(`https://control.example/auth/workos/callback?code=auth_code&state=${encodeURIComponent(state)}`, { headers: { cookie: `tinkerbot_oauth_state=${encodeURIComponent(state)}` } }), env);
-    const sessionId = decodeURIComponent(callback.headers.get("set-cookie")!.match(/tinkerbot_session=([^;]+)/)![1]);
+    const state = cookieFrom(start, "tinkerbot_oauth_state");
+    const callback = await worker.fetch(new Request(`https://control.example/auth/workos/callback?code=auth_code&state=${encodeURIComponent(state)}`, { headers: { cookie: oauthCookieHeader(start) } }), env);
+    const sessionId = cookieFrom(callback, "tinkerbot_session");
     const invitation = await worker.fetch(new Request("https://control.example/tenant/invitations", { method: "POST", headers: { origin: "https://control.example", cookie: `tinkerbot_session=${encodeURIComponent(sessionId)}`, "content-type": "application/json" }, body: JSON.stringify({ email: "invitee@example.com", role: "viewer" }) }), env);
     expect(invitation.status).toBe(201);
     const invitationBody = await invitation.json() as Record<string, unknown>;
     expect(invitationBody).toMatchObject({ sent: true, invitation: { invitationId: "invitation_1", role: "viewer", state: "pending" } });
     expect(JSON.stringify(invitationBody)).not.toContain("secret-token");
 
-    entitlements.set("org_1", { ...entitlements.get("org_1"), features_json: JSON.stringify({ team_invitations: false }) });
+    entitlements.set("org_1", { ...entitlements.get("org_1"), plan_id: "developer", billing_status: "active", features_json: "{}" });
     const denied = await worker.fetch(new Request("https://control.example/tenant/invitations", { method: "POST", headers: { origin: "https://control.example", cookie: `tinkerbot_session=${encodeURIComponent(sessionId)}`, "content-type": "application/json" }, body: JSON.stringify({ email: "another@example.com", role: "viewer" }) }), env);
     expect(denied.status).toBe(403);
     expect(await denied.json()).toMatchObject({ code: "entitlement_required", feature: "team_invitations" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("public catalog, seat summary, and cardless Team trial are server-authoritative", async () => {
+  const sessions = new Map<string, Record<string, unknown>>();
+  const trials = new Map<string, Record<string, unknown>>();
+  const billing = new Map<string, Record<string, unknown>>();
+  const database = {
+    prepare: (query: string) => ({
+      bind: (...args: unknown[]) => ({
+        first: async <T>() => {
+          if (query.includes("FROM tinkerbot_sessions")) return (sessions.get(String(args[0])) ?? null) as T | null;
+          if (query.includes("COUNT(*) AS count")) return { count: 2 } as T;
+          if (query.includes("FROM tinkerbot_memberships")) return { organization_id: "org_1", user_id: "user_1", role: "owner", status: "active" } as T;
+          if (query.includes("FROM tinkerbot_trial_records")) return (trials.get(String(args[0])) ?? null) as T | null;
+          if (query.includes("FROM tinkerbot_billing_accounts")) return (billing.get(String(args[0])) ?? null) as T | null;
+          return null;
+        },
+        all: async <T>() => ({ results: [] as T[] }),
+        run: async () => {
+          if (query.startsWith("INSERT INTO tinkerbot_sessions")) sessions.set(String(args[0]), { session_id: args[0], user_id: args[1], email: args[2], first_name: args[3], last_name: args[4], email_verified: args[5], organization_id: args[6], expires_at: args[7], authentication_method: args[8], token_ciphertext: args[9] });
+          if (query.includes("tinkerbot_trial_records")) trials.set(String(args[0]), { organization_id: args[0], state: "trialing", ends_at: args[3], started_at: args[2] });
+          if (query.startsWith("INSERT INTO tinkerbot_billing_accounts")) billing.set(String(args[0]), { organization_id: args[0], plan_id: args[3], subscription_status: args[5], last_event_created_at: args[9] });
+          return { meta: { changes: 1 } };
+        },
+      }),
+    }),
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    if (String(input).includes("api.workos.com")) {
+      if (String(input).includes("organization_memberships")) return new Response(JSON.stringify({ data: [{ id: "om_1", user_id: "user_1", organization_id: "org_1", organization_name: "Atlas", status: "active", role: { slug: "owner" }, user: { id: "user_1", email: "alex@example.com", email_verified: true }, updated_at: "2030-01-01T00:00:00.000Z" }], list_metadata: {} }), { status: 200 });
+      return new Response(JSON.stringify({ user: { id: "user_1", email: "alex@example.com", email_verified: true }, organization_id: "org_1", access_token: "access_secret", refresh_token: "refresh_secret", expires_in: 3600 }), { status: 200 });
+    }
+    return new Response(JSON.stringify({}), { status: 200 });
+  };
+  try {
+    const env = { ENVIRONMENT: "staging", WORKOS_CLIENT_ID: "client_test", WORKOS_API_KEY: "workos_test_secret", SESSION_ENCRYPTION_KEY: "session-encryption-test-key-with-32-bytes-minimum", STRIPE_PLANS_JSON: JSON.stringify([{ id: "team", monthlyPriceId: "price_team", annualPriceId: "price_team_year" }]), DB: database };
+    const catalog = await worker.fetch(new Request("https://control.example/billing/catalog"), env);
+    expect(catalog.status).toBe(200);
+    const catalogBody = await catalog.json() as { plans: Array<{ id: string; monthlyPriceCents: number | null; trialAvailable: boolean }> };
+    expect(catalogBody.plans.find((plan) => plan.id === "developer")?.monthlyPriceCents).toBe(2000);
+    expect(catalogBody.plans.find((plan) => plan.id === "team")).toMatchObject({ monthlyPriceCents: 4000, trialAvailable: true });
+    expect(catalogBody.plans.find((plan) => plan.id === "business")?.monthlyPriceCents).toBe(6000);
+    const start = await worker.fetch(new Request("https://control.example/auth/workos/start"), env);
+    const state = cookieFrom(start, "tinkerbot_oauth_state");
+    const callback = await worker.fetch(new Request(`https://control.example/auth/workos/callback?code=auth_code&state=${encodeURIComponent(state)}`, { headers: { cookie: oauthCookieHeader(start) } }), env);
+    const sessionId = cookieFrom(callback, "tinkerbot_session");
+    const cookie = `tinkerbot_session=${encodeURIComponent(sessionId)}`;
+    const trial = await worker.fetch(new Request("https://control.example/billing/trial/start", { method: "POST", headers: { origin: "https://control.example", cookie } }), env);
+    expect(trial.status).toBe(200);
+    expect(await trial.json()).toMatchObject({ pending: false, trial: { state: "trialing" }, grantedFromRedirect: false });
+    const second = await worker.fetch(new Request("https://control.example/billing/trial/start", { method: "POST", headers: { origin: "https://control.example", cookie } }), env);
+    expect(second.status).toBe(409);
+    const seats = await worker.fetch(new Request("https://control.example/org/seats", { headers: { cookie } }), env);
+    expect(seats.status).toBe(200);
+    expect(await seats.json()).toMatchObject({ activeBillableSeats: 2 });
+    const summary = await worker.fetch(new Request("https://control.example/billing/summary", { headers: { cookie } }), env);
+    expect(summary.status).toBe(200);
+    expect(await summary.json()).toMatchObject({ planId: "team", subscriptionState: "trialing", activeBillableSeats: 2, paidSeatCap: "none" });
+    const rejectedCheckout = await worker.fetch(new Request("https://control.example/billing/checkout", { method: "POST", headers: { origin: "https://control.example", cookie, "content-type": "application/json" }, body: JSON.stringify({ planId: "team", interval: "month", priceId: "price_injected", quantity: 99 }) }), env);
+    expect(rejectedCheckout.status).toBe(400);
+    expect(await rejectedCheckout.json()).toMatchObject({ code: "invalid_billing_request" });
+    const missingPortal = await worker.fetch(new Request("https://control.example/billing/portal", { method: "POST", headers: { origin: "https://control.example", cookie } }), env);
+    expect(missingPortal.status).toBe(409);
+    const production = { ...env, ENVIRONMENT: "production", STRIPE_PLANS_JSON: "[]" };
+    const catalogUnavailable = await worker.fetch(new Request("https://control.example/billing/checkout", { method: "POST", headers: { origin: "https://control.example", cookie, "content-type": "application/json" }, body: JSON.stringify({ planId: "team", interval: "month" }) }), production);
+    expect(catalogUnavailable.status).toBe(503);
+    expect(await catalogUnavailable.json()).toMatchObject({ code: "catalog_unavailable" });
   } finally {
     globalThis.fetch = originalFetch;
   }

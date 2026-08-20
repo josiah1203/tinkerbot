@@ -7,7 +7,7 @@ import { renderReport } from "../packages/reporters/src";
 import { buildGraph } from "../packages/parser/src";
 import { validateLanguageSource } from "../packages/language-validation/src";
 import { isSourceFile, isTestFile } from "../packages/git/src";
-import { languageForFile, summarizeLanguageFiles } from "../packages/language-core/src";
+import { languageEnabled, languageForFile, isSupportedSourceFile, isTestFileForLanguage, summarizeLanguageFiles } from "../packages/language-core/src";
 import { parseCoveragePyJson, parseGoCoverprofile, parseLlvmCovJson } from "../packages/coverage/src";
 import { analyzeTestDiffs } from "../packages/test-integrity/src";
 
@@ -33,6 +33,28 @@ test("detects source and test conventions across supported languages", () => {
   expect(isTestFile("tests/calc_test.rs")).toBe(true);
   expect(isTestFile("tests/widget_test.cpp")).toBe(true);
   expect(summarizeLanguageFiles(["src/main.py", "internal/math/math.go", "src/lib.rs", "src/math.c", "src/widget.cpp"]).map((item) => item.language)).toEqual(["c", "cpp", "go", "python", "rust"]);
+  expect(languageForFile("notes.txt")).toBeUndefined();
+  expect(languageForFile("node_modules/pkg/index.ts")).toBeUndefined();
+  expect(languageForFile("vendor/lib.go")).toBeUndefined();
+  expect(isSupportedSourceFile("src/app.ts")).toBe(true);
+  expect(isSupportedSourceFile("README.md")).toBe(false);
+  expect(isTestFileForLanguage("src/app.ts")).toBe(false);
+  expect(languageEnabled("src/app.ts", { mode: "auto", include: [], exclude: ["typescript"] })).toBe(false);
+  expect(languageEnabled("src/app.ts", { mode: "explicit", include: ["python"], exclude: [] })).toBe(false);
+});
+
+test("missing syntax tools stay unavailable instead of passing", () => {
+  const previous = process.env.PATH;
+  process.env.PATH = "/this-path-does-not-exist";
+  try {
+    const result = validateLanguageSource(process.cwd(), "pkg.go", "package p\n", "go");
+    expect(result.status).not.toBe("valid");
+    expect(["unavailable", "unknown"]).toContain(result.status);
+  } finally {
+    if (previous === undefined) delete process.env.PATH; else process.env.PATH = previous;
+  }
+  const oversized = validateLanguageSource(process.cwd(), "x.py", "x".repeat(3_000_000), "python");
+  expect(oversized.status).toBe("unknown");
 });
 
 test("builds deterministic Python, Go, Rust, C, and C++ graph adapters", () => {
@@ -93,7 +115,7 @@ test("resolves common monorepo layouts and build metadata", () => {
   expect(graph.modules.get("crates/demo/src/lib.rs")?.imports.some((item) => item.resolvedFile === "crates/demo/src/calc.rs")).toBe(true);
   expect(graph.modules.get("native/main.c")?.imports[0]?.resolvedFile).toBe("include/project.h");
   const validated = buildGraph(root, ["native/main.c"], undefined, { validateSyntax: true });
-  expect(["valid", "unavailable"]).toContain(validated.modules.get("native/main.c")?.syntaxValidation?.status);
+  expect(["valid", "unknown", "unavailable"]).toContain(validated.modules.get("native/main.c")?.syntaxValidation?.status);
 });
 
 test("uses installed language front ends without executing repository code", () => {

@@ -32,8 +32,8 @@ try {
 
 const longTermTargets = {
   critical: { statements: 90, branches: 85, functions: 90, lines: 90, packages: ["core", "git", "cli", "reporters"] },
-  high: { statements: 85, branches: 80, functions: 85, lines: 85, packages: ["parser", "test-integrity", "coverage", "mutation", "impact-analysis"] },
-  medium: { statements: 85, branches: 80, functions: 85, lines: 85, packages: ["baseline", "policy", "artifacts", "provenance", "selection", "history", "contracts", "fixtures", "control-plane", "assurance"] },
+  high: { statements: 85, branches: 80, functions: 85, lines: 85, packages: ["parser", "test-integrity", "coverage", "mutation", "impact-analysis", "factory"] },
+  medium: { statements: 85, branches: 80, functions: 85, lines: 85, packages: ["baseline", "policy", "artifacts", "provenance", "selection", "history", "contracts", "fixtures", "control-plane", "assurance", "github", "hosted-integrations", "language-core", "language-validation"] },
 };
 
 function metric(entry, name) {

@@ -14,20 +14,61 @@
     "WORKER_NAME": "tinkerbot-control-plane",
     "CLOUDFLARE_ACCOUNT_ID": "ee09ba373380c725a23c69d5236e570d",
     "STRIPE_PLANS_JSON": "[]",
-    "WORKOS_EVENTS_SYNC_ENABLED": "false"
+    "WORKOS_EVENTS_SYNC_ENABLED": "false",
+    "ACTION_OIDC_AUDIENCE": "tinkerbot",
+    "CONTROL_PLANE_URL": "https://control.tinkerbot.dev",
+    "WORKOS_REDIRECT_URI": "https://control.tinkerbot.dev/auth/workos/callback",
+    "AI_GATEWAY_ID": "tinkerbot-factory"
+  },
+  "ai": { "binding": "AI" },
+  "vectorize": [
+    { "binding": "FACTORY_MEMORY", "index_name": "tinkerbot-factory-memory" }
+  ],
+  "browser": { "binding": "BROWSER" },
+  "durable_objects": {
+    "bindings": [
+      { "name": "FOREMAN", "class_name": "ForemanDurableObject" },
+      { "name": "Sandbox", "class_name": "Sandbox" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1-foreman", "new_sqlite_classes": ["ForemanDurableObject"] },
+    { "tag": "v2-sandbox", "new_sqlite_classes": ["Sandbox"] }
+  ],
+  "workflows": [{ "binding": "FACTORY_RUN", "name": "factory-run", "class_name": "FactoryRunWorkflow" }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "tinkerbot-control-plane-dev",
+      "database_id": "00000000-0000-4000-8000-000000000000",
+      "migrations_dir": "./migrations"
+    }
+  ],
+  "r2_buckets": [
+    { "binding": "EVIDENCE_BUCKET", "bucket_name": "tinkerbot-evidence" }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "FACTORY_EVENTS", "queue": "tinkerbot-factory-events" },
+      { "binding": "SELF_HOSTED_WORK", "queue": "tinkerbot-self-hosted-work" }
+    ],
+    "consumers": [{ "queue": "tinkerbot-factory-events", "max_batch_size": 10, "max_retries": 5 }]
+  },
+  "assets": {
+    "directory": "../control-plane",
+    "binding": "ASSETS"
   },
   "triggers": {
     "crons": ["*/15 * * * *"]
   },
   "secrets": {
-      "required": [
-        "WORKOS_CLIENT_ID",
-        "WORKOS_API_KEY",
-        "WORKOS_WEBHOOK_SECRET",
-        "STRIPE_SECRET_KEY",
-        "STRIPE_WEBHOOK_SECRET",
-        "SESSION_ENCRYPTION_KEY",
-        "GITHUB_WEBHOOK_SECRET"
+    "required": [
+      "WORKOS_CLIENT_ID",
+      "WORKOS_API_KEY",
+      "WORKOS_WEBHOOK_SECRET",
+      "STRIPE_SECRET_KEY",
+      "STRIPE_WEBHOOK_SECRET",
+      "SESSION_ENCRYPTION_KEY"
     ]
   },
   "env": {
@@ -39,16 +80,46 @@
         "CLOUDFLARE_ACCOUNT_ID": "ee09ba373380c725a23c69d5236e570d",
         "STRIPE_PLANS_JSON": "[]",
         "WORKOS_EVENTS_SYNC_ENABLED": "false",
-        "WORKOS_EVENTS_RANGE_START": "2026-08-11T00:00:00.000Z"
+        "WORKOS_EVENTS_RANGE_START": "2026-08-11T00:00:00.000Z",
+        "ACTION_OIDC_AUDIENCE": "tinkerbot",
+        "CONTROL_PLANE_URL": "https://staging.control.tinkerbot.dev",
+        "WORKOS_REDIRECT_URI": "https://staging.control.tinkerbot.dev/auth/workos/callback",
+        "AI_GATEWAY_ID": "tinkerbot-factory"
       },
+      "ai": { "binding": "AI" },
+      "vectorize": [
+        { "binding": "FACTORY_MEMORY", "index_name": "tinkerbot-factory-memory-staging" }
+      ],
+      "browser": { "binding": "BROWSER" },
+      "durable_objects": {
+        "bindings": [
+          { "name": "FOREMAN", "class_name": "ForemanDurableObject" },
+          { "name": "Sandbox", "class_name": "Sandbox" }
+        ]
+      },
+      "workflows": [{ "binding": "FACTORY_RUN", "name": "factory-run", "class_name": "FactoryRunWorkflow" }],
       "d1_databases": [
         {
           "binding": "DB",
-          "database_name": "tinkerbot-control-plane",
-          "database_id": "fb3f060e-c613-495d-80ed-7da581e029cd",
+          "database_name": "tinkerbot-control-plane-staging",
+          "database_id": "11111111-1111-4111-8111-111111111111",
           "migrations_dir": "./migrations"
         }
       ],
+      "r2_buckets": [
+        { "binding": "EVIDENCE_BUCKET", "bucket_name": "tinkerbot-evidence-staging" }
+      ],
+      "queues": {
+        "producers": [
+          { "binding": "FACTORY_EVENTS", "queue": "tinkerbot-factory-events-staging" },
+          { "binding": "SELF_HOSTED_WORK", "queue": "tinkerbot-self-hosted-work-staging" }
+        ],
+        "consumers": [{ "queue": "tinkerbot-factory-events-staging", "max_batch_size": 10, "max_retries": 5 }]
+      },
+      "assets": {
+        "directory": "../control-plane",
+        "binding": "ASSETS"
+      },
       "triggers": {
         "crons": ["*/15 * * * *"]
       },
@@ -59,8 +130,7 @@
           "WORKOS_WEBHOOK_SECRET",
           "STRIPE_SECRET_KEY",
           "STRIPE_WEBHOOK_SECRET",
-          "SESSION_ENCRYPTION_KEY",
-          "GITHUB_WEBHOOK_SECRET"
+          "SESSION_ENCRYPTION_KEY"
         ]
       }
     },
@@ -70,8 +140,45 @@
         "ENVIRONMENT": "production",
         "WORKER_NAME": "tinkerbot-control-plane-production",
         "CLOUDFLARE_ACCOUNT_ID": "ee09ba373380c725a23c69d5236e570d",
-        "STRIPE_PLANS_JSON": "[]",
-        "WORKOS_EVENTS_SYNC_ENABLED": "false"
+        "WORKOS_EVENTS_SYNC_ENABLED": "false",
+        "ACTION_OIDC_AUDIENCE": "tinkerbot",
+        "CONTROL_PLANE_URL": "https://control.tinkerbot.dev",
+        "WORKOS_REDIRECT_URI": "https://control.tinkerbot.dev/auth/workos/callback",
+        "AI_GATEWAY_ID": "tinkerbot-factory"
+      },
+      "ai": { "binding": "AI" },
+      "vectorize": [
+        { "binding": "FACTORY_MEMORY", "index_name": "tinkerbot-factory-memory" }
+      ],
+      "browser": { "binding": "BROWSER" },
+      "durable_objects": {
+        "bindings": [
+          { "name": "FOREMAN", "class_name": "ForemanDurableObject" },
+          { "name": "Sandbox", "class_name": "Sandbox" }
+        ]
+      },
+      "workflows": [{ "binding": "FACTORY_RUN", "name": "factory-run", "class_name": "FactoryRunWorkflow" }],
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "tinkerbot-control-plane-production",
+          "database_id": "22222222-2222-4222-8222-222222222222",
+          "migrations_dir": "./migrations"
+        }
+      ],
+      "r2_buckets": [
+        { "binding": "EVIDENCE_BUCKET", "bucket_name": "tinkerbot-evidence" }
+      ],
+      "queues": {
+        "producers": [
+          { "binding": "FACTORY_EVENTS", "queue": "tinkerbot-factory-events" },
+          { "binding": "SELF_HOSTED_WORK", "queue": "tinkerbot-self-hosted-work" }
+        ],
+        "consumers": [{ "queue": "tinkerbot-factory-events", "max_batch_size": 10, "max_retries": 5 }]
+      },
+      "assets": {
+        "directory": "../control-plane",
+        "binding": "ASSETS"
       },
       "triggers": {
         "crons": ["*/15 * * * *"]
@@ -83,8 +190,7 @@
           "WORKOS_WEBHOOK_SECRET",
           "STRIPE_SECRET_KEY",
           "STRIPE_WEBHOOK_SECRET",
-          "SESSION_ENCRYPTION_KEY",
-          "GITHUB_WEBHOOK_SECRET"
+          "SESSION_ENCRYPTION_KEY"
         ]
       }
     }

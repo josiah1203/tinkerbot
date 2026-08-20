@@ -2,10 +2,16 @@ import type { Finding, PrProofConfig, Verdict } from "./types";
 
 const SEVERITY_WEIGHT: Record<Finding["severity"], number> = { info: 0, warning: 1, high: 2, critical: 3 };
 
+export function translateLegacyVerdict(verdict: string | undefined): Verdict {
+  if (verdict === "PASS" || verdict === "FAIL" || verdict === "UNKNOWN") return verdict;
+  if (verdict === "NEEDS_REVIEW") return "UNKNOWN";
+  return "UNKNOWN";
+}
+
 export function calculateVerdict(findings: Finding[], config: PrProofConfig, unknowns: string[]): Verdict {
   if (config.test_integrity.mode === "blocking" && findings.some((finding) => finding.blocking && SEVERITY_WEIGHT[finding.severity] >= 2)) return "FAIL";
   if (findings.some((finding) => finding.severity === "critical" && finding.blocking)) return "FAIL";
-  if (findings.some((finding) => SEVERITY_WEIGHT[finding.severity] >= 1)) return "NEEDS_REVIEW";
+  if (findings.some((finding) => SEVERITY_WEIGHT[finding.severity] >= 1)) return "UNKNOWN";
   if (unknowns.length > 0) return "UNKNOWN";
   return "PASS";
 }

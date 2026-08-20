@@ -337,6 +337,21 @@ export interface AgentExecutionReceipt extends AssuranceObjectMetadata {
   releaseAssessmentState?: AssuranceState;
   humanApprovals: Array<{ actorId: string; role: string; approvedAt: string }>;
   sourceUpload: "not_uploaded" | "uploaded" | "unknown";
+  model?: string;
+  provider?: string;
+  harness?: string;
+  promptHash?: string;
+  configHash?: string;
+  definitionHash?: string;
+  inputRef?: string;
+  outputRef?: string;
+  toolCallNames?: string[];
+  tokens?: number;
+  costCents?: number;
+  durationMs?: number;
+  retries?: number;
+  verificationResult?: string;
+  pullRequest?: string;
 }
 
 export interface AgentPolicy {

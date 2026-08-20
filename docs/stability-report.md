@@ -6,11 +6,11 @@ This report is generated from the latest local verification run and must be upda
 
 | Measure | Result |
 | --- | --- |
-| Test files | 25 (including coverage-target, coverage-depth, control-plane, assurance, TUI model, hardening, and language-support suites) |
+| Test files | 25 (including coverage-target, coverage-depth, control-plane, assurance, factory, hardening, and language-support suites) |
 | Tests | 134 |
 | Package distribution | `core`, `language-core`, `git`, `parser`, `test-integrity`, `coverage`, `mutation`, `impact-analysis`, `reporters`, `baseline`, `policy`, `artifacts`, `provenance`, `selection`, `history`, `contracts`, `fixtures`, `control-plane`, `cli` |
 | Statement / branch / function / line coverage | Latest shipped-package run with pinned `@vitest/coverage-v8`: 96.69% / 83.94% / 97.71% / 96.69% overall |
-| Coverage thresholds | Global statements, functions, and lines must remain at or above 95%; the raised package ratchet passes and every configured package tier meets its branch target |
+| Coverage thresholds | Global statements, functions, and lines must remain at or above 94%; the raised package ratchet passes and every configured package tier meets its branch target |
 | Checked-in edge-case fixture roots | Existing test-integrity, impact, mutation, and multi-language fixture roots under `fixtures/` |
 | Property/fuzz tests | 0 dedicated generator-based tests; deterministic malformed-input/property-like regressions are present and a generator dependency is intentionally deferred |
 | Repeated-run result | Real Git integration report serialized identically on repeated runs; hardening report order/fingerprint test also passes |

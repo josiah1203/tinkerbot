@@ -51,3 +51,49 @@ test("uncertain impact selects the full suite and explains the fallback", () => 
   expect(plan.fallback).toMatch(/full suite/i);
   expect(plan.unknowns).toContain("dynamic import could not be resolved");
 });
+
+test("selection classifies generated paths, empty suites, and mixed confidence", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pr-proof-selection-branches-"));
+  git(root, ["init", "-q"]);
+  git(root, ["config", "user.email", "test@example.com"]);
+  git(root, ["config", "user.name", "PR Proof Test"]);
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.writeFileSync(path.join(root, "src/a.ts"), "export const a = 1;\n");
+  git(root, ["add", "."]);
+  git(root, ["commit", "-q", "-m", "no tests"]);
+  const emptyHead = git(root, ["rev-parse", "HEAD"]);
+  const empty = selectTests({ root, head: emptyHead, diffs: [diff("src/a.ts")], impact: emptyImpact(), config: structuredClone(DEFAULT_CONFIG) });
+  expect(empty.unknowns).toContain("No test files were found at the head revision.");
+  fs.writeFileSync(path.join(root, "src/a.test.ts"), "test('a', () => {});\n");
+  fs.writeFileSync(path.join(root, "src/b.test.ts"), "test('b', () => {});\n");
+  git(root, ["add", "."]);
+  git(root, ["commit", "-q", "-m", "tests"]);
+  const head = git(root, ["rev-parse", "HEAD"]);
+  const generated = selectTests({
+    root,
+    head,
+    diffs: [diff("src/a.ts")],
+    impact: emptyImpact({
+      paths: [{ id: "gen", sourceFile: "src/a.ts", file: "src/a.ts", classification: "generated", reason: "generated", testFiles: ["src/a.test.ts"], verified: false, modifiedByPr: true, verificationState: "partially_verified" }],
+    }),
+    config: structuredClone(DEFAULT_CONFIG),
+  });
+  expect(generated.requiresFullSuite).toBe(true);
+  const mixedConfig = structuredClone(DEFAULT_CONFIG);
+  mixedConfig.selection.full_suite_on_unknown = false;
+  mixedConfig.selection.confidence_threshold = "medium";
+  const mixed = selectTests({
+    root,
+    head,
+    diffs: [diff("src/a.ts")],
+    impact: emptyImpact({
+      paths: [
+        { id: "high", sourceFile: "src/a.ts", sourceSymbol: "a", file: "src/a.ts", symbol: "a", classification: "direct", reason: "verified", testFiles: ["src/a.test.ts"], verified: true, modifiedByPr: true, verificationState: "verified" },
+        { id: "mid", sourceFile: "src/a.ts", file: "src/a.ts", classification: "downstream", reason: "related", testFiles: ["src/b.test.ts"], verified: false, modifiedByPr: false, verificationState: "partially_verified" },
+      ],
+    }),
+    config: mixedConfig,
+  });
+  expect(mixed.confidence).toBe("medium");
+  expect(mixed.selected).toEqual(["src/a.test.ts", "src/b.test.ts"]);
+});

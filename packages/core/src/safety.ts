@@ -110,6 +110,7 @@ export function redactSecrets(value: string, extraSecrets: string[] = []): strin
   for (const secret of [...new Set(secrets)]) redacted = redacted.split(secret).join("[REDACTED]");
   redacted = redacted.replace(/(Bearer\s+)[^\s,]+/gi, "$1[REDACTED]");
   redacted = redacted.replace(/([?&](?:token|secret|password|key)=)[^&\s]+/gi, "$1[REDACTED]");
+  redacted = redacted.replace(/(?:sk-[A-Za-z0-9_-]{8,}|sk_(?:live|test)_[A-Za-z0-9_-]{8,}|gh(?:p|s|o|u|r)_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{8,}|whsec_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|hf_[A-Za-z0-9_-]{8,}|npm_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,}|(?:xai|pplx)-[A-Za-z0-9_-]{8,})/gi, "[REDACTED]");
   return redacted;
 }
 

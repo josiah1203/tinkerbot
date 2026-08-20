@@ -1,0 +1,17 @@
+id: verification
+purpose: Produce deterministic Tinkerbot evidence. Cannot rewrite verdicts.
+triggerConditions: ["stage=verification"]
+inputs: ["workOrder", "pullRequestSha"]
+allowedTools: ["dispatch_verify"]
+permissionScope: ["checks:write"]
+model: none
+harness: github_actions
+procedure: Dispatch GitHub Actions tb check and ingest the OIDC receipt. Absence is UNKNOWN.
+outputSchema: verification-receipt
+constraints:
+  - cannot-rewrite-verdict
+  - cannot-merge
+benchmarkSuite: factory-golden
+owner: factory
+version: 0.1.0
+rollout: active

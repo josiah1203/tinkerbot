@@ -1169,6 +1169,21 @@ export interface AgentExecutionReceiptOptions {
   humanApprovals?: AgentExecutionReceipt["humanApprovals"];
   sourceUpload?: AgentExecutionReceipt["sourceUpload"];
   now?: string;
+  model?: string;
+  provider?: string;
+  harness?: string;
+  promptHash?: string;
+  configHash?: string;
+  definitionHash?: string;
+  inputRef?: string;
+  outputRef?: string;
+  toolCallNames?: string[];
+  tokens?: number;
+  costCents?: number;
+  durationMs?: number;
+  retries?: number;
+  verificationResult?: string;
+  pullRequest?: string;
 }
 
 export function createAgentExecutionReceipt(options: AgentExecutionReceiptOptions): AgentExecutionReceipt {
@@ -1198,6 +1213,21 @@ export function createAgentExecutionReceipt(options: AgentExecutionReceiptOption
     releaseAssessmentState: options.releaseAssessmentState,
     humanApprovals: [...(options.humanApprovals ?? [])].sort((a, b) => `${a.actorId}:${a.approvedAt}`.localeCompare(`${b.actorId}:${b.approvedAt}`)),
     sourceUpload: options.sourceUpload ?? "not_uploaded",
+    model: options.model,
+    provider: options.provider,
+    harness: options.harness,
+    promptHash: options.promptHash,
+    configHash: options.configHash,
+    definitionHash: options.definitionHash,
+    inputRef: options.inputRef,
+    outputRef: options.outputRef,
+    toolCallNames: [...new Set(options.toolCallNames ?? [])].sort(),
+    tokens: options.tokens,
+    costCents: options.costCents,
+    durationMs: options.durationMs,
+    retries: options.retries,
+    verificationResult: options.verificationResult,
+    pullRequest: options.pullRequest,
   };
 }
 

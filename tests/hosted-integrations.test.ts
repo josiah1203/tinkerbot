@@ -13,6 +13,9 @@ import {
   parseStripePlans,
   verifyWorkOSSignature,
   verifyStripeSignature,
+  FanoutEvidenceStore,
+  HttpEvidenceReplica,
+  evidenceStoreFromEnv,
 } from "../packages/hosted-integrations/src";
 
 test("WorkOS adapter keeps credentials server-side and normalizes AuthKit sessions", async () => {
@@ -101,7 +104,7 @@ test("Stripe adapter uses server-configured prices and idempotent requests", asy
   const provider = new StripeBillingProvider({
     secretKey: "stripe_test_secret",
     webhookSecret: "whsec_test",
-    plans: [{ id: "developer", monthlyPriceId: "price_month", annualPriceId: "price_year", privateRepositoryLimit: 3, memberLimit: 5, retentionDays: 30, features: {} }],
+    plans: [{ id: "developer", monthlyPriceId: "price_month", annualPriceId: "price_year" }],
     fetcher: async (input, init) => {
       requests.push({ url: String(input), init });
       const path = new URL(String(input)).pathname;
@@ -110,13 +113,28 @@ test("Stripe adapter uses server-configured prices and idempotent requests", asy
     },
   });
 
-  const checkout = await provider.createCheckoutSession({ planId: "developer", interval: "month", organizationId: "org_1", successUrl: "https://tinkerbot.example/success", cancelUrl: "https://tinkerbot.example/cancel", idempotencyKey: "checkout-org_1-developer-month" });
+  const checkout = await provider.createCheckoutSession({ planId: "developer", interval: "month", organizationId: "org_1", successUrl: "https://tinkerbot.example/success", cancelUrl: "https://tinkerbot.example/cancel", seatQuantity: 0, idempotencyKey: "checkout-org_1-developer-month" });
   expect(checkout.id).toBe("cs_test");
   expect(requests[0]?.init?.headers).toMatchObject({ "idempotency-key": "checkout-org_1-developer-month" });
   expect(String(requests[0]?.init?.body)).toContain("price_month");
+  expect(String(requests[0]?.init?.body)).toContain("line_items%5B0%5D%5Bquantity%5D=1");
   expect(String(requests[0]?.init?.body)).not.toContain("stripe_test_secret");
+  await expect(provider.createCheckoutSession({ planId: "developer", interval: "month", organizationId: "org_1", successUrl: "https://tinkerbot.example/success", cancelUrl: "https://tinkerbot.example/cancel", seatQuantity: 1.5, idempotencyKey: "checkout-invalid-quantity" })).rejects.toThrow(/quantity/);
+  await expect(provider.createCheckoutSession({ planId: "developer", interval: "month", organizationId: "org_1", successUrl: "https://tinkerbot.example/success", cancelUrl: "https://tinkerbot.example/cancel", seatQuantity: -1, idempotencyKey: "checkout-negative-quantity" })).rejects.toThrow(/quantity/);
   expect((await provider.createPortalSession({ customerId: "cus_1", returnUrl: "https://tinkerbot.example/app/settings/billing", idempotencyKey: "portal-org_1" })).id).toBe("bps_test");
   expect((await provider.setSubscriptionCancellation({ subscriptionId: "sub_1", cancelAtPeriodEnd: true, idempotencyKey: "cancel-org_1" })).status).toBe("canceled");
+  const quantityProvider = new StripeBillingProvider({
+    secretKey: "stripe_test_secret",
+    webhookSecret: "whsec_test",
+    plans: [{ id: "team", monthlyPriceId: "price_team" }],
+    fetcher: async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path.includes("/v1/subscriptions/") && !path.includes("items")) return new Response(JSON.stringify({ id: "sub_1", items: { data: [{ id: "si_1" }] } }), { status: 200, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ id: "si_1", quantity: 3, status: "active" }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  expect(await quantityProvider.updateSubscriptionQuantity({ subscriptionId: "sub_1", quantity: 3, idempotencyKey: "qty-1" })).toMatchObject({ id: "si_1", quantity: 3 });
+  expect(await quantityProvider.changeSubscriptionPrice({ subscriptionId: "sub_1", priceId: "price_team", quantity: 3, prorationBehavior: "create_prorations", idempotencyKey: "chg-1" })).toMatchObject({ id: "sub_1" });
 });
 
 test("Stripe webhook verification rejects replay and invalid signatures", async () => {
@@ -143,13 +161,35 @@ test("Cloudflare secret bindings and portable metadata/evidence stores are provi
     { provider: "stripe", state: "unavailable", missing: ["STRIPE_WEBHOOK_SECRET", "STRIPE_PLANS_JSON"] },
     { provider: "cloudflare", state: "configured", missing: [] },
   ]);
+  const incompleteProduction = await hostedProviderConfig({ ENVIRONMENT: "production", STRIPE_SECRET_KEY: "stripe_test_secret", STRIPE_WEBHOOK_SECRET: "whsec_test", STRIPE_PLANS_JSON: JSON.stringify([{ id: "team", monthlyPriceId: "price_team" }]) });
+  expect(incompleteProduction.stripe.plans).toEqual([]);
+  expect(providerStatuses(incompleteProduction).find((item) => item.provider === "stripe")).toMatchObject({ state: "unavailable", missing: ["STRIPE_PLANS_JSON"] });
+  const completeProduction = await hostedProviderConfig({ ENVIRONMENT: "production", STRIPE_SECRET_KEY: "stripe_test_secret", STRIPE_WEBHOOK_SECRET: "whsec_test", STRIPE_PLANS_JSON: JSON.stringify([
+    { id: "developer", monthlyPriceId: "price_DevMonthly", annualPriceId: "price_DevAnnual", catalogVersion: "seat-v1" },
+    { id: "team", monthlyPriceId: "price_TeamMonthly", annualPriceId: "price_TeamAnnual", catalogVersion: "seat-v1" },
+    { id: "business", monthlyPriceId: "price_BusinessMonthly", annualPriceId: "price_BusinessAnnual", catalogVersion: "seat-v1" },
+  ]) });
+  expect(completeProduction.stripe.plans).toHaveLength(3);
+  expect(providerStatuses(completeProduction).find((item) => item.provider === "stripe")).toMatchObject({ state: "configured" });
   expect(JSON.stringify(providerStatuses(config))).not.toContain("workos_test_secret");
 
   const values = new Map<string, string>();
-  const database = { prepare: (query: string) => ({ bind: (...args: unknown[]) => ({ first: async <T>() => query.startsWith("SELECT") ? (values.has(String(args[0])) ? { value: values.get(String(args[0])) } as T : null) : null, run: async () => { if (query.startsWith("INSERT")) values.set(String(args[0]), String(args[1])); else values.delete(String(args[0])); } }) }) };
+  const database = { prepare: (query: string) => ({ bind: (...args: unknown[]) => ({ first: async <T>() => query.startsWith("SELECT") ? (values.has(String(args[0])) ? { value: values.get(String(args[0])) } as T : null) : null, run: async () => {
+    if (query.startsWith("INSERT OR IGNORE")) {
+      if (values.has(String(args[0]))) return { meta: { changes: 0 } };
+      values.set(String(args[0]), String(args[1]));
+      return { meta: { changes: 1 } };
+    }
+    if (query.startsWith("INSERT")) { values.set(String(args[0]), String(args[1])); return { meta: { changes: 1 } }; }
+    values.delete(String(args[0]));
+    return { meta: { changes: 1 } };
+  } }) }) };
   const metadata = new D1JsonMetadataStore(database);
   await metadata.put("org_1", { plan: "developer" });
   expect(await metadata.get("org_1")).toEqual({ plan: "developer" });
+  expect(await metadata.putIfAbsent("claim_1", { payloadDigest: "sha256:a" })).toBe(true);
+  expect(await metadata.putIfAbsent("claim_1", { payloadDigest: "sha256:b" })).toBe(false);
+  expect(await metadata.get("claim_1")).toEqual({ payloadDigest: "sha256:a" });
   await metadata.delete("org_1");
   expect(await metadata.get("org_1")).toBeNull();
 
@@ -158,6 +198,35 @@ test("Cloudflare secret bindings and portable metadata/evidence stores are provi
   const evidence = new R2JsonEvidenceStore(bucket, "runs/");
   await evidence.put("run_1", { schemaVersion: 1, organizationId: "org_1" });
   expect(await evidence.get("run_1")).toEqual({ schemaVersion: 1, organizationId: "org_1" });
+  const replicaPuts: string[] = [];
+  const replica = new HttpEvidenceReplica("https://export.example", "export-token", (async (input) => {
+    replicaPuts.push(String(input));
+    return new Response("no", { status: 500 });
+  }) as typeof fetch);
+  await expect(replica.put("k", { a: 1 })).rejects.toThrow(/HTTP 500/);
+  expect(await replica.get()).toBeNull();
+  await replica.delete();
+  const okReplica = new HttpEvidenceReplica("https://export.example/", undefined, (async () => new Response("ok", { status: 200 })) as typeof fetch);
+  await okReplica.put("k", { a: 1 });
+  expect(evidenceStoreFromEnv({})).toBeUndefined();
+  const fanout = new FanoutEvidenceStore(evidence, replica);
+  await fanout.put("run_2", { ok: true });
+  expect(await fanout.get("run_2")).toEqual({ ok: true });
+  await fanout.delete("run_2");
+  expect(replicaPuts.some((url) => url.includes("/run_2"))).toBe(true);
+  const store = evidenceStoreFromEnv({ bucket, exportEndpoint: "https://export.example" });
+  await store?.put("run_3", { primary: true });
+  expect(await store?.get("run_3")).toEqual({ primary: true });
+});
+
+test("Stripe catalog rejects reusing one price for monthly and annual billing", async () => {
+  const config = await hostedProviderConfig({ ENVIRONMENT: "production", STRIPE_SECRET_KEY: "stripe_test_secret", STRIPE_WEBHOOK_SECRET: "whsec_test", STRIPE_PLANS_JSON: JSON.stringify([
+    { id: "developer", monthlyPriceId: "price_same", annualPriceId: "price_same", catalogVersion: "seat-v1" },
+    { id: "team", monthlyPriceId: "price_team_month", annualPriceId: "price_team_year", catalogVersion: "seat-v1" },
+    { id: "business", monthlyPriceId: "price_business_month", annualPriceId: "price_business_year", catalogVersion: "seat-v1" },
+  ]) });
+  expect(config.stripe.plans).toEqual([]);
+  expect(providerStatuses(config).find((item) => item.provider === "stripe")).toMatchObject({ state: "unavailable" });
 });
 
 test("D1 sessions encrypt provider tokens and webhook claims are replay-safe", async () => {
@@ -218,9 +287,11 @@ test("D1 sessions encrypt provider tokens and webhook claims are replay-safe", a
 });
 
 test("Stripe plan fixtures and D1 billing mappings fail closed and reject stale events", async () => {
-  expect(parseStripePlans(JSON.stringify([{ id: "team", monthlyPriceId: "price_month", privateRepositoryLimit: 10, memberLimit: 5, retentionDays: 30, features: { team_invitations: true } }]))).toHaveLength(1);
-  expect(parseStripePlans(JSON.stringify([{ id: "unsafe", monthlyPriceId: "price_bad", privateRepositoryLimit: 10, retentionDays: 30 }]))).toEqual([]);
-  expect(parseStripePlans(JSON.stringify([{ id: "unsafe", monthlyPriceId: "price_bad", privateRepositoryLimit: -1, memberLimit: 5, retentionDays: 30, features: {} }]))).toEqual([]);
+  expect(parseStripePlans(JSON.stringify([{ id: "team", monthlyPriceId: "price_month", catalogVersion: "2026-08-18.seat-v1" }]))).toHaveLength(1);
+  expect(parseStripePlans(JSON.stringify([{ id: "team", monthlyPriceId: "price_month", memberLimit: 5 }]))).toEqual([]);
+  expect(parseStripePlans(JSON.stringify([{ id: "team", monthlyPriceId: "price_month", privateRepositoryLimit: 10 }]))).toEqual([]);
+  expect(parseStripePlans(JSON.stringify([{ id: "unsafe", monthlyPriceId: "price_bad", retentionDays: 30 }]))).toEqual([]);
+  expect(parseStripePlans(JSON.stringify([{ id: "unsafe", monthlyPriceId: "price_bad", retentionDays: -1, features: {} }]))).toEqual([]);
 
   let row: Record<string, unknown> | null = null;
   const database = {
@@ -298,4 +369,17 @@ test("D1 tenant invitation state and seat usage are organization-scoped", async 
   expect(await tenants.getPendingInvitation("org_1", "INVITEE@example.com")).toMatchObject({ invitationId: "inv_1", role: "viewer", state: "pending" });
   expect(await tenants.listInvitations("org_1")).toHaveLength(1);
   expect(await tenants.getPendingInvitation("org_2", "invitee@example.com")).toBeNull();
+});
+
+test("malformed provider signatures, unavailable providers, and incomplete sessions fail closed", async () => {
+  expect(await verifyStripeSignature("{}", null, "whsec_test")).toBe(false);
+  expect(await verifyStripeSignature("{}", "t=1,v1=nothex", "whsec_test")).toBe(false);
+  expect(await verifyWorkOSSignature("{}", "not-a-signature", "workos_webhook_secret")).toBe(false);
+  expect(await verifyWorkOSSignature("{}", null, "workos_webhook_secret")).toBe(false);
+  const workos = new WorkOSAuthProvider({});
+  await expect(workos.exchangeCode({ code: "auth_code" })).rejects.toMatchObject({ code: "provider_not_configured" });
+  const stripe = new StripeBillingProvider({ plans: [] });
+  await expect(stripe.createPortalSession({ customerId: "cus_1", returnUrl: "https://tinkerbot.example/app", idempotencyKey: "portal-1" })).rejects.toMatchObject({ code: "provider_not_configured" });
+  const config = await hostedProviderConfig({ ENVIRONMENT: "staging" });
+  expect(providerStatuses(config).some((item) => item.provider === "workos" && item.state === "unavailable")).toBe(true);
 });

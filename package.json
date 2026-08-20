@@ -27,11 +27,13 @@
   "bin": {
     "pr-proof": "dist/packages/cli/src/index.js",
     "tb": "dist/packages/cli/src/index.js",
-    "tinkerbot": "dist/packages/cli/src/index.js"
+    "tinkerbot": "dist/packages/cli/src/index.js",
+    "tinkerbot-factory": "dist/packages/cli/src/factory-cli.js",
+    "tinkerbot-tui": "dist/packages/cli/src/workstation-cli.js",
+    "tinkerbot-mcp": "dist/packages/platform-mcp/src/cli.js"
   },
   "files": [
     "dist/packages",
-    "dist/tui",
     "dist/action",
     "action.yml",
     "action/index.js",
@@ -40,45 +42,49 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:control-plane-assets": "node apps/control-plane/build-assets.mjs",
     "lint": "tsc -p tsconfig.json --noEmit",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "pnpm build && vitest run",
     "test:coverage": "pnpm build && vitest run --coverage && node scripts/verify-coverage.mjs",
     "coverage:check": "node scripts/verify-coverage.mjs",
     "test:watch": "vitest",
+    "test:e2e": "playwright install chromium && playwright test",
+    "test:all": "pnpm test && pnpm test:e2e",
     "validate:providers": "node scripts/validate-live-providers.mjs",
+    "validate:stripe": "pnpm build && node scripts/validate-stripe-catalog.mjs",
     "prepare": "npm run build",
     "prepack": "node scripts/prepare-package.mjs",
     "tb": "node dist/packages/cli/src/index.js",
-    "tui:build": "bun --cwd packages/tui scripts/build.ts",
-    "tui:compile": "bun --cwd packages/tui scripts/compile.ts",
-    "tui:compile:release": "node scripts/build-release-clients.mjs",
-    "tui:test": "bun --cwd packages/tui test --preload @opentui/solid/preload src",
-    "tui:test:coverage": "bun --cwd packages/tui test --coverage --preload @opentui/solid/preload src",
-    "release:clients": "pnpm build && pnpm tui:compile:release && node scripts/package-release-clients.mjs && node scripts/generate-release-manifest.mjs",
+    "factory-cli": "node dist/packages/cli/src/factory-cli.js",
+    "tui:kit": "node dist/packages/cli/src/workstation-cli.js",
+    "mcp:platform": "node dist/packages/platform-mcp/src/cli.js",
+    "tui": "node dist/packages/cli/src/index.js tui",
+    "tui:once": "node dist/packages/cli/src/index.js tui --once",
+    "release:clients": "pnpm build && node scripts/package-release-clients.mjs && node scripts/generate-release-manifest.mjs",
     "release:homebrew": "node scripts/render-homebrew-formula.mjs",
-    "release:dry-run": "pnpm build && pnpm tui:build && pnpm pack --pack-destination /tmp/tinkerbot-pack-release && NPM_CONFIG_CACHE=/tmp/tinkerbot-npm-cache npm pack --dry-run"
+    "release:dry-run": "pnpm build && pnpm pack --pack-destination /tmp/tinkerbot-pack-release && NPM_CONFIG_CACHE=/tmp/tinkerbot-npm-cache npm pack --dry-run"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
+    "@blobatar/react": "^2.2.0",
+    "blobatar": "^2.2.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
     "typescript": "5.9.3",
     "yaml": "2.9.0"
   },
   "devDependencies": {
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@fontsource/ibm-plex-sans": "^5.3.0",
+    "@playwright/test": "1.55.1",
     "@types/node": "22.20.1",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
     "@vitest/coverage-v8": "3.2.7",
+    "esbuild": "^0.28.2",
     "vitest": "3.2.7"
-  },
-  "optionalDependencies": {
-    "@opentui/core-darwin-arm64": "0.4.5",
-    "@opentui/core-darwin-x64": "0.4.5",
-    "@opentui/core-linux-arm64": "0.4.5",
-    "@opentui/core-linux-x64": "0.4.5",
-    "@opentui/core-linux-arm64-musl": "0.4.5",
-    "@opentui/core-linux-x64-musl": "0.4.5",
-    "@opentui/core-win32-arm64": "0.4.5",
-    "@opentui/core-win32-x64": "0.4.5"
   }
 }

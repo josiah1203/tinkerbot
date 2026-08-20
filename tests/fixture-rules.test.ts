@@ -20,7 +20,7 @@ test("runs the real test-integrity rule fixture matrix", () => {
       expect(finding?.line, fixture.name).toBeGreaterThan(0);
       expect(finding?.message, fixture.name).toBeTruthy();
       expect(finding?.suggestedAction, fixture.name).toBeTruthy();
-      const report = finalizeReport({ schemaVersion: 1, toolVersion: "0.1.0", repository: "fixture", base: "base-sha", head: "head-sha", verdict: "NEEDS_REVIEW", summary: { assertionsWeakened: 1, newTests: 0, testsPassingOnBase: 0, changedLinesCoveredPercentage: null, mutantsKilled: 0, mutantsTotal: 0, changedSymbols: 0, downstreamConsumers: 0, impactedTests: 0, impactedPathsExecuted: 0, impactedPathsTotal: 0, unverifiedPaths: 0 }, findings: [finding!], limitations: [] });
+      const report = finalizeReport({ schemaVersion: 1, toolVersion: "0.1.0", repository: "fixture", base: "base-sha", head: "head-sha", verdict: "UNKNOWN", reviewAssessment: "NEEDS_HUMAN_REVIEW", summary: { assertionsWeakened: 1, newTests: 0, testsPassingOnBase: 0, changedLinesCoveredPercentage: null, mutantsKilled: 0, mutantsTotal: 0, changedSymbols: 0, downstreamConsumers: 0, impactedTests: 0, impactedPathsExecuted: 0, impactedPathsTotal: 0, unverifiedPaths: 0 }, findings: [finding!], limitations: [] });
       expect(renderJson(report)).toContain(`"ruleId": "${fixture.rule}"`);
       expect(renderMarkdown(report)).toContain(finding?.message ?? "");
       expect(renderSarif(report)).toContain(`"startLine": ${finding?.line}`);

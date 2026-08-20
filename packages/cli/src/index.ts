@@ -4,6 +4,8 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import {
   calculateVerdict,
+  classifyUnknowns,
+  combineVerification,
   finalizeReport,
   FEATURE_CAPABILITIES,
   loadConfig,
@@ -62,8 +64,16 @@ import {
   type VerificationReceipt,
 } from "../../assurance/src";
 import { runDoctor, renderDoctor } from "./doctor";
-import { runControlPlaneServer } from "./serve";
-import { runTui } from "./tui";
+import { clearStoredCredentials, hostedSession, saveStoredCredentials } from "./credentials";
+import { loadFactoryDefinition, validateAgentReceipt, buildFactoryStarter } from "../../factory/src";
+import { evalCli, evalCliAsync, executeLocalRun, factoryPlanPayload, localDashboardPayload } from "./runtime-cli";
+import { cellCheckPayload, factoryCheckPayload, factoryInitPayload, localFactoryGraphStatusPayload, localIntentPayload, localOutcomePayload, localWorkApprovalPayload, localWorkNewPayload, outcomeCheckPayload } from "./factory-os";
+import { createLocalDashboardServer, localDashboardUrl } from "./local-dashboard";
+import { formatCostTab, formatEvalTab, formatPlanTab } from "../../local-runtime/src";
+import { isInteractiveTty, runTui, TUI_HELP, type TuiDeps, type TuiOptions } from "./tui/index";
+import { isAgentId, listAgentsJson, runKitWorkstationInteractive } from "../../tui/src";
+import { planVerificationStreams } from "./tui/streams";
+import type { StageEvent } from "./tui/types";
 
 export const EXIT_CODES = {
   PASS: 0,
@@ -111,8 +121,20 @@ interface CliOptions {
   host?: string;
   directory?: string;
   repository?: string;
+  token?: string;
+  url?: string;
   verbose: boolean;
   help: boolean;
+  once?: boolean;
+  agent?: string;
+  local?: boolean;
+  profile?: string;
+  allowProcessRunner?: boolean;
+  allowExternalHarness?: boolean;
+  intentMode?: "micro" | "standard" | "strategic";
+  workOrderId?: string;
+  outcomeStatus?: "POSITIVE" | "NEUTRAL" | "NEGATIVE" | "UNKNOWN";
+  outcomeMature?: boolean;
 }
 
 function valueAfter(rest: string[], index: number, flag: string): string {
@@ -131,11 +153,11 @@ function parseArgs(argv: string[]): CliOptions {
   const first = argv[0];
   // `tb` is the interactive product surface. A non-interactive invocation
   // remains safe for automation and package probes by printing help instead.
-  const command = first === "--version" || first === "-V" ? "version" : first === "--help" || first === "-h" ? "help" : first ?? (process.stdout.isTTY ? "tui" : "help");
+  const command = first === "--version" || first === "-V" ? "version" : first === "--help" || first === "-h" ? "help" : first ?? "help";
   const rest = first === "--version" || first === "-V" || first === "--help" || first === "-h" ? argv.slice(1) : argv.slice(1);
   const options: CliOptions = { command, head: "HEAD", format: "terminal", baseTests: true, verbose: false, help: false };
   let index = 0;
-  if (["config", "baseline", "policy", "history", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "org", "github"].includes(command) && rest[0] && !rest[0].startsWith("--")) {
+  if (["config", "baseline", "policy", "history", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "org", "github", "factory", "work", "run", "receipt", "cell", "product", "skill", "evolution", "billing", "tui", "eval"].includes(command) && rest[0] && !rest[0].startsWith("--")) {
     options.subcommand = rest[0];
     index = 1;
   }
@@ -180,9 +202,29 @@ function parseArgs(argv: string[]): CliOptions {
     else if (token === "--host") options.host = valueAfter(rest, index++, token);
     else if (token === "--directory") options.directory = valueAfter(rest, index++, token);
     else if (token === "--repository") options.repository = valueAfter(rest, index++, token);
+    else if (token === "--token") options.token = valueAfter(rest, index++, token);
+    else if (token === "--url") options.url = valueAfter(rest, index++, token);
     else if (token === "--verbose") options.verbose = true;
+    else if (token === "--once") options.once = true;
+    else if (token === "--agent") options.agent = valueAfter(rest, index++, token);
+    else if (token === "--local") options.local = true;
+    else if (token === "--profile") options.profile = valueAfter(rest, index++, token);
+    else if (token === "--intent-mode") {
+      const mode = valueAfter(rest, index++, token);
+      if (mode !== "micro" && mode !== "standard" && mode !== "strategic") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "--intent-mode must be micro, standard, or strategic");
+      options.intentMode = mode;
+    }
+    else if (token === "--work-order") options.workOrderId = valueAfter(rest, index++, token);
+    else if (token === "--outcome-status") {
+      const status = valueAfter(rest, index++, token).toUpperCase();
+      if (status !== "POSITIVE" && status !== "NEUTRAL" && status !== "NEGATIVE" && status !== "UNKNOWN") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "--outcome-status must be POSITIVE, NEUTRAL, NEGATIVE, or UNKNOWN");
+      options.outcomeStatus = status;
+    }
+    else if (token === "--mature") options.outcomeMature = true;
+    else if (token === "--allow-process-runner") options.allowProcessRunner = true;
+    else if (token === "--allow-external-harness") options.allowExternalHarness = true;
     else if (token.startsWith("--")) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown option: ${token}`);
-    else if (["policy", "history", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "org", "github"].includes(command) && !options.positional) options.positional = token;
+    else if (["intent", "policy", "history", "proof", "repo", "change", "change-set", "release", "outcome", "evidence", "org", "github", "factory", "work", "run", "receipt", "cell", "product", "skill", "evolution", "billing", "tui", "eval"].includes(command) && !options.positional) options.positional = token;
     else throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unexpected argument: ${token}`);
   }
   if (!["terminal", "json", "markdown", "sarif", "review-context", "receipt", "change-assurance", "release-manifest"].includes(options.format)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown report format: ${options.format}`);
@@ -196,11 +238,24 @@ function parseArgs(argv: string[]): CliOptions {
   if (command === "change" && options.subcommand === "contract" && options.subcommand2 && !["validate", "assess"].includes(options.subcommand2)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown change contract command: ${options.subcommand2}`);
   if (command === "change-set" && options.subcommand && !["assess", "export"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown change-set command: ${options.subcommand}`);
   if (command === "release" && options.subcommand && !["assess", "manifest"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown release command: ${options.subcommand}`);
-  if (command === "outcome" && options.subcommand && !["record", "export"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown outcome command: ${options.subcommand}`);
+  if (command === "outcome" && options.subcommand && !["record", "export", "check"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown outcome command: ${options.subcommand}`);
   if (command === "evidence" && options.subcommand && !["export"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown evidence command: ${options.subcommand}`);
-  if (command === "org" && options.subcommand && !["list", "switch"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown org command: ${options.subcommand}`);
+  if (command === "org" && options.subcommand && !["list", "switch", "seats"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown org command: ${options.subcommand}`);
   if (command === "org" && options.subcommand === "switch" && !options.positional) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "org switch requires an organization identifier");
+  if (command === "billing" && options.subcommand && !["summary", "catalog", "portal"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown billing command: ${options.subcommand}`);
   if (command === "github" && options.subcommand && options.subcommand !== "run") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown github command: ${options.subcommand}`);
+  if (command === "factory" && options.subcommand && !["list", "show", "status", "validate", "sync", "mcp", "new", "plan", "init", "check"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown factory command: ${options.subcommand}`);
+  if (command === "work" && options.subcommand && !["list", "show", "graph", "retry", "approve", "cancel", "take", "return", "new"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown work command: ${options.subcommand}`);
+  if (command === "run" && options.subcommand && !["show", "logs"].includes(options.subcommand) && !options.local) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown run command: ${options.subcommand}`);
+  if (command === "eval" && options.subcommand && !["init", "add", "run", "compare", "baseline", "export"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown eval command: ${options.subcommand}`);
+  if (command === "cell" && options.subcommand && !["list", "show", "check"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown cell command: ${options.subcommand}`);
+  if (command === "product" && options.subcommand && !["list", "show"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown product command: ${options.subcommand}`);
+  if (command === "skill" && options.subcommand && !["list", "show"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown skill command: ${options.subcommand}`);
+  if (command === "evolution" && options.subcommand && !["list", "show", "approve"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown evolution command: ${options.subcommand}`);
+  if (command === "receipt" && options.subcommand && options.subcommand !== "validate") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown receipt command: ${options.subcommand}`);
+  if (command === "tui" && options.subcommand && !["check", "work"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown tui command: ${options.subcommand}`);
+  if (command === "tui" && options.subcommand === "work" && !options.positional) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb tui work requires a work-order id");
+  if (command === "tui" && options.agent && !["claude", "gemini", "codex", "cursor", "shell"].includes(options.agent)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "--agent must be claude, gemini, codex, cursor, or shell");
   if (command === "serve" && options.format !== "terminal") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "serve does not support report formats");
   return options;
 }
@@ -284,6 +339,7 @@ export interface RunOptions {
   timeout?: number;
   maxFiles?: number;
   maxFindings?: number;
+  onStage?: (event: StageEvent) => void;
 }
 
 export function createReport(run: RunOptions = {}): PrProofReport {
@@ -299,21 +355,54 @@ export function createReport(run: RunOptions = {}): PrProofReport {
   const runTest = !run.command || run.command === "check" || run.command === "test-integrity";
   const runImpact = !run.command || run.command === "check" || run.command === "impact";
   const runFixtures = (!run.command || run.command === "check") && config.fixtures.enabled;
+  const emit = (event: StageEvent) => { run.onStage?.(event); };
+  emit({ type: "stage_start", id: "coverage", label: "Coverage", feedsVerdict: true });
   const coverage = readCoverage(root, config.framework.coverage_file);
+  emit({ type: "stage_end", id: "coverage", status: "done", summary: coverage.available ? "coverage artifact present" : (coverage.unknowns ?? ["coverage unavailable"]).join(" "), feedsVerdict: true });
   const artifacts = config.framework.coverage_file ? [loadArtifact(root, config.framework.coverage_file)] : [];
+  emit({ type: "stage_start", id: "suite", label: `Bash(${config.framework.command})`, feedsVerdict: true });
   const testIntegrity = runTest ? analyzeTestIntegrity(root, gitContext.diffs, config, { base: gitContext.base, head: gitContext.head, coverage }) : undefined;
+  emit({ type: "stage_end", id: "suite", status: config.test_integrity.run_base_tests ? "done" : "locked", summary: config.test_integrity.run_base_tests ? `${testIntegrity?.unknowns.length ?? 0} suite unknowns` : "Base/head execution is disabled; missing suite evidence is UNKNOWN.", feedsVerdict: true });
+  emit({ type: "stage_start", id: "integrity", label: "TestIntegrity", feedsVerdict: true });
   if (testIntegrity && coverage.unknowns?.length) testIntegrity.unknowns.push(...coverage.unknowns);
+  emit({ type: "stage_end", id: "integrity", status: "done", summary: testIntegrity ? `${testIntegrity.findings.length} findings · ${testIntegrity.newTests} new tests` : "not run", feedsVerdict: true });
   let mutation;
-  if (runTest && (run.runMutation ?? config.test_integrity.mutation_testing.enabled)) mutation = runTargetedMutation({ root, diffs: gitContext.diffs, config: config.test_integrity.mutation_testing, base: gitContext.base, head: gitContext.head, toolVersion: TOOL_VERSION, allowShellCommands: config.validation.allow_shell_commands, testConfiguration: { runner: config.framework.test_runner, command: config.framework.command, coverageFile: config.framework.coverage_file, timeoutSeconds: config.framework.test_timeout_seconds } });
+  if (runTest && (run.runMutation ?? config.test_integrity.mutation_testing.enabled)) {
+    emit({ type: "stage_start", id: "mutation", label: "Mutation", feedsVerdict: true });
+    mutation = runTargetedMutation({ root, diffs: gitContext.diffs, config: config.test_integrity.mutation_testing, base: gitContext.base, head: gitContext.head, toolVersion: TOOL_VERSION, allowShellCommands: config.validation.allow_shell_commands, testConfiguration: { runner: config.framework.test_runner, command: config.framework.command, coverageFile: config.framework.coverage_file, timeoutSeconds: config.framework.test_timeout_seconds } });
+    emit({ type: "stage_end", id: "mutation", status: "done", summary: `${mutation.killed} killed / ${mutation.results.length} mutants`, feedsVerdict: true });
+  }
   if (testIntegrity && mutation) {
     testIntegrity.mutation = mutation;
     testIntegrity.findings = [...testIntegrity.findings, ...mutationFindings(mutation)];
     if (mutation.limitation && mutation.enabled) testIntegrity.unknowns.push(mutation.limitation);
   }
+  emit({ type: "stage_start", id: "impact", label: "Impact", feedsVerdict: true });
   const impact = runImpact ? analyzeImpact({ root, base: gitContext.base, head: gitContext.head, diffs: gitContext.diffs, config, coverage }) : undefined;
+  emit({ type: "stage_end", id: "impact", status: "done", summary: impact ? `${impact.paths.length} paths · ${impact.unknowns.length} unknowns` : "not run", feedsVerdict: true });
+  if (run.onStage && impact) {
+    const selection = selectTests({ root, head: gitContext.head, diffs: gitContext.diffs, impact, config });
+    const planned = planVerificationStreams(selection, {
+      runBaseTests: config.test_integrity.run_base_tests,
+      runMutation: Boolean(mutation),
+      watchSubset: true,
+      coverageConfigured: Boolean(config.framework.coverage_file),
+      fixturesEnabled: Boolean(runFixtures),
+      testCommand: config.framework.command,
+    });
+    const subset = planned.find((stream) => stream.id === "subset");
+    emit({ type: "stage_start", id: "select", label: "SelectTests", feedsVerdict: false });
+    emit({ type: "stage_end", id: "select", status: "done", summary: `${selection.selected.length} selected · ${selection.requiresFullSuite ? "full suite required" : "recommendation only"}`, feedsVerdict: false });
+    emit({ type: "stage_start", id: "subset", label: "Subset", feedsVerdict: false });
+    emit({ type: "stage_end", id: "subset", status: subset?.locked ? "locked" : "done", summary: subset?.locked ? subset.lockReason : `${selection.selected.join("\n")}\nearly signal; does not feed the verdict`, feedsVerdict: false });
+  }
   const languageFiles = listFilesAtRevision(gitContext.head, root).filter((file) => isSourceFile(file) && languageEnabled(file, config.languages));
   const languages = summarizeLanguageFiles(languageFiles, [...(impact?.unknowns ?? []), ...(testIntegrity?.unknowns ?? [])]);
   const fixtures = runFixtures ? analyzeFixtures(gitContext.diffs, config.fixtures) : undefined;
+  if (runFixtures) {
+    emit({ type: "stage_start", id: "fixtures", label: "Fixtures", feedsVerdict: true });
+    emit({ type: "stage_end", id: "fixtures", status: "done", summary: `${fixtures?.findings.length ?? 0} findings · ${fixtures?.unknowns.length ?? 0} unknowns`, feedsVerdict: true });
+  }
   const provenance = impact ? buildProvenance(root, gitContext.diffs, impact) : [];
   const policy = getPolicyPack(config.policy.pack);
   const policyUnknowns = [...new Set([...(testIntegrity?.unknowns ?? []), ...(impact?.unknowns ?? []), ...(fixtures?.unknowns ?? []), ...artifacts.flatMap((artifact) => artifact.unknowns)])];
@@ -337,7 +426,7 @@ export function createReport(run: RunOptions = {}): PrProofReport {
   }] : [];
   const sortedFindings = sortFindings([...policyApply.findings, ...policyFindings]);
   const findings = sortedFindings.slice(0, config.limits.max_findings);
-  const limitations = [...new Set([...policyUnknowns, ...(sortedFindings.length > findings.length ? [`Finding output was capped at ${config.limits.max_findings}; review the full analysis in smaller bounded runs.`] : [])])];
+  const limitations = classifyUnknowns([...new Set([...policyUnknowns, ...(sortedFindings.length > findings.length ? [`Finding output was capped at ${config.limits.max_findings}; review the full analysis in smaller bounded runs.`] : [])])]);
   const summary = {
     assertionsWeakened: testIntegrity?.findings.filter((finding) => /assertion|matcher|tolerance|disabled|deleted/.test(finding.ruleId)).length ?? 0,
     newTests: testIntegrity?.newTests ?? 0,
@@ -379,8 +468,9 @@ export function createReport(run: RunOptions = {}): PrProofReport {
   const verdictConfig = (baseline?.newCount && config.baseline.fail_on_new) || policyRequestsBlocking || (policyApply.unknownHandling === "fail" && finalLimitations.length)
     ? { ...config, test_integrity: { ...config.test_integrity, mode: "blocking" as const } }
     : config;
-  const verdict = calculateVerdict(baselineFindings, verdictConfig, finalLimitations);
-  return finalizeReport({ ...preliminary, verdict, findings: baselineFindings, testIntegrity: baselineTestIntegrity, impact: baselineImpact, fixtures: baselineFixtures, baseline, limitations: finalLimitations });
+  const combined = combineVerification({ findings: baselineFindings, config: verdictConfig, unknowns: finalLimitations });
+  const verdict = combined.verificationVerdict;
+  return finalizeReport({ ...preliminary, verdict, reviewAssessment: combined.reviewAssessment, findings: baselineFindings, testIntegrity: baselineTestIntegrity, impact: baselineImpact, fixtures: baselineFixtures, baseline, limitations: classifyUnknowns(finalLimitations) });
 }
 
 function versionText(root = process.cwd()): string {
@@ -390,13 +480,30 @@ function versionText(root = process.cwd()): string {
 }
 
 function help(command?: string): string {
-  if (command === "tui") return "Usage: tb tui [--base REF] [--head REF] [--config FILE]\n\nLaunch the local-first OpenTUI workspace.\n";
-  if (command === "serve") return "Usage: pr-proof serve [--host 127.0.0.1] [--port 4173] [--directory apps/control-plane]\n";
-  if (command === undefined) return "Tinkerbot — deterministic change assurance\n\nInteractive: tb (or tb tui)\nCore: check, test-integrity, impact, contracts, fixtures, select-tests, artifacts, history, report\nAssurance: proof create|verify|replay; repo inspect|map; change contract validate|assess; change assess; policy simulate; change-set assess|export; release assess|manifest; outcome record|export; evidence --format review-context|receipt|change-assurance|release-manifest\n\nHosted commands that are not compiled into this client exit 12; they never succeed by printing help. Use tb <command> --help for command details.\n";
-  if (["proof", "repo", "change", "change-set", "release", "outcome", "evidence"].includes(command ?? "")) return `Usage: tb ${command} ...\n\nAssurance commands are local-first and emit machine-readable JSON with --format json.\n`;
-  if (["check", "test-integrity", "impact", "contracts", "fixtures", "select-tests"].includes(command ?? "")) return `Usage: pr-proof ${command} [options]\n\nOptions:\n  --base REF              base revision\n  --head REF              head revision (default: HEAD)\n  --format FORMAT         terminal, json, markdown, or sarif\n  --output FILE           write rendered output\n  --config FILE           configuration path\n  --policy PACK           policy pack\n  --mode MODE             advisory or blocking\n  --fail-on RULES         comma-separated impact rules\n  --timeout SECONDS       analysis timeout\n  --max-files N           bound files analyzed\n  --max-findings N        bound findings emitted\n  --mutation-enabled BOOL enable/disable mutation testing\n  --mutation-max N        maximum mutants\n  --no-base-tests         skip base/head execution\n  --verbose               include additional diagnostics\n`;
-  if (command === "artifacts") return "Usage: pr-proof artifacts --input FILE [--type TYPE] [--format json|terminal]\n";
-  return `Tinkerbot — deterministic change assurance\n\nCommands:\n  tb [tui]\n  tb --version\n  tb doctor\n  tb config validate|explain [--config FILE]\n  tb policy list|explain <pack>\n  tb baseline init|check|update\n  tb check --base origin/main --head HEAD\n  tb test-integrity --base origin/main --head HEAD\n  tb impact --base origin/main --head HEAD\n  tb contracts --base origin/main --head HEAD\n  tb fixtures --base origin/main --head HEAD\n  tb select-tests --base origin/main --head HEAD\n  tb artifacts --input coverage/lcov.info\n  tb history [compare <revision>]\n  tb report --format sarif --input .tinkerbot/report.json\n  tb usage [--json]\n\nHosted command names: login, logout, whoami, org list|switch, verify, explain, github run. An unavailable hosted command exits 12.\n\nRun tb <command> --help for command options.\n`;
+  if (command === "tui") return TUI_HELP;
+  if (command === "agents") return "Usage: tb agents\n\nList local agent CLIs on PATH. OAuth stays in the child CLI. Tinkerbot does not store vendor tokens.\n";
+  if (command === "dashboard") return "Usage: tb dashboard [--local] [--port 4174]\n\nOpen the authenticated Tinkerbot dashboard, or serve a local SQLite adapter on 127.0.0.1 with --local (not `tb serve`).\n";
+  if (command === "login") return "Usage: tb login --token SESSION [--url https://control.example]\n\nStore a short-lived control-plane session. Browser login opens the public website.\n";
+  if (command === "intent") return "Usage: tb intent [--intent-mode micro|standard|strategic] \"description\"\n\nPersist a provider-independent intent contract in the local Factory Graph. Strategic intents include baseline, target, measurement, owner, and kill criteria.\n";
+  if (command === "factory") return "Usage: tb factory list|show|validate|check|sync|mcp|new|init|plan\n\n`tb factory init` inspects the repo and writes a conservative .tinkerbot tree (no LLM). `tb factory check` compiles an immutable FactoryPlan. `tb factory new` writes a named starter. `tb factory validate` parses only.\n";
+  if (command === "work") return "Usage: tb work list|show|graph|new|retry|approve|cancel|take|return [id]\n\n`tb work new` creates a local WorkOrder without an LLM. `tb work graph <id>` reads the append-only Factory Graph; `tb work approve <id>` records a human approval event locally.\n";
+  if (command === "outcome") return "Usage: tb outcome record|export|check [--input FILE] [--work-order ID --outcome-status POSITIVE|NEUTRAL|NEGATIVE|UNKNOWN --mature]\n\nWithout --work-order, outcome records remain compatible with the assurance JSONL format. With it, the observation is also written to the local append-only Factory Graph.\n";
+  if (command === "cell") return "Usage: tb cell list|show|check\n\n`tb cell check` reproduces lease/branch/credential scope. It is not tb check.\n";
+  if (command === "product") return "Usage: tb product list|show [id]\n";
+  if (command === "skill") return "Usage: tb skill list|show [id]\n";
+  if (command === "evolution") return "Usage: tb evolution list|show|approve [id]\n";
+  if (command === "run") return "Usage: tb run show|logs <id>\n       tb run --local [--profile solo] [--allow-process-runner] [--allow-external-harness]\n";
+  if (command === "eval") return "Usage: tb eval init|add|run|compare|baseline|export\n\nPortable personal evals. Scorers are advisory and never upgrade tb check.\n";
+  if (command === "org") return "Usage: tb org list|switch|seats [organization-id]\n";
+  if (command === "billing") return "Usage: tb billing summary|catalog|portal\n\nHosted billing reads the server catalog and seat quantity. Portal opens your Tinkerbot billing portal.\n";
+  if (command === "receipt") return "Usage: tb receipt validate --input FILE\n\nValidate an agent execution receipt. A valid receipt never upgrades a failed or unknown verdict.\n";
+  if (command === "serve") return "Usage: tb serve is retired. Use the hosted dashboard or `tb dashboard --local`.\n";
+  if (command === undefined) return "Tinkerbot — factory operating system and deterministic verification\n\nHosted: login, logout, whoami, org list|switch|seats, billing summary|catalog|portal, dashboard, factory, work, cell, product, skill, evolution, run, verify\nLocal runtime: tb run --local, tb factory plan, tb eval, tb dashboard --local\nCore: tui, agents, check, test-integrity, impact, contracts, fixtures, select-tests, artifacts, history, report, doctor\nAssurance: proof create|verify|replay; repo inspect|map; change contract validate|assess; release assess; outcome record; evidence\n\nUse tb <command> --help for command details.\n";
+  if (["proof", "repo", "change", "change-set", "release", "outcome", "evidence"].includes(command ?? "")) return `Usage: tb ${command} ...\n\nAssurance commands emit machine-readable JSON with --format json.\n`;
+  if (["check", "test-integrity", "impact", "contracts", "fixtures", "select-tests"].includes(command ?? "")) return `Usage: tb ${command} [options]\n\nOptions:\n  --base REF              base revision\n  --head REF              head revision (default: HEAD)\n  --format FORMAT         terminal, json, markdown, or sarif\n  --output FILE           write rendered output\n  --config FILE           configuration path\n  --policy PACK           policy pack\n  --mode MODE             advisory or blocking\n  --fail-on RULES         comma-separated impact rules\n  --timeout SECONDS       analysis timeout\n  --max-files N           bound files analyzed\n  --max-findings N        bound findings emitted\n  --mutation-enabled BOOL enable/disable mutation testing\n  --mutation-max N        maximum mutants\n  --no-base-tests         skip base/head execution\n  --verbose               include additional diagnostics\n`;
+  if (command === "artifacts") return "Usage: tb artifacts --input FILE [--type TYPE] [--format json|terminal]\n";
+  return `Tinkerbot — factory operating system and deterministic verification\n\nCommands:\n  tb --version\n  tb login --token SESSION\n  tb tui\n  tb dashboard [--local]\n  tb factory validate|check|list|show|sync|mcp|new|init|plan
+  tb run --local [--profile solo]\n  tb eval init|add|run|compare|baseline|export\n  tb agents\n  tb work list|show|take|return|approve\n  tb cell list\n  tb product list\n  tb skill list\n  tb evolution list|approve\n  tb run show <id>\n  tb check --base origin/main --head HEAD\n  tb doctor\n`;
 }
 
 function legacyInvocationWarning(): void {
@@ -465,7 +572,7 @@ function usageCommand(options: CliOptions): number {
   let usage: UsageSummary;
   try {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<UsageSummary>;
-    if (!parsed || typeof parsed !== "object" || !Number.isFinite(parsed.durationMs) || !Number.isFinite(parsed.filesAnalyzed) || !Number.isFinite(parsed.symbolsAnalyzed) || !Number.isFinite(parsed.mutantsAttempted) || !["hit", "miss", "disabled", "not_run"].includes(String(parsed.mutationCache)) || !["available", "unavailable"].includes(String(parsed.coverage)) || !["PASS", "NEEDS_REVIEW", "UNKNOWN", "FAIL"].includes(String(parsed.verdict)) || !Array.isArray(parsed.unknownReasons) || !parsed.findingsByRule || typeof parsed.findingsByRule !== "object") throw new Error("usage report shape is invalid");
+    if (!parsed || typeof parsed !== "object" || !Number.isFinite(parsed.durationMs) || !Number.isFinite(parsed.filesAnalyzed) || !Number.isFinite(parsed.symbolsAnalyzed) || !Number.isFinite(parsed.mutantsAttempted) || !["hit", "miss", "disabled", "not_run"].includes(String(parsed.mutationCache)) || !["available", "unavailable"].includes(String(parsed.coverage)) || !["PASS", "UNKNOWN", "FAIL"].includes(String(parsed.verdict)) || !Array.isArray(parsed.unknownReasons) || !parsed.findingsByRule || typeof parsed.findingsByRule !== "object") throw new Error("usage report shape is invalid");
     usage = parsed as UsageSummary;
   } catch {
     throw new CliFailure(EXIT_CODES.UNKNOWN, "Usage report is malformed and cannot be trusted; run pr-proof check again.");
@@ -489,7 +596,7 @@ function writeOutput(root: string, options: CliOptions, content: string): void {
 }
 
 function reportExitCode(report: PrProofReport, config: PrProofConfig, options: CliOptions): number {
-  if (report.verdict === "FAIL" || ((options.mode === "blocking" || config.test_integrity.mode === "blocking") && report.verdict === "NEEDS_REVIEW")) return EXIT_CODES.FAIL;
+  if (report.verdict === "FAIL") return EXIT_CODES.FAIL;
   if (report.verdict === "UNKNOWN" && config.output.fail_on_unknown) return EXIT_CODES.UNKNOWN;
   return EXIT_CODES.PASS;
 }
@@ -507,7 +614,8 @@ function standaloneReport(root: string, options: CliOptions, base: string, head:
   const reportFindings = uncappedFindings.slice(0, config.limits.max_findings);
   const reportLimitations = [...new Set([...limitations, ...(uncappedFindings.length > reportFindings.length ? [`Finding output was capped at ${config.limits.max_findings}; review the analysis in smaller bounded runs.`] : [])])];
   const verdictConfig = (policyResult.unknownHandling === "fail" && reportLimitations.length) || (pack.id !== "default" && pack.id !== "agent-authored-change") ? { ...config, test_integrity: { ...config.test_integrity, mode: "blocking" as const } } : config;
-  const report = { schemaVersion: 1 as const, toolVersion: TOOL_VERSION, repository: repositoryLabel(root), base, head, verdict: calculateVerdict(reportFindings, verdictConfig, reportLimitations), summary: zeroSummary(), findings: reportFindings, limitations: reportLimitations, policy: { pack: pack.id, rationale: pack.rationale, unknownHandling: policyResult.unknownHandling }, ...extra };
+  const combined = combineVerification({ findings: reportFindings, config: verdictConfig, unknowns: reportLimitations });
+  const report = { schemaVersion: 1 as const, toolVersion: TOOL_VERSION, repository: repositoryLabel(root), base, head, verdict: combined.verificationVerdict, reviewAssessment: combined.reviewAssessment, summary: zeroSummary(), findings: reportFindings, limitations: classifyUnknowns(reportLimitations), policy: { pack: pack.id, rationale: pack.rationale, unknownHandling: policyResult.unknownHandling }, ...extra };
   return finalizeReport(report);
 }
 
@@ -714,6 +822,18 @@ function outcomeCommand(options: CliOptions): number {
     return outcomes.length ? EXIT_CODES.PASS : EXIT_CODES.UNKNOWN;
   }
   const value = readInputValue(root, options.input) as Partial<RuntimeOutcome>;
+  const graphWorkOrderId = options.workOrderId ?? (typeof (value as Record<string, unknown>).workOrderId === "string" ? String((value as Record<string, unknown>).workOrderId) : undefined);
+  if (graphWorkOrderId) {
+    const rawStatus = options.outcomeStatus ?? (typeof (value as Record<string, unknown>).status === "string" ? String((value as Record<string, unknown>).status).toUpperCase() : "UNKNOWN");
+    const status = ["POSITIVE", "NEUTRAL", "NEGATIVE", "UNKNOWN"].includes(rawStatus) ? rawStatus as "POSITIVE" | "NEUTRAL" | "NEGATIVE" | "UNKNOWN" : undefined;
+    if (!status) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "Graph outcome recording requires status POSITIVE, NEUTRAL, NEGATIVE, or UNKNOWN.");
+    const mature = options.outcomeMature ?? (value as Record<string, unknown>).mature === true;
+    let graph: Record<string, unknown>;
+    try { graph = localOutcomePayload(root, graphWorkOrderId, status, mature, { sourceOutcomeId: (value as Record<string, unknown>).id, observedAt: (value as Record<string, unknown>).observedAt }); }
+    catch (error) { throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error)); }
+    writeOutput(root, options, `${JSON.stringify(graph, null, 2)}\n`);
+    return EXIT_CODES.PASS;
+  }
   const outcome = value.kind === "runtime-outcome" ? value as RuntimeOutcome : createRuntimeOutcome({ outcomeType: value.outcomeType!, observedAt: value.observedAt ?? new Date().toISOString(), repository: value.repository, changeRecordRefs: value.changeRecordRefs, association: value.association, facts: value.facts, externalSignal: value.externalSignal, retention: value.retention });
   appendRuntimeOutcome(root, outcome);
   writeOutput(root, options, options.format === "terminal" ? `Outcome recorded\nID: ${outcome.id}\nType: ${outcome.outcomeType}\nAssociation: ${outcome.association.type}\n` : `${JSON.stringify(outcome, null, 2)}\n`);
@@ -818,8 +938,78 @@ export function runCli(argv = process.argv.slice(2)): number {
   try {
     if (options.help || options.command === "help" || options.command === "-h") { process.stdout.write(help(options.command === "help" ? undefined : options.command)); return EXIT_CODES.PASS; }
     if (options.command === "version") { process.stdout.write(versionText()); return EXIT_CODES.PASS; }
-    if (options.command === "tui") return runTui({ base: options.base, head: options.head, config: options.config, repository: options.repository });
-    if (["login", "logout", "whoami", "org", "verify", "explain", "github"].includes(options.command)) return unsupportedCommand(options.subcommand ? `${options.command} ${options.subcommand}` : options.command);
+    if (options.command === "dashboard") {
+      if (options.local) return localDashboardCommand(options);
+      return dashboardCommand();
+    }
+    if (options.command === "tui") return tuiCommand(options);
+    if (options.command === "login") return loginCommand(options);
+    if (options.command === "intent") {
+      try { process.stdout.write(`${JSON.stringify(localIntentPayload(getRepoRoot(process.cwd()), options.positional, options.intentMode ?? "micro"), null, 2)}\n`); return EXIT_CODES.PASS; }
+      catch (error) { throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error)); }
+    }
+    if (options.command === "factory" && options.subcommand === "validate") return factoryValidateCommand();
+    if (options.command === "factory" && options.subcommand === "check") {
+      try {
+        process.stdout.write(`${JSON.stringify(factoryCheckPayload(getRepoRoot(process.cwd())), null, 2)}\n`);
+        return EXIT_CODES.PASS;
+      } catch (error) {
+        throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (options.command === "factory" && options.subcommand === "status") {
+      try { process.stdout.write(`${JSON.stringify(localFactoryGraphStatusPayload(getRepoRoot(process.cwd()), options.positional), null, 2)}\n`); return EXIT_CODES.PASS; }
+      catch (error) { throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error)); }
+    }
+    if (options.command === "factory" && options.subcommand === "init") {
+      try {
+        process.stdout.write(`${JSON.stringify(factoryInitPayload(getRepoRoot(process.cwd()), options.positional), null, 2)}\n`);
+        return EXIT_CODES.PASS;
+      } catch (error) {
+        throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (options.command === "factory" && options.subcommand === "plan") {
+      process.stdout.write(`${JSON.stringify(factoryPlanPayload(getRepoRoot(process.cwd()), options.profile, options.positional), null, 2)}\n`);
+      return EXIT_CODES.PASS;
+    }
+    if (options.command === "factory" && options.subcommand === "mcp") return factoryMcpCommand();
+    if (options.command === "factory" && options.subcommand === "new") return factoryNewCommand(options);
+    if (options.command === "work" && options.subcommand === "new") {
+      try {
+        process.stdout.write(`${JSON.stringify(localWorkNewPayload(getRepoRoot(process.cwd()), options.positional), null, 2)}\n`);
+        return EXIT_CODES.PASS;
+      } catch (error) {
+        throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (options.command === "work" && options.subcommand === "graph") {
+      try { process.stdout.write(`${JSON.stringify(localFactoryGraphStatusPayload(getRepoRoot(process.cwd()), options.positional), null, 2)}\n`); return EXIT_CODES.PASS; }
+      catch (error) { throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error)); }
+    }
+    if (options.command === "work" && options.subcommand === "approve") {
+      try { process.stdout.write(`${JSON.stringify(localWorkApprovalPayload(getRepoRoot(process.cwd()), options.positional), null, 2)}\n`); return EXIT_CODES.PASS; }
+      catch (error) { throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error)); }
+    }
+    if (options.command === "cell" && options.subcommand === "check") {
+      const root = getRepoRoot(process.cwd());
+      process.stdout.write(`${JSON.stringify(cellCheckPayload({ repository: options.repository ?? path.basename(root), branch: options.head === "HEAD" ? "tinkerbot/local" : options.head }), null, 2)}\n`);
+      return EXIT_CODES.PASS;
+    }
+    if (options.command === "outcome" && options.subcommand === "check") {
+      process.stdout.write(`${JSON.stringify(outcomeCheckPayload(options.positional ?? "pending"), null, 2)}\n`);
+      return EXIT_CODES.PASS;
+    }
+    if (options.command === "eval") {
+      process.stdout.write(`${JSON.stringify(evalCli(getRepoRoot(process.cwd()), options.subcommand ?? "run", options.positional), null, 2)}\n`);
+      return EXIT_CODES.PASS;
+    }
+    if (options.command === "agents") {
+      process.stdout.write(listAgentsJson(process.env));
+      return EXIT_CODES.PASS;
+    }
+    if (options.command === "receipt") return receiptValidateCommand(options);
+    if (["logout", "whoami", "org", "verify", "explain", "github", "cell", "product", "skill", "evolution", "billing"].includes(options.command)) return unsupportedCommand(options.subcommand ? `${options.command} ${options.subcommand}` : options.command);
     if (options.command === "doctor") {
       const doctor = runDoctor(process.cwd(), options.config, options.base, options.head);
       process.stdout.write(renderDoctor(doctor));
@@ -861,7 +1051,7 @@ export function runCli(argv = process.argv.slice(2)): number {
     }
     let config: PrProofConfig;
     try { config = loadConfig(root, options.config); } catch { config = loadConfig(root); }
-    if (report.verdict === "FAIL" || ((options.mode === "blocking" || config.test_integrity.mode === "blocking") && report.verdict === "NEEDS_REVIEW")) return EXIT_CODES.FAIL;
+    if (report.verdict === "FAIL") return EXIT_CODES.FAIL;
     if (report.verdict === "UNKNOWN" && config.output.fail_on_unknown) return EXIT_CODES.UNKNOWN;
     return EXIT_CODES.PASS;
   } catch (error) {
@@ -881,17 +1071,194 @@ interface HostedResponse {
   body: Record<string, unknown>;
 }
 
+function factoryMcpCommand(): number {
+  const url = hostedSession().url;
+  if (!url || !/^https:\/\//.test(url)) {
+    process.stderr.write("Tinkerbot Factory MCP requires `tb login` with an HTTPS control-plane URL.\n");
+    return EXIT_CODES.UNKNOWN;
+  }
+  process.stdout.write(`${url.replace(/\/$/, "")}/mcp\n`);
+  return EXIT_CODES.PASS;
+}
+
+function factoryValidateCommand(): number {
+  try {
+    const loaded = loadFactoryDefinition(getRepoRoot(process.cwd()));
+    process.stdout.write(`${JSON.stringify({ valid: true, path: loaded.path, digest: loaded.digest, name: loaded.definition.name, repositories: loaded.definition.repositories }, null, 2)}\n`);
+    return EXIT_CODES.PASS;
+  } catch (error) {
+    throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error));
+  }
+}
+
+function factoryNewCommand(options: CliOptions): number {
+  const root = getRepoRoot(process.cwd());
+  const existing = path.join(root, ".tinkerbot", "factory.yaml");
+  if (fs.existsSync(existing)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "A factory definition already exists. Edit it in git, then run tb factory sync.");
+  const starter = buildFactoryStarter({
+    name: options.positional?.trim() || path.basename(root),
+    owner: "owner",
+    repository: "repository",
+  });
+  for (const file of starter.files) {
+    const dest = path.join(root, file.path);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, file.contents);
+  }
+  process.stdout.write(`${JSON.stringify({ created: true, path: ".tinkerbot", files: starter.files.map((file) => file.path), next: "tb factory validate && tb factory sync" }, null, 2)}\n`);
+  return EXIT_CODES.PASS;
+}
+
+function receiptValidateCommand(options: CliOptions): number {
+  if (options.subcommand !== "validate") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "Usage: tb receipt validate --input FILE");
+  if (!options.input) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb receipt validate requires --input.");
+  const root = getRepoRoot(process.cwd());
+  let parsed: unknown;
+  try { parsed = JSON.parse(fs.readFileSync(resolveRepositoryPath(root, options.input), "utf8")); }
+  catch (error) { throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Invalid receipt input: ${error instanceof Error ? error.message : String(error)}`); }
+  const result = validateAgentReceipt(parsed);
+  process.stdout.write(`${JSON.stringify({ ...result, upgradesVerdict: false }, null, 2)}\n`);
+  return result.valid ? EXIT_CODES.PASS : EXIT_CODES.UNKNOWN;
+}
+
+function loginCommand(options: CliOptions): number {
+  const url = options.url ?? hostedSession().url;
+  const token = options.token ?? hostedSession().token;
+  if (!url || !/^https:\/\//.test(url) || !token || !/^[A-Za-z0-9_-]{20,200}$/.test(token)) {
+    process.stderr.write("Tinkerbot: open the website to authenticate, then run `tb login --url https://… --token SESSION`.\n");
+    return EXIT_CODES.CONFIGURATION_ERROR;
+  }
+  saveStoredCredentials({ controlPlaneUrl: url.replace(/\/$/, ""), sessionToken: token });
+  process.stdout.write("Stored Tinkerbot control-plane credentials.\n");
+  return EXIT_CODES.PASS;
+}
+
+function shouldOpenDashboardBrowser(): boolean {
+  if (process.env.CI === "true" || process.env.VITEST || process.env.TINKERBOT_OPEN_BROWSER === "0") return false;
+  return process.env.TINKERBOT_OPEN_BROWSER === "1" || Boolean(process.stdout.isTTY && process.stdin.isTTY);
+}
+
+function localRuntimeTuiView(root: string): { plan: string; cost: string; eval: string } {
+  const view = localDashboardPayload(root);
+  return { plan: formatPlanTab(view), cost: formatCostTab(view), eval: formatEvalTab(view) };
+}
+
+function localDashboardCommand(options: CliOptions): number {
+  const root = getRepoRoot(process.cwd());
+  const host = options.host ?? "127.0.0.1";
+  const port = options.port ?? 4174;
+  const url = localDashboardUrl(host, port);
+  process.stdout.write(`${url}\n`);
+  process.stdout.write(`${JSON.stringify(localDashboardPayload(root), null, 2)}\n`);
+  const skipListen = process.env.VITEST || process.env.CI === "true" || process.env.TINKERBOT_DASHBOARD_LISTEN === "0";
+  if (skipListen && process.env.TINKERBOT_DASHBOARD_LISTEN !== "1") return EXIT_CODES.PASS;
+  const server = createLocalDashboardServer({ root, host, port, directory: options.directory });
+  server.listen(port, host, () => {
+    process.stdout.write(`Local dashboard adapter (SQLite, organizationId=local): ${url}\n`);
+  });
+  if (shouldOpenDashboardBrowser()) {
+    try { execFileSync(process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open", process.platform === "win32" ? ["/c", "start", "", url] : [url], { stdio: "ignore" }); } catch { /* URL is printed */ }
+  }
+  return EXIT_CODES.PASS;
+}
+
+function dashboardCommand(): number {
+  const url = hostedSession().url;
+  if (!url || !/^https:\/\//.test(url)) {
+    process.stderr.write("Tinkerbot dashboard is unavailable until `tb login` stores an HTTPS control-plane URL.\n");
+    return EXIT_CODES.UNKNOWN;
+  }
+  const target = `${url.replace(/\/$/, "")}/app`;
+  process.stdout.write(`${target}\n`);
+  if (!shouldOpenDashboardBrowser()) return EXIT_CODES.PASS;
+  try { execFileSync(process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open", process.platform === "win32" ? ["/c", "start", "", target] : [target], { stdio: "ignore" }); } catch { /* print the URL even if a browser cannot be launched */ }
+  return EXIT_CODES.PASS;
+}
+
+function tuiOptionsFrom(options: CliOptions): TuiOptions {
+  return { help: options.help, subcommand: options.subcommand, positional: options.positional, once: options.once, base: options.base, head: options.head, config: options.config, mutation: options.mutation, baseTests: options.baseTests, mode: options.mode, failOn: options.failOn, mutationMax: options.mutationMax, policy: options.policy, timeout: options.timeout, maxFiles: options.maxFiles, maxFindings: options.maxFindings, agent: options.agent };
+}
+
+function makeTuiDeps(): TuiDeps {
+  return {
+    header: () => {
+      try {
+        const root = getRepoRoot(process.cwd());
+        const config = loadConfig(root);
+        return { repo: repositoryLabel(root), base: config.base.ref, head: "HEAD", cwd: root };
+      } catch {
+        return { repo: "local", base: "origin/main", head: "HEAD", cwd: process.cwd() };
+      }
+    },
+    createReport,
+    reportExitCode: (report) => {
+      try {
+        const config = loadConfig(getRepoRoot(process.cwd()));
+        if (report.verdict === "FAIL") return EXIT_CODES.FAIL;
+        if (report.verdict === "UNKNOWN" && config.output.fail_on_unknown) return EXIT_CODES.UNKNOWN;
+        return EXIT_CODES.PASS;
+      } catch {
+        return report.verdict === "FAIL" ? EXIT_CODES.FAIL : report.verdict === "UNKNOWN" ? EXIT_CODES.UNKNOWN : EXIT_CODES.PASS;
+      }
+    },
+    openDashboard: dashboardCommand,
+    localRuntime: () => localRuntimeTuiView(process.cwd()),
+    localGraph: (id) => JSON.stringify(localFactoryGraphStatusPayload(getRepoRoot(process.cwd()), id), null, 2),
+    stdout: process.stdout,
+    stderr: process.stderr,
+    stdin: process.stdin,
+    env: process.env,
+    cwd: process.cwd(),
+  };
+}
+
+function tuiCommand(options: CliOptions): number {
+  return runTui(tuiOptionsFrom(options), makeTuiDeps());
+}
+
+export async function dispatchTui(options: TuiOptions, deps: TuiDeps, interactive: boolean): Promise<number> {
+  if (interactive && !options.once && !options.help) {
+    const agent = isAgentId(options.agent) ? options.agent : undefined;
+    return runKitWorkstationInteractive({
+      workOrderId: options.subcommand === "work" ? options.positional : undefined,
+      agent,
+      help: options.help,
+    }, {
+      stdout: deps.stdout,
+      stderr: deps.stderr,
+      cwd: deps.cwd,
+      env: deps.env,
+      stdin: deps.stdin,
+      header: () => {
+        const header = deps.header();
+        return { repo: header.repo, base: header.base, head: header.head };
+      },
+      openDashboard: deps.openDashboard,
+      localRuntime: deps.localRuntime ?? (() => localRuntimeTuiView(deps.cwd)),
+      localGraph: deps.localGraph ?? ((id) => JSON.stringify(localFactoryGraphStatusPayload(getRepoRoot(deps.cwd), id), null, 2)),
+      createReport: () => deps.createReport({ cwd: deps.cwd, command: "check", base: options.base, head: options.head, runBaseTests: options.baseTests }),
+      fetchWork: deps.fetchWork ? (id) => {
+        const view = deps.fetchWork!(id);
+        return { summary: `Work ${id}. Agent stage text is not a verdict.`, verdict: view.workOrder?.verificationVerdict };
+      } : undefined,
+    });
+  }
+  return runTui(options, deps);
+}
+
 function hostedConfigurationError(): string | undefined {
-  const base = process.env.TINKERBOT_CONTROL_PLANE_URL?.replace(/\/$/, "");
-  const token = process.env.TINKERBOT_SESSION_TOKEN;
-  if (!base || !/^https:\/\//.test(base)) return "Hosted commands require an HTTPS TINKERBOT_CONTROL_PLANE_URL.";
+  const session = hostedSession();
+  const base = session.url?.replace(/\/$/, "");
+  const token = session.token;
+  if (!base || !/^https:\/\//.test(base)) return "Hosted commands require an HTTPS TINKERBOT_CONTROL_PLANE_URL or `tb login`.";
   if (!token || !/^[A-Za-z0-9_-]{20,200}$/.test(token)) return "Hosted commands require TINKERBOT_SESSION_TOKEN from an authenticated Tinkerbot session.";
   return undefined;
 }
 
 async function hostedRequest(pathname: string, method = "GET", payload?: Record<string, unknown>): Promise<HostedResponse> {
-  const base = process.env.TINKERBOT_CONTROL_PLANE_URL?.replace(/\/$/, "");
-  const token = process.env.TINKERBOT_SESSION_TOKEN;
+  const session = hostedSession();
+  const base = session.url?.replace(/\/$/, "");
+  const token = session.token;
   const configurationError = hostedConfigurationError();
   if (configurationError) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, configurationError);
   let response: Response;
@@ -910,20 +1277,85 @@ async function hostedRequest(pathname: string, method = "GET", payload?: Record<
 
 async function runHostedCli(argv: string[]): Promise<number | undefined> {
   const command = argv[0];
-  if (!command || command === "tui") {
-    const response = await hostedRequest("/auth/session");
+  if (!command) return undefined;
+    if (command === "factory" && argv[1] && argv[1] !== "validate" && argv[1] !== "mcp" && argv[1] !== "new" && argv[1] !== "plan" && argv[1] !== "init" && argv[1] !== "check") {
+    const subcommand = argv[1];
+    const id = argv[2];
+    const pathname = subcommand === "list" || !id ? "/factories" : `/factories/${id}`;
+    let payload: Record<string, unknown> | undefined;
+    if (subcommand === "sync") {
+      const loaded = loadFactoryDefinition(getRepoRoot(process.cwd()));
+      payload = { name: loaded.definition.name, yaml: fs.readFileSync(loaded.path, "utf8"), files: loaded.files };
+    }
+    const response = await hostedRequest(pathname, subcommand === "sync" ? "POST" : "GET", payload);
     if (response.status < 200 || response.status >= 300) {
       process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
       return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
     }
-    return undefined;
+    process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
+    return EXIT_CODES.PASS;
+  }
+  if (command === "work") {
+    const subcommand = argv[1] ?? "list";
+    if (subcommand === "new") return undefined;
+    if (subcommand === "graph" && !argv[2]) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb work graph requires a work-order id.");
+    const id = argv[2];
+    const method = ["retry", "approve", "cancel", "take", "return"].includes(subcommand) ? "POST" : "GET";
+    const pathname = !id && subcommand === "list" ? "/work-orders" : id ? `/work-orders/${id}${subcommand === "graph" ? "/graph" : method === "POST" ? `/${subcommand}` : ""}` : `/work-orders/${subcommand}`;
+    const response = await hostedRequest(pathname, method);
+    if (response.status < 200 || response.status >= 300) {
+      process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
+      return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
+    }
+    process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
+    return EXIT_CODES.PASS;
+  }
+    if (command === "cell" || command === "product" || command === "skill" || command === "evolution") {
+    const subcommand = argv[1] ?? "list";
+    if (command === "cell" && subcommand === "check") return undefined;
+    const id = argv[2];
+    const collection = command === "cell" ? "cells" : command === "product" ? "products" : command === "skill" ? "skills" : "evolution";
+    const method = command === "evolution" && subcommand === "approve" ? "POST" : "GET";
+    const pathname = subcommand === "approve" && id ? `/evolution/${id}/approve` : subcommand === "show" && id ? `/${collection}/${id}` : `/${collection}`;
+    const response = await hostedRequest(pathname, method);
+    if (response.status < 200 || response.status >= 300) {
+      process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
+      return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
+    }
+    process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
+    return EXIT_CODES.PASS;
+  }
+  if (command === "run") {
+    if (argv.includes("--local")) return undefined;
+    const id = argv[2] ?? argv[1];
+    if (!id || id === "show" || id === "logs") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb run show requires a run id.");
+    const response = await hostedRequest(`/runs/${id}${argv[1] === "logs" ? "/events" : ""}`);
+    if (response.status < 200 || response.status >= 300) {
+      process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
+      return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
+    }
+    process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
+    return EXIT_CODES.PASS;
   }
   if (command === "org") {
     const subcommand = argv[1] ?? "list";
-    if (subcommand !== "list" && subcommand !== "switch") return undefined;
+    if (subcommand !== "list" && subcommand !== "switch" && subcommand !== "seats") return undefined;
     const organizationId = argv[2];
     if (subcommand === "switch" && !organizationId) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb org switch requires an organization identifier.");
-    const response = await hostedRequest(subcommand === "list" ? "/tenant/organizations" : "/tenant/organizations/switch", subcommand === "list" ? "GET" : "POST", subcommand === "switch" ? { organizationId } : undefined);
+    const pathname = subcommand === "list" ? "/tenant/organizations" : subcommand === "seats" ? "/org/seats" : "/tenant/organizations/switch";
+    const response = await hostedRequest(pathname, subcommand === "switch" ? "POST" : "GET", subcommand === "switch" ? { organizationId } : undefined);
+    if (response.status < 200 || response.status >= 300) {
+      process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
+      return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
+    }
+    process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
+    return EXIT_CODES.PASS;
+  }
+  if (command === "billing") {
+    const subcommand = argv[1] ?? "summary";
+    if (!["summary", "catalog", "portal"].includes(subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "tb billing supports summary, catalog, or portal.");
+    const pathname = subcommand === "summary" ? "/billing/summary" : subcommand === "catalog" ? "/billing/catalog" : "/billing/portal";
+    const response = await hostedRequest(pathname, subcommand === "portal" ? "POST" : "GET", subcommand === "portal" ? {} : undefined);
     if (response.status < 200 || response.status >= 300) {
       process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
       return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
@@ -959,12 +1391,65 @@ async function runHostedCli(argv: string[]): Promise<number | undefined> {
     return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
   }
   if (command === "whoami") process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
-  else process.stdout.write("Signed out of the Tinkerbot control plane.\n");
+  else {
+    clearStoredCredentials();
+    process.stdout.write("Signed out of the Tinkerbot control plane.\n");
+  }
   return EXIT_CODES.PASS;
 }
 
 export async function mainAsync(argv = process.argv.slice(2)): Promise<number> {
   try {
+    if (argv[0] === "run" && argv.includes("--local")) {
+      const options = parseArgs(argv);
+      const session = hostedSession();
+      const postSync = session.url && session.token
+        ? async (kind: string, body: Record<string, unknown>) => {
+          try {
+            const response = await hostedRequest("/runtime/sync", "POST", body.kind ? body : { kind, ...body });
+            return { ok: response.status >= 200 && response.status < 300 };
+          } catch {
+            return { ok: false };
+          }
+        }
+        : undefined;
+      const payload = await executeLocalRun(getRepoRoot(process.cwd()), {
+        profile: options.profile,
+        allowProcessRunner: options.allowProcessRunner,
+        allowExternalHarness: options.allowExternalHarness,
+        text: options.positional,
+        warn: (message) => process.stderr.write(`${message}\n`),
+        postSync,
+      });
+      process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+      return EXIT_CODES.PASS;
+    }
+    if (argv[0] === "eval" && (argv[1] === "run" || argv[1] === undefined)) {
+      process.stdout.write(`${JSON.stringify(await evalCliAsync(getRepoRoot(process.cwd()), "run", parseArgs(argv).positional), null, 2)}\n`);
+      return EXIT_CODES.PASS;
+    }
+    if (argv[0] === "tui") {
+      const options = parseArgs(argv);
+      const deps: TuiDeps = {
+        ...makeTuiDeps(),
+        fetchWorkAsync: async (id) => {
+          const response = await hostedRequest(`/work-orders/${id}`);
+          if (response.status < 200 || response.status >= 300) return {};
+          const graph = await hostedRequest(`/work-orders/${id}/graph`).catch(() => ({ status: 0, body: {} as Record<string, unknown> }));
+          return { ...response.body, ...(graph.status >= 200 && graph.status < 300 ? { graph: graph.body.graph, economics: graph.body.economics, events: graph.body.events, sourceOfTruth: graph.body.sourceOfTruth } : {}) } as { workOrder?: { workOrderId?: string; status?: string; currentStage?: string; verificationVerdict?: string; verificationIngested?: boolean }; run?: { run_id?: string; status?: string }; stages?: Array<{ stage?: string; status?: string; summary?: string }>; graph?: { verificationVerdict?: string; reviewDecision?: string; releaseDecision?: string; outcomeStatus?: string; outcomeMaturity?: string; eventCount?: number }; economics?: { cogsCents?: number; copqCents?: number; acceptedChanges?: number }; events?: Array<{ type?: string; actorType?: string; occurredAt?: string }>; sourceOfTruth?: string };
+        },
+        workActionAsync: async (id, action, note) => {
+          const response = await hostedRequest(`/work-orders/${id}/${action}`, "POST", action === "steer" ? { note } : undefined);
+          if (response.status < 200 || response.status >= 300) return { ok: false, message: String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`) };
+          return { ok: true, message: action === "approve" ? "Specification approval recorded. Humans still merge." : `${action} recorded.` };
+        },
+      };
+      if (options.subcommand === "work" && options.positional && deps.fetchWorkAsync) {
+        const view = await deps.fetchWorkAsync(options.positional);
+        deps.fetchWork = () => view;
+      }
+      return dispatchTui(tuiOptionsFrom(options), deps, isInteractiveTty(process.stdout, process.stdin, process.env) && !options.once && !options.help);
+    }
     const hosted = await runHostedCli(argv);
     return hosted ?? runCli(argv);
   } catch (error) {

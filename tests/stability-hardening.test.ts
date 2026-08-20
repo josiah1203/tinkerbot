@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { DEFAULT_CONFIG, calculateVerdict, finalizeReport, findingFingerprint, resolveRepositoryPath, tokenizeCommand } from "../packages/core/src";
+import { DEFAULT_CONFIG, calculateVerdict, finalizeReport, findingFingerprint, redactSecrets, resolveRepositoryPath, tokenizeCommand } from "../packages/core/src";
 import { makeTempWorktree, parseUnifiedDiff, runCommandAtRevision } from "../packages/git/src";
 import { parseIstanbulJson, parseLcov } from "../packages/coverage/src";
 import { parseArtifact, loadArtifact } from "../packages/artifacts/src";
@@ -52,6 +52,7 @@ test("safe command tokenization preserves quoted arguments and rejects shell ope
   expect(tokenizeCommand("pnpm test --run")).toEqual(["pnpm", "test", "--run"]);
   expect(() => tokenizeCommand("node -e 'process.exit(1)'; touch leaked")).toThrow(/shell control/);
   expect(() => tokenizeCommand('node -e "unterminated')).toThrow(/unterminated/);
+  expect(redactSecrets("github_pat_abcdefghijklmnop xoxb-abcdefghijklmnop")).toBe("[REDACTED] [REDACTED]");
 });
 
 test("repository paths reject traversal and symlink escapes", () => {
@@ -109,11 +110,11 @@ test("revision commands use safe argv, scrub secret environment, time out, and c
   expect(fs.existsSync(directory)).toBe(false);
 });
 
-test("all four verdict states remain explicit", () => {
+test("tb check verdicts are PASS, FAIL, or UNKNOWN", () => {
   const advisory = structuredClone(DEFAULT_CONFIG);
   expect(calculateVerdict([], advisory, [])).toBe("PASS");
   expect(calculateVerdict([], advisory, ["coverage unavailable"])).toBe("UNKNOWN");
-  expect(calculateVerdict([baseFinding({ severity: "warning" })], advisory, [])).toBe("NEEDS_REVIEW");
+  expect(calculateVerdict([baseFinding({ severity: "warning" })], advisory, [])).toBe("UNKNOWN");
   const blocking = structuredClone(DEFAULT_CONFIG);
   blocking.test_integrity.mode = "blocking";
   expect(calculateVerdict([baseFinding({ severity: "high", blocking: true })], blocking, [])).toBe("FAIL");
@@ -155,7 +156,7 @@ test("artifact loading and parser diagnostics make unsupported input explicit", 
 
 test("reporters escape hostile text and omit fake SARIF locations", () => {
   const finding = baseFinding({ file: "tests/[evil]|name.ts", message: "bad\n::error file=secret.ts::leak", line: undefined });
-  const rendered = renderMarkdown(report([finding], "NEEDS_REVIEW"));
+  const rendered = renderMarkdown(report([finding], "UNKNOWN"));
   expect(rendered).not.toContain("\n::error");
   expect(rendered).toContain("tests/\\[evil\\]\\|name.ts");
   const sarif = JSON.parse(renderSarif(finalizeReport(report([baseFinding({ file: "repository", line: undefined })])))) as { runs: Array<{ results: Array<{ locations?: unknown[] }> }> };
@@ -179,7 +180,7 @@ test("stability fixture manifest remains structured and bounded", () => {
     expect(typeof scenario.area).toBe("string");
     expect(typeof scenario.scenario).toBe("string");
     expect(Array.isArray(scenario.expectedFindings)).toBe(true);
-    expect(["PASS", "NEEDS_REVIEW", "UNKNOWN", "FAIL"]).toContain(scenario.expectedVerdict);
+    expect(["PASS", "UNKNOWN", "FAIL"]).toContain(scenario.expectedVerdict);
     expect(Array.isArray(scenario.expectedUnknowns)).toBe(true);
     expect(Number.isInteger(scenario.expectedExitCode)).toBe(true);
   }

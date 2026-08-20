@@ -1,0 +1,6 @@
+id: security
+stages: [foreman, triage, specification, security, implementation, review, verification, release]
+agents: [foreman, security, specification, implementer, reviewer, verification]
+autonomy: restricted
+requiredEvidence: [verification-receipt, security]
+approvalRoles: [admin, owner]

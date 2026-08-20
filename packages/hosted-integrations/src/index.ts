@@ -31,7 +31,7 @@ export interface SessionStore {
 }
 
 export interface AuthProvider {
-  authorizationUrl(input: { redirectUri: string; state: string; connectionId?: string }): string;
+  authorizationUrl(input: { redirectUri: string; state: string; connectionId?: string; codeChallenge?: string; nonce?: string }): string;
   exchangeCode(input: { code: string; codeVerifier?: string; ipAddress?: string; userAgent?: string }): Promise<HostedSession>;
   refreshSession(input: { refreshToken: string; organizationId?: string }): Promise<HostedSession>;
 }
@@ -91,10 +91,13 @@ export interface StripePlan {
   id: string;
   monthlyPriceId: string;
   annualPriceId?: string;
-  privateRepositoryLimit: number;
-  memberLimit: number;
-  retentionDays: number;
-  features: Record<string, boolean>;
+  catalogVersion?: string;
+}
+
+export interface StripeCatalogValidation {
+  valid: boolean;
+  plans: StripePlan[];
+  errors: string[];
 }
 
 export interface CheckoutSessionInput {
@@ -105,6 +108,8 @@ export interface CheckoutSessionInput {
   cancelUrl: string;
   customerId?: string;
   customerEmail?: string;
+  seatQuantity?: number;
+  trialPeriodDays?: number;
   idempotencyKey: string;
 }
 
@@ -139,6 +144,8 @@ export interface WebhookLedger {
 export interface MetadataStore {
   get<T>(key: string): Promise<T | null>;
   put<T>(key: string, value: T): Promise<void>;
+  /** Atomically claim a key when the backing store supports conditional insert. */
+  putIfAbsent?<T>(key: string, value: T): Promise<boolean>;
   delete(key: string): Promise<void>;
 }
 
@@ -156,6 +163,8 @@ export interface TenantMembership {
   userId: string;
   role: TenantRole;
   status: MembershipStatus;
+  identityType?: "human" | "bot" | "github_app" | "service" | "system";
+  accessState?: "enabled" | "suspended" | "disabled";
   updatedAt?: string;
 }
 
@@ -390,7 +399,7 @@ export class WorkOSAuthProvider implements AuthProvider {
     this.fetcher = config.fetcher ?? fetch;
   }
 
-  authorizationUrl(input: { redirectUri: string; state: string; connectionId?: string }): string {
+  authorizationUrl(input: { redirectUri: string; state: string; connectionId?: string; codeChallenge?: string; nonce?: string }): string {
     const clientId = requiredSecret(this.clientId, "WORKOS_CLIENT_ID", "workos");
     const url = new URL("/user_management/authorize", this.apiBaseUrl);
     url.searchParams.set("response_type", "code");
@@ -398,6 +407,11 @@ export class WorkOSAuthProvider implements AuthProvider {
     url.searchParams.set("redirect_uri", input.redirectUri);
     url.searchParams.set("state", input.state);
     if (input.connectionId) url.searchParams.set("connection_id", input.connectionId);
+    if (input.codeChallenge) {
+      url.searchParams.set("code_challenge", input.codeChallenge);
+      url.searchParams.set("code_challenge_method", "S256");
+    }
+    if (input.nonce) url.searchParams.set("nonce", input.nonce);
     return url.toString();
   }
 
@@ -546,6 +560,14 @@ function basicAuth(value: string): string {
   return `Basic ${btoa(`${value}:`)}`;
 }
 
+function stripeSeatQuantity(value: number | undefined): number {
+  const quantity = value == null ? 1 : value;
+  if (!Number.isSafeInteger(quantity) || quantity < 0 || quantity > 1_000_000) {
+    throw new ProviderError("stripe", "Stripe seat quantity must be a non-negative integer no greater than 1000000 (zero is normalized to one).", { code: "invalid_quantity" });
+  }
+  return Math.max(1, quantity);
+}
+
 export async function verifyStripeSignature(payload: string, signatureHeader: string | null | undefined, secret: string, toleranceSeconds = 300, nowSeconds = Math.floor(Date.now() / 1000)): Promise<boolean> {
   if (!signatureHeader || !secret) return false;
   const values = new Map<string, string[]>();
@@ -602,7 +624,9 @@ export class StripeBillingProvider implements BillingProvider {
     if (!plan) throw new ProviderError("stripe", `Billing plan ${input.planId} is not configured on the server.`, { code: "plan_not_configured" });
     const price = input.interval === "year" ? plan.annualPriceId : plan.monthlyPriceId;
     if (!price) throw new ProviderError("stripe", `Billing interval ${input.interval} is not configured for plan ${input.planId}.`, { code: "price_not_configured" });
-    const payload = await this.post("/v1/checkout/sessions", { mode: "subscription", success_url: input.successUrl, cancel_url: input.cancelUrl, client_reference_id: input.organizationId, customer: input.customerId, customer_email: input.customerEmail, "line_items": [{ price, quantity: 1 }], "subscription_data": { metadata: { organization_id: input.organizationId, plan_id: plan.id, billing_interval: input.interval } }, metadata: { organization_id: input.organizationId, plan_id: plan.id } }, input.idempotencyKey);
+    const subscriptionData: Record<string, unknown> = { metadata: { organization_id: input.organizationId, plan_id: plan.id, billing_interval: input.interval } };
+    if (input.trialPeriodDays && input.trialPeriodDays > 0) subscriptionData.trial_period_days = input.trialPeriodDays;
+    const payload = await this.post("/v1/checkout/sessions", { mode: "subscription", success_url: input.successUrl, cancel_url: input.cancelUrl, client_reference_id: input.organizationId, customer: input.customerId, customer_email: input.customerEmail, "line_items": [{ price, quantity: stripeSeatQuantity(input.seatQuantity) }], "subscription_data": subscriptionData, metadata: { organization_id: input.organizationId, plan_id: plan.id } }, input.idempotencyKey);
     if (typeof payload.id !== "string") throw new ProviderError("stripe", "Stripe returned an incomplete checkout session.", { code: "provider_invalid_response" });
     return { id: payload.id, url: typeof payload.url === "string" ? payload.url : undefined };
   }
@@ -617,6 +641,39 @@ export class StripeBillingProvider implements BillingProvider {
     const payload = await this.post(`/v1/subscriptions/${encodeURIComponent(input.subscriptionId)}`, { cancel_at_period_end: input.cancelAtPeriodEnd }, input.idempotencyKey);
     if (typeof payload.id !== "string") throw new ProviderError("stripe", "Stripe returned an incomplete subscription.", { code: "provider_invalid_response" });
     return { id: payload.id, status: typeof payload.status === "string" ? payload.status : undefined, cancelAtPeriodEnd: typeof payload.cancel_at_period_end === "boolean" ? payload.cancel_at_period_end : undefined };
+  }
+
+  async retrieveSubscription(subscriptionId: string): Promise<Record<string, unknown>> {
+    const secretKey = requiredSecret(this.secretKey, "STRIPE_SECRET_KEY", "stripe");
+    return jsonRequest("stripe", this.fetcher, `${this.apiBaseUrl}/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, { method: "GET", headers: { accept: "application/json", authorization: basicAuth(secretKey) } });
+  }
+
+  async updateSubscriptionQuantity(input: { subscriptionId: string; quantity: number; idempotencyKey: string }): Promise<{ id: string; quantity?: number }> {
+    const subscription = await this.retrieveSubscription(input.subscriptionId);
+    const items = recordValue(subscription.items);
+    const data = Array.isArray(items.data) ? items.data : [];
+    const first = data[0] && typeof data[0] === "object" ? data[0] as Record<string, unknown> : undefined;
+    const itemId = typeof first?.id === "string" ? first.id : undefined;
+    if (!itemId) throw new ProviderError("stripe", "Stripe subscription has no billable item to update.", { code: "subscription_item_missing" });
+    const payload = await this.post(`/v1/subscription_items/${encodeURIComponent(itemId)}`, { quantity: stripeSeatQuantity(input.quantity), proration_behavior: "create_prorations" }, input.idempotencyKey);
+    if (typeof payload.id !== "string") throw new ProviderError("stripe", "Stripe returned an incomplete subscription item.", { code: "provider_invalid_response" });
+    return { id: payload.id, quantity: typeof payload.quantity === "number" ? payload.quantity : undefined };
+  }
+
+  async changeSubscriptionPrice(input: { subscriptionId: string; priceId: string; quantity: number; prorationBehavior: "create_prorations" | "none"; idempotencyKey: string }): Promise<{ id: string; status?: string }> {
+    const subscription = await this.retrieveSubscription(input.subscriptionId);
+    const items = recordValue(subscription.items);
+    const data = Array.isArray(items.data) ? items.data : [];
+    const first = data[0] && typeof data[0] === "object" ? data[0] as Record<string, unknown> : undefined;
+    const itemId = typeof first?.id === "string" ? first.id : undefined;
+    if (!itemId) throw new ProviderError("stripe", "Stripe subscription has no billable item to update.", { code: "subscription_item_missing" });
+    const payload = await this.post(`/v1/subscriptions/${encodeURIComponent(input.subscriptionId)}`, {
+      items: [{ id: itemId, price: input.priceId, quantity: stripeSeatQuantity(input.quantity) }],
+      proration_behavior: input.prorationBehavior,
+      cancel_at_period_end: false,
+    }, input.idempotencyKey);
+    if (typeof payload.id !== "string") throw new ProviderError("stripe", "Stripe returned an incomplete subscription.", { code: "provider_invalid_response" });
+    return { id: payload.id, status: typeof payload.status === "string" ? payload.status : undefined };
   }
 
   async handleWebhook(payload: string, signatureHeader: string | null | undefined, ledger: WebhookLedger, onEvent: (event: StripeWebhookEvent) => Promise<void>, options: { nowSeconds?: number; toleranceSeconds?: number } = {}): Promise<{ duplicate: boolean; event: StripeWebhookEvent }> {
@@ -657,19 +714,23 @@ export async function readCloudflareSecret(env: CloudflareEnv, name: string): Pr
 }
 
 export async function hostedProviderConfig(env: CloudflareEnv): Promise<HostedProviderConfig> {
+  const environment = env.ENVIRONMENT === "production" || env.ENVIRONMENT === "staging" ? env.ENVIRONMENT : "development";
+  const catalog = validateStripePlans(env.STRIPE_PLANS_JSON, { requireAllPlans: environment === "production", requireAnnualPrices: environment === "production" });
   return {
-    environment: env.ENVIRONMENT === "production" || env.ENVIRONMENT === "staging" ? env.ENVIRONMENT : "development",
+    environment,
     workos: { clientId: await readCloudflareSecret(env, "WORKOS_CLIENT_ID"), apiKey: await readCloudflareSecret(env, "WORKOS_API_KEY"), webhookSecret: await readCloudflareSecret(env, "WORKOS_WEBHOOK_SECRET") },
-    stripe: { secretKey: await readCloudflareSecret(env, "STRIPE_SECRET_KEY"), webhookSecret: await readCloudflareSecret(env, "STRIPE_WEBHOOK_SECRET"), plans: parseStripePlans(env.STRIPE_PLANS_JSON) },
+    stripe: { secretKey: await readCloudflareSecret(env, "STRIPE_SECRET_KEY"), webhookSecret: await readCloudflareSecret(env, "STRIPE_WEBHOOK_SECRET"), plans: catalog.plans },
     cloudflare: { accountId: typeof env.CLOUDFLARE_ACCOUNT_ID === "string" ? env.CLOUDFLARE_ACCOUNT_ID : undefined, workerName: typeof env.WORKER_NAME === "string" ? env.WORKER_NAME : undefined },
     sessionEncryptionKey: await readCloudflareSecret(env, "SESSION_ENCRYPTION_KEY"),
   };
 }
 
 export function providerStatuses(config: HostedProviderConfig): ProviderStatus[] {
+  const stripeCatalogReady = config.environment !== "production" || stripeCatalogComplete(config.stripe.plans);
+  const stripePlansPresent = config.stripe.plans.length > 0;
   return [
     { provider: "workos", state: config.workos.clientId && config.workos.apiKey && config.workos.webhookSecret ? "configured" : "unavailable", missing: [!config.workos.clientId ? "WORKOS_CLIENT_ID" : "", !config.workos.apiKey ? "WORKOS_API_KEY" : "", !config.workos.webhookSecret ? "WORKOS_WEBHOOK_SECRET" : ""].filter(Boolean) },
-    { provider: "stripe", state: config.stripe.secretKey && config.stripe.webhookSecret && config.stripe.plans.length > 0 ? "configured" : "unavailable", missing: [!config.stripe.secretKey ? "STRIPE_SECRET_KEY" : "", !config.stripe.webhookSecret ? "STRIPE_WEBHOOK_SECRET" : "", config.stripe.plans.length === 0 ? "STRIPE_PLANS_JSON" : ""].filter(Boolean) },
+    { provider: "stripe", state: config.stripe.secretKey && config.stripe.webhookSecret && stripePlansPresent && stripeCatalogReady ? "configured" : "unavailable", missing: [!config.stripe.secretKey ? "STRIPE_SECRET_KEY" : "", !config.stripe.webhookSecret ? "STRIPE_WEBHOOK_SECRET" : "", !stripePlansPresent || !stripeCatalogReady ? "STRIPE_PLANS_JSON" : ""].filter(Boolean) },
     { provider: "cloudflare", state: config.cloudflare.accountId && config.cloudflare.workerName ? "configured" : "unavailable", missing: [!config.cloudflare.accountId ? "CLOUDFLARE_ACCOUNT_ID" : "", !config.cloudflare.workerName ? "WORKER_NAME" : ""].filter(Boolean) },
   ];
 }
@@ -691,6 +752,13 @@ export class D1JsonMetadataStore implements MetadataStore {
 
   async put<T>(key: string, value: T): Promise<void> {
     await this.database.prepare("INSERT INTO tinkerbot_metadata (key, value, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").bind(key, JSON.stringify(value), new Date().toISOString()).run();
+  }
+
+  async putIfAbsent<T>(key: string, value: T): Promise<boolean> {
+    const result = await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_metadata (key, value, updated_at) VALUES (?1, ?2, ?3)").bind(key, JSON.stringify(value), new Date().toISOString()).run() as { meta?: { changes?: number } };
+    // Cloudflare D1 exposes `meta.changes`. If an adapter cannot report it,
+    // fail closed rather than pretending an atomic claim was acquired.
+    return result.meta?.changes === 1;
   }
 
   async delete(key: string): Promise<void> {
@@ -829,7 +897,7 @@ export class D1TenantStore implements TenantAccessStore {
   }
 
   async countSeatUsage(organizationId: string): Promise<number> {
-    const row = await this.database.prepare("SELECT COUNT(*) AS count FROM tinkerbot_memberships WHERE organization_id = ?1 AND status = 'active'").bind(organizationId).first<{ count?: number | string }>();
+    const row = await this.database.prepare("SELECT COUNT(*) AS count FROM tinkerbot_memberships WHERE organization_id = ?1 AND status = 'active' AND COALESCE(identity_type, 'human') = 'human' AND COALESCE(access_state, 'enabled') = 'enabled'").bind(organizationId).first<{ count?: number | string }>();
     const count = typeof row?.count === "number" ? row.count : Number(row?.count);
     return Number.isFinite(count) && count >= 0 ? Math.trunc(count) : 0;
   }
@@ -882,7 +950,9 @@ export class D1TenantStore implements TenantAccessStore {
   async upsertMembership(membership: TenantMembership): Promise<void> {
     if (!isTenantRole(membership.role) || !isMembershipStatus(membership.status)) throw new Error("Invalid tenant membership state.");
     const updatedAt = membership.updatedAt ?? new Date().toISOString();
-    await this.database.prepare("INSERT INTO tinkerbot_memberships (organization_id, user_id, role, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5) ON CONFLICT(organization_id, user_id) DO UPDATE SET role = excluded.role, status = excluded.status, updated_at = excluded.updated_at WHERE excluded.updated_at >= tinkerbot_memberships.updated_at").bind(membership.organizationId, membership.userId, membership.role, membership.status, updatedAt, updatedAt).run();
+    const identityType = membership.identityType ?? "human";
+    const accessState = membership.accessState ?? (membership.status === "active" ? "enabled" : "disabled");
+    await this.database.prepare("INSERT INTO tinkerbot_memberships (organization_id, user_id, role, status, identity_type, access_state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) ON CONFLICT(organization_id, user_id) DO UPDATE SET role = excluded.role, status = excluded.status, identity_type = excluded.identity_type, access_state = excluded.access_state, updated_at = excluded.updated_at WHERE excluded.updated_at >= tinkerbot_memberships.updated_at").bind(membership.organizationId, membership.userId, membership.role, membership.status, identityType, accessState, updatedAt, updatedAt).run();
   }
 }
 
@@ -1021,29 +1091,112 @@ export class R2JsonEvidenceStore implements EvidenceStore {
   }
 }
 
-export function parseStripePlans(value: unknown): StripePlan[] {
-  if (typeof value !== "string" || !value.trim()) return [];
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    if (!Array.isArray(parsed)) return [];
-    const plans = parsed.filter((item): item is StripePlan => {
-      if (!item || typeof item !== "object") return false;
-      const plan = item as Record<string, unknown>;
-      if (typeof plan.id !== "string" || !plan.id.trim() || typeof plan.monthlyPriceId !== "string" || !plan.monthlyPriceId.trim() || (plan.annualPriceId !== undefined && (typeof plan.annualPriceId !== "string" || !plan.annualPriceId.trim()))) return false;
-      for (const limit of [plan.privateRepositoryLimit, plan.memberLimit, plan.retentionDays]) if (!Number.isSafeInteger(limit) || (limit as number) < 0) return false;
-      if (!plan.features || typeof plan.features !== "object" || Array.isArray(plan.features) || Object.values(plan.features as Record<string, unknown>).some((flag) => typeof flag !== "boolean")) return false;
-      return true;
+/** Optional customer S3/GCS-compatible HTTP replica. Failures never change a tb check verdict. */
+export class HttpEvidenceReplica implements EvidenceStore {
+  constructor(
+    private readonly endpoint: string,
+    private readonly token?: string,
+    private readonly fetchImpl: typeof fetch = fetch,
+  ) {}
+
+  async put(key: string, value: unknown): Promise<void> {
+    const response = await this.fetchImpl(`${this.endpoint.replace(/\/$/, "")}/${key}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) },
+      body: JSON.stringify(value),
     });
-    const ids = new Set<string>();
-    const prices = new Set<string>();
-    return plans.filter((plan) => {
-      if (ids.has(plan.id) || prices.has(plan.monthlyPriceId) || (plan.annualPriceId && prices.has(plan.annualPriceId))) return false;
-      ids.add(plan.id);
-      prices.add(plan.monthlyPriceId);
-      if (plan.annualPriceId) prices.add(plan.annualPriceId);
-      return true;
-    });
-  } catch {
-    return [];
+    if (!response.ok) throw new Error(`Evidence export HTTP ${response.status}`);
   }
+
+  async get<T>(): Promise<T | null> {
+    return null;
+  }
+
+  async delete(): Promise<void> {
+    return;
+  }
+}
+
+export class FanoutEvidenceStore implements EvidenceStore {
+  constructor(private readonly primary: EvidenceStore, private readonly replica?: EvidenceStore) {}
+
+  async put(key: string, value: unknown): Promise<void> {
+    await this.primary.put(key, value);
+    if (!this.replica) return;
+    try { await this.replica.put(key, value); } catch { /* replica fan-out cannot set or rewrite a verification verdict */ }
+  }
+
+  async get<T>(key: string): Promise<T | null> {
+    return this.primary.get<T>(key);
+  }
+
+  async delete(key: string): Promise<void> {
+    await this.primary.delete(key);
+  }
+}
+
+export function evidenceStoreFromEnv(input: { bucket?: R2BucketLike; exportEndpoint?: string; exportToken?: string; fetchImpl?: typeof fetch }): EvidenceStore | undefined {
+  if (!input.bucket) return undefined;
+  const primary = new R2JsonEvidenceStore(input.bucket);
+  const replica = input.exportEndpoint ? new HttpEvidenceReplica(input.exportEndpoint, input.exportToken, input.fetchImpl) : undefined;
+  return new FanoutEvidenceStore(primary, replica);
+}
+
+export function validateStripePlans(value: unknown, options: { requireAllPlans?: boolean; requireAnnualPrices?: boolean } = {}): StripeCatalogValidation {
+  const errors: string[] = [];
+  if (typeof value !== "string" || !value.trim()) return { valid: false, plans: [], errors: ["STRIPE_PLANS_JSON is empty."] };
+  if (value.length > 1_000_000) return { valid: false, plans: [], errors: ["STRIPE_PLANS_JSON exceeds the 1 MB configuration limit."] };
+  let parsed: unknown;
+  try { parsed = JSON.parse(value) as unknown; } catch { return { valid: false, plans: [], errors: ["STRIPE_PLANS_JSON is not valid JSON."] }; }
+  if (!Array.isArray(parsed) || parsed.length === 0) return { valid: false, plans: [], errors: ["STRIPE_PLANS_JSON must be a non-empty array."] };
+  if (parsed.length > 32) return { valid: false, plans: [], errors: ["STRIPE_PLANS_JSON contains too many plan entries."] };
+  const prohibited = ["memberLimit", "seatLimit", "privateRepositoryLimit", "repositoryLimit", "additionalRepositoryPrice", "perRepositoryPrice", "perRunPrice", "perTokenPrice", "factoryLimit"];
+  const ids = new Set<string>();
+  const prices = new Set<string>();
+  const versions = new Set<string>();
+  const allowedFields = new Set(["id", "monthlyPriceId", "annualPriceId", "catalogVersion"]);
+  const plans: StripePlan[] = [];
+  for (const [index, item] of parsed.entries()) {
+    const context = `Stripe plan ${index + 1}`;
+    if (!item || typeof item !== "object" || Array.isArray(item)) { errors.push(`${context} must be an object.`); continue; }
+    const plan = item as Record<string, unknown>;
+    for (const field of Object.keys(plan)) if (!allowedFields.has(field)) errors.push(`${context} contains unsupported field '${field}'.`);
+    const id = typeof plan.id === "string" ? plan.id.trim() : "";
+    const monthly = typeof plan.monthlyPriceId === "string" ? plan.monthlyPriceId.trim() : "";
+    const annual = plan.annualPriceId === undefined ? undefined : typeof plan.annualPriceId === "string" ? plan.annualPriceId.trim() : "";
+    if (!["developer", "team", "business"].includes(id)) errors.push(`${context} has an unsupported id.`);
+    if (!monthly || !/^price_[A-Za-z0-9]+$/.test(monthly) || monthly.includes("REPLACE")) errors.push(`${context} has an invalid monthlyPriceId.`);
+    if (annual !== undefined && (!annual || !/^price_[A-Za-z0-9]+$/.test(annual) || annual.includes("REPLACE"))) errors.push(`${context} has an invalid annualPriceId.`);
+    if (annual !== undefined && annual === monthly) errors.push(`${context} must use distinct monthlyPriceId and annualPriceId values.`);
+    if (options.requireAnnualPrices && annual === undefined) errors.push(`${context} is missing annualPriceId.`);
+    for (const field of prohibited) if (Object.prototype.hasOwnProperty.call(plan, field)) errors.push(`${context} must not include ${field}; the catalog is seat-only.`);
+    const catalogVersion = plan.catalogVersion;
+    if (catalogVersion !== undefined) {
+      if (typeof catalogVersion !== "string" || !/^[A-Za-z0-9._-]{1,80}$/.test(catalogVersion)) errors.push(`${context} has an invalid catalogVersion.`);
+      else versions.add(catalogVersion);
+    } else if (options.requireAllPlans) errors.push(`${context} is missing catalogVersion.`);
+    if (!id || !monthly || !/^price_[A-Za-z0-9]+$/.test(monthly)) continue;
+    if (ids.has(id)) errors.push(`Duplicate Stripe plan id '${id}'.`);
+    if (prices.has(monthly)) errors.push(`Duplicate Stripe price id '${monthly}'.`);
+    if (annual && prices.has(annual)) errors.push(`Duplicate Stripe price id '${annual}'.`);
+    ids.add(id);
+    prices.add(monthly);
+    if (annual) prices.add(annual);
+    plans.push({ id, monthlyPriceId: monthly, ...(annual ? { annualPriceId: annual } : {}), ...(typeof catalogVersion === "string" ? { catalogVersion } : {}) });
+  }
+  if (versions.size > 1) errors.push("All Stripe plans must use the same catalogVersion.");
+  if (options.requireAllPlans) for (const id of ["developer", "team", "business"]) if (!plans.some((plan) => plan.id === id)) errors.push(`Stripe catalog is missing ${id}.`);
+  return { valid: errors.length === 0, plans: errors.length === 0 ? plans : [], errors };
+}
+
+/** Strict production readiness check for the seat catalog. */
+export function stripeCatalogComplete(plans: readonly StripePlan[]): boolean {
+  if (plans.length !== 3) return false;
+  const ids = new Set(plans.map((plan) => plan.id));
+  const versions = new Set(plans.map((plan) => plan.catalogVersion).filter((version): version is string => Boolean(version)));
+  return ids.size === 3 && ["developer", "team", "business"].every((id) => ids.has(id)) && plans.every((plan) => Boolean(plan.monthlyPriceId && plan.annualPriceId)) && versions.size === 1;
+}
+
+export function parseStripePlans(value: unknown): StripePlan[] {
+  return validateStripePlans(value).plans;
 }

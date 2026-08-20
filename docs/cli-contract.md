@@ -4,21 +4,22 @@
 
 | Code | Meaning |
 | ---: | --- |
-| 0 | PASS, advisory NEEDS_REVIEW, or an informational command completed |
-| 1 | FAIL, or NEEDS_REVIEW in blocking mode |
+| 0 | PASS, advisory UNKNOWN, or an informational command completed |
+| 1 | FAIL |
+
 | 2 | UNKNOWN when `output.fail_on_unknown` is enabled, or an unavailable history/artifact command |
 | 3 | Configuration, argument, policy, format, or report-input error |
 | 4 | Repository, Git, worktree, or execution error |
 | 5 | Unexpected internal error |
 | 12 | Recognized command unavailable in this client build |
 
-Scripts may rely on these values. A normal advisory `NEEDS_REVIEW` does not fail the process; blocking mode and explicit unknown policy do.
+Scripts may rely on these values. Advisory `UNKNOWN` does not fail the process unless `output.fail_on_unknown` is enabled. Review lives on `reviewAssessment`, not `verdict`.
 
 ## Commands
 
-The supported local analysis commands are `check`, `test-integrity`, `impact`, `report`, `doctor`, `config validate`, `config explain`, `usage`, `baseline init|check|update`, `policy list|explain`, `artifacts`, `select-tests`, `contracts`, `fixtures`, and `history|history compare`. The installed `tb`/`tinkerbot` executable validates a hosted session before launching OpenTUI with no subcommand. `--help` and `--version` are available without a repository analysis.
+The supported local analysis commands are `check`, `test-integrity`, `impact`, `report`, `doctor`, `config validate`, `config explain`, `usage`, `baseline init|check|update`, `policy list|explain`, `artifacts`, `select-tests`, `contracts`, `fixtures`, and `history|history compare`. Local factory runtime commands are `factory validate|new|plan`, `run --local`, `eval init|add|run|compare|baseline|export`, and `dashboard --local`. Empty `tb` prints help. `tb tui` is a tabbed master terminal on a TTY (`pnpm tb tui`); `--once` prints one Node check transcript. `tb agents` lists PATH CLIs. `tb factory new` writes a local starter tree. `tb dashboard` opens the hosted app. `--help` and `--version` are available without a repository analysis.
 
-`whoami`, `logout`, `org list`, `org switch <organization-id>`, and `verify --repository owner/repository` use `TINKERBOT_CONTROL_PLANE_URL` (HTTPS) and a validated `TINKERBOT_SESSION_TOKEN`. `verify` prepares source-minimized assurance data locally and submits it to the authenticated, organization-scoped control plane; it requires a repository identifier. These commands fail closed when the URL/token is absent, malformed, unauthorized, or unavailable. `login`, `explain`, `github run`, and `serve` remain recognized but unshipped commands and return stable exit code `12`; they never print help and exit `0`.
+`login`, `logout`, `whoami`, `org list`, `org switch <organization-id>`, `org seats`, `billing summary|catalog|portal`, `factory list|show|sync|mcp`, `work *`, `cell list`, `product list|show`, `skill list|show`, `evolution list|show|approve`, `run show|logs`, `receipt validate`, and `verify --repository owner/repository` use an HTTPS control-plane URL and session from `tb login` or environment variables. `tb factory sync` uploads `factory.yaml` plus the `.tinkerbot/` tree. The separately packaged `tinkerbot-factory` delegates these commands to the same implementation; `tinkerbot-mcp` is the local stdio platform MCP and `tinkerbot-tui` is the kit-aware workstation entrypoint. `github run` and `serve` remain recognized but unshipped and return exit code `12`.
 
 Analysis commands accept `--base`, `--head`, `--format terminal|json|markdown|sarif`, `--output`, `--config`, `--policy`, `--mode`, `--timeout`, `--max-files`, and `--max-findings`. Values are passed as argument arrays; repository output/input paths must remain inside the repository root. Output files are created as needed and atomically replaced when an explicit `--output` is supplied.
 

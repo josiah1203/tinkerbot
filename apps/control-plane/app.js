@@ -1,1129 +1,368 @@
-import { createDevelopmentAuth, safeReturnTo as safeAuthReturnTo } from "./auth.js";
-import {
-  findingById,
-  findings,
-  localReport,
-  plans,
-  repositories,
-  repositoryById,
-  runById,
-  runs,
-  setupTasks,
-  workspace,
-} from "./data.js";
-
 const app = document.querySelector("#app");
-const storage = (() => {
-  try { return window.localStorage; } catch {
-    const values = new Map();
-    return { getItem: (key) => values.get(key) ?? null, setItem: (key, value) => void values.set(key, value), removeItem: (key) => void values.delete(key) };
-  }
-})();
-const auth = createDevelopmentAuth(storage);
-const h = (...parts) => parts.join("");
 
-function icon(name, className = "") {
-  return h("<svg class=\"ui-icon ", esc(className), "\" aria-hidden=\"true\" viewBox=\"0 0 24 24\"><use href=\"/assets/circle-icons.svg#", esc(name), "\"></use></svg>");
-}
+const html = (strings, ...values) => strings.reduce((output, string, index) => output + string + (index < values.length ? values[index] : ""), "");
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[character]));
 
-function iconButton(action, name, label, extra = "", className = "") {
-  return h("<button type=\"button\" class=\"icon-button ", esc(className), "\" data-action=\"", esc(action), "\" aria-label=\"", esc(label), "\" ", extra, ">", icon(name), "</button>");
-}
+const STAGES = ["intake", "spec", "build", "verify", "release"];
+const STAGE_LABELS = { intake: "Intake", spec: "Spec", build: "Build", verify: "Verify", release: "Release" };
+const STAGE_SUBTITLES = { intake: "Work enters", spec: "Intent clarified", build: "Change produced", verify: "Evidence checked", release: "Authority required" };
+const GROUPS = ["blocked", "awaiting_review", "in_progress", "ready", "released", "unknown"];
+const GROUP_LABELS = { blocked: "Blocked", awaiting_review: "Awaiting review", in_progress: "In progress", ready: "Ready", released: "Released", unknown: "Unknown" };
+const GROUP_TONES = { blocked: "error", awaiting_review: "warning", in_progress: "info", ready: "brand", released: "success", unknown: "neutral" };
+const DECISION_LABELS = {
+  pass: "Pass", blocked: "Blocked", fail: "Fail", unknown: "Unknown", not_run: "Not run",
+  not_required: "Not required", awaiting_human: "Awaiting human", approved: "Approved", rejected: "Rejected",
+  changes_requested: "Changes requested", not_eligible: "Not eligible", awaiting_authorization: "Awaiting authorization",
+  released: "Released", rolled_back: "Rolled back", cancelled: "Cancelled", pending: "Pending", accepted: "Accepted",
+  reworked: "Reworked", failed: "Failed",
+};
 
 const state = {
-  session: null,
-  paletteOpen: false,
-  accountMenu: false,
-  orgMenu: false,
-  sidebarOpen: true,
-  mobileNav: false,
-  selectedFindingId: null,
-  toast: null,
-  toastTimer: null,
-  report: localReport,
-  reportSource: "bundled preview report",
-  hosted: {
-    teamLoaded: false,
-    teamLoading: false,
-    invitations: [],
-    error: null,
-    inviteOpen: false,
-    inviteSubmitting: false,
-    inviteMessage: null,
-    billingLoaded: false,
-    billingLoading: false,
-    billing: null,
-    billingError: null,
-    billingSubmitting: false,
-  },
-  filters: {
-    findingQuery: "",
-    findingSeverity: "all",
-    findingStatus: "all",
-    runQuery: "",
-    runVerdict: "all",
-  },
+  session: null, factories: [], selectedFactoryId: null, factoryView: null, workOrders: [], routeItems: [],
+  entity: null, graph: null, costs: null, loading: true, routeLoading: false, error: null, routeError: null,
+  paletteOpen: false, paletteQuery: "", sidebarOpen: false, orgMenu: false, modal: null, modalError: null,
+  actionError: null, globalSearch: "", searchResults: [], updateNotice: "", filterTimer: null,
 };
 
-function esc(value) {
-  return String(value ?? "").replace(/[&<>"']/g, (character) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;",
-  })[character]);
-}
+function pathName() { return window.location.pathname || "/"; }
+function queryParams() { return new URLSearchParams(window.location.search); }
+function segments(path = pathName()) { return path.split("/").filter(Boolean).map((part) => decodeURIComponent(part)); }
 
-function currentPath() {
-  return window.location.pathname || "/";
-}
-
-function currentSearch() {
-  return new URLSearchParams(window.location.search);
-}
-
-function hostedApiBase() {
-  const configured = typeof window.__TINKERBOT_CONTROL_PLANE_API__ === "string"
-    ? window.__TINKERBOT_CONTROL_PLANE_API__
-    : document.querySelector("meta[name=\"tinkerbot-api-base\"]")?.content ?? "";
-  const value = configured.trim();
-  if (!value) return "";
+function apiBase() {
+  const configured = typeof window.__TINKERBOT_CONTROL_PLANE_API__ === "string" ? window.__TINKERBOT_CONTROL_PLANE_API__ : document.querySelector('meta[name="tinkerbot-api-base"]')?.content ?? "";
+  const localFileFallback = window.location.protocol === "file:" ? "http://127.0.0.1:4173" : window.location.origin;
   try {
-    const url = new URL(value, window.location.origin);
-    const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-    if (url.protocol !== "https:" && !(url.protocol === "http:" && local)) return "";
+    const url = new URL(configured.trim() || localFileFallback, localFileFallback);
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) return "";
     return url.toString().replace(/\/$/, "");
-  } catch {
-    return "";
+  } catch { return ""; }
+}
+
+async function api(pathname, method = "GET", body) {
+  const base = apiBase();
+  if (!base) throw Object.assign(new Error("Control plane API is unavailable."), { code: "api_unavailable" });
+  const response = await fetch(`${base}${pathname}`, { method, credentials: window.location.protocol === "file:" ? "omit" : "include", headers: { accept: "application/json", ...(body ? { "content-type": "application/json" } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw Object.assign(new Error(payload.error || `HTTP ${response.status}`), { status: response.status, payload, correlationId: response.headers.get("x-correlation-id") });
+  return payload;
+}
+
+function signedIn() { return Boolean(state.session?.authenticated); }
+function storedFactoryId() { try { return window.localStorage.getItem("tinkerbot.factoryId"); } catch { return null; } }
+function selectedFactory() { return state.factories.find((factory) => factory.factoryId === state.selectedFactoryId) ?? state.factories[0] ?? { factoryId: state.selectedFactoryId || "fac_1", name: "Payments", status: "active" }; }
+function factoryId() { return selectedFactory().factoryId; }
+function saveFactoryId(id) { state.selectedFactoryId = id; try { window.localStorage.setItem("tinkerbot.factoryId", id); } catch { /* best effort */ } }
+
+function canonicalPath(path) {
+  const [pathname, search = ""] = path.split("?");
+  const parts = segments(pathname);
+  if (parts[0] !== "app") return `${pathname}${search ? `?${search}` : ""}`;
+  if (!parts[1] || parts[1] === "overview") return `/${search ? `?${search}` : ""}`;
+  if (parts[1] === "work" || parts[1] === "work-orders") {
+    const id = parts[2];
+    return `/factories/${encodeURIComponent(factoryId())}/work-orders${id ? `/${encodeURIComponent(id)}` : ""}${search ? `?${search}` : ""}`;
   }
-}
-
-async function hostedRequest(path, init = {}) {
-  const base = hostedApiBase();
-  if (!base) throw new Error("Hosted control-plane API is not configured for this preview.");
-  const headers = new Headers(init.headers ?? {});
-  if (init.body && !headers.has("content-type")) headers.set("content-type", "application/json");
-  const response = await fetch(new URL(path, base + "/").toString(), { ...init, credentials: "include", headers });
-  let payload = null;
-  try { payload = await response.json(); } catch { /* the status still communicates failure */ }
-  if (!response.ok) throw new Error(payload?.error || `Hosted request failed with HTTP ${response.status}.`);
-  return payload ?? {};
-}
-
-async function loadHostedTeam() {
-  if (!hostedApiBase() || state.hosted.teamLoading || state.hosted.teamLoaded) return;
-  state.hosted.teamLoading = true;
-  state.hosted.error = null;
-  renderCurrent();
-  try {
-    const result = await hostedRequest("/tenant/invitations");
-    state.hosted.invitations = Array.isArray(result.invitations) ? result.invitations : [];
-    state.hosted.teamLoaded = true;
-  } catch (error) {
-    state.hosted.error = error instanceof Error ? error.message : "Hosted team data could not be loaded.";
-    state.hosted.teamLoaded = true;
-  } finally {
-    state.hosted.teamLoading = false;
-    if (currentPath() === "/app/team") renderCurrent();
+  if (parts[1] === "factories") {
+    const id = parts[2];
+    if (!id) return `/factories${search ? `?${search}` : ""}`;
+    return `/factories/${encodeURIComponent(id)}${parts.slice(3).map((part) => `/${encodeURIComponent(part)}`).join("")}${search ? `?${search}` : ""}`;
   }
-}
-
-async function loadHostedBilling(force = false) {
-  if (!hostedApiBase() || state.hosted.billingLoading || (state.hosted.billingLoaded && !force)) return;
-  state.hosted.billingLoading = true;
-  state.hosted.billingError = null;
-  renderCurrent();
-  try {
-    state.hosted.billing = await hostedRequest("/billing/summary");
-  } catch (error) {
-    state.hosted.billingError = error instanceof Error ? error.message : "Hosted billing data could not be loaded.";
-  } finally {
-    state.hosted.billingLoaded = true;
-    state.hosted.billingLoading = false;
-    if (currentPath() === "/app/settings/billing") renderCurrent();
+  if (["runs", "environments", "integrations", "secrets", "settings", "usage"].includes(parts[1])) {
+    const resource = parts[1] === "usage" ? "settings/usage" : parts.slice(1).map((part) => encodeURIComponent(part)).join("/");
+    return `/${resource}${search ? `?${search}` : ""}`;
   }
+  return `${pathname}${search ? `?${search}` : ""}`;
 }
 
-function safeReturnTo(value) {
-  return safeAuthReturnTo(value);
+function factoryHref(id = factoryId(), area = "", entityId = "") { return `/factories/${encodeURIComponent(id)}${area ? `/${area}${entityId ? `/${encodeURIComponent(entityId)}` : ""}` : ""}`; }
+function workspaceHref(resource, entityId = "") { return `/${resource}${entityId ? `/${encodeURIComponent(entityId)}` : ""}`; }
+
+function routeInfo() {
+  const rawPath = pathName();
+  const rawParts = segments(rawPath);
+  const isAlias = rawParts[0] === "app";
+  const canonical = canonicalPath(`${rawPath}${window.location.search}`);
+  const parts = segments(canonical.split("?")[0]);
+  if (canonical === "/" || (isAlias && (!rawParts[1] || rawParts[1] === "overview"))) return { kind: "root", alias: isAlias, parentPath: "/" };
+  if (parts[0] === "factories" && parts[1]) {
+    const id = parts[1]; const area = parts[2] || "dashboard"; const entityId = parts[3] || "";
+    return { kind: "factory", factoryId: id, area, entityId, alias: isAlias, parentPath: factoryHref(id, area) };
+  }
+  if (parts[0] === "factories") return { kind: "workspace", resource: "factories", entityId: parts[1] || "", alias: isAlias, parentPath: "/factories" };
+  if (["runs", "environments", "integrations", "secrets"].includes(parts[0])) return { kind: "workspace", resource: parts[0], entityId: parts[1] || "", alias: isAlias, parentPath: workspaceHref(parts[0]) };
+  if (parts[0] === "settings") return { kind: "settings", area: parts[1] || "profile", alias: isAlias, parentPath: "/settings/profile" };
+  if (parts[0] === "login") return { kind: "login" };
+  return { kind: "marketing", page: parts[0] || "home" };
 }
 
-function badge(value, tone = "neutral") {
-  return h("<span class=\"status ", esc(tone), "\">", esc(value), "</span>");
+function routeQuery() { const params = queryParams(); return { q: params.get("q") || "", group: params.get("group") || "", stage: params.get("stage") || "", risk: params.get("risk") || "", view: params.get("view") || "" }; }
+
+function navigate(href, replace = false) {
+  const url = new URL(href, window.location.origin); const raw = `${url.pathname}${url.search}`; const next = url.pathname.startsWith("/app") ? canonicalPath(raw) : raw;
+  if (replace) window.history.replaceState({}, "", next); else window.history.pushState({}, "", next);
+  state.paletteOpen = false; state.orgMenu = false; state.sidebarOpen = false; state.modal = null; state.entity = null; state.graph = null; state.routeError = null;
+  render(); void loadRoute();
 }
 
-function button(label, action, kind = "secondary", extra = "") {
-  return h("<button type=\"button\" class=\"button ", esc(kind), "\" data-action=\"", esc(action), "\" ", extra, ">", label, "</button>");
+function icon(name, size = "x-small") {
+  const names = new Set(["home", "git", "shield", "exclamation", "archive", "settings", "agents", "plugin", "files", "search", "plus", "sidebar", "chevron-down", "x", "checkmark", "arrow-left", "arrow-right", "bell", "user", "card", "toolbox", "clock", "link", "refresh", "lock"]);
+  return `<svg class="slds-icon slds-icon_${size} tb-icon" aria-hidden="true"><use href="assets/circle-icons.svg#${names.has(name) ? name : "files"}"></use></svg>`;
 }
 
-const navIconByLabel = {
-  Overview: "home",
-  Repositories: "git",
-  "Verification runs": "shield",
-  Findings: "exclamation",
-  Baselines: "archive",
-  Policies: "settings",
-  Team: "agents",
-  Integrations: "plugin",
-  "Change Sets": "git",
-  Releases: "files",
-  Outcomes: "checkmark",
-  Settings: "settings",
+function titleCase(value) { return String(value ?? "").replace(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase()); }
+function normalizeDecision(value, fallback = "unknown") { const key = String(value ?? "").trim().toLowerCase().replace(/[-\s]+/g, "_"); return DECISION_LABELS[key] ? key : fallback; }
+function decisionLabel(value) { return DECISION_LABELS[normalizeDecision(value)] || titleCase(value || "Unknown"); }
+
+function stageKey(order) {
+  const raw = String(order.stage ?? order.currentStage ?? "intake").toLowerCase();
+  if (["intake", "triage"].includes(raw)) return "intake";
+  if (["spec", "specification", "planning", "plan"].includes(raw)) return "spec";
+  if (["build", "implementation", "building"].includes(raw)) return "build";
+  if (["test", "testing", "verify", "verification", "review", "reviewing", "foreman"].includes(raw)) return "verify";
+  if (["release", "approval", "ready", "merged", "released", "complete"].includes(raw)) return "release";
+  return "intake";
+}
+function stageLabel(order) { return STAGE_LABELS[stageKey(order)]; }
+
+function normalizedActor(raw, fallback = "System") {
+  if (raw && typeof raw === "object") return { id: raw.id || raw.actorId || "", name: raw.name || raw.email || fallback, kind: raw.kind || raw.actorType || "system" };
+  if (typeof raw === "string" && raw) return { id: raw, name: raw === "user_1" ? "Alex Morgan" : raw, kind: raw.startsWith("user") ? "human" : "system" };
+  return { id: "system", name: fallback, kind: "system" };
+}
+
+function normalizeGroup(raw, decisions, status) {
+  const group = String(raw ?? "").toLowerCase().replace(/[-\s]+/g, "_");
+  if (["blocked", "needs_attention", "failed"].includes(group) || ["blocked", "fail"].includes(decisions.verification)) return "blocked";
+  if (["released", "completed", "done"].includes(group) || decisions.release === "released") return "released";
+  if (["unknown"].includes(group) || decisions.verification === "unknown") return "unknown";
+  if (["ready"].includes(group) || decisions.release === "approved") return "ready";
+  if (["awaiting_review", "waiting_for_approval", "approval"].includes(group) || decisions.review === "awaiting_human") return "awaiting_review";
+  if (["in_progress", "implementation", "building"].includes(group)) return "in_progress";
+  if (["failed", "blocked"].includes(String(status).toLowerCase())) return "blocked";
+  return "in_progress";
+}
+
+function defaultActions(order) {
+  const blocked = order.group === "blocked";
+  return [
+    { id: order.heldBy ? "return" : "take", label: order.heldBy ? "Return cell" : "Take cell", allowed: true },
+    { id: "steer", label: "Add operator note", allowed: true },
+    { id: "retry", label: "Retry run", allowed: blocked, reason: blocked ? undefined : "Retry is available after a failed or blocked run." },
+    { id: "review", label: "Record review", allowed: order.reviewDecision === "awaiting_human", reason: order.reviewDecision === "awaiting_human" ? undefined : "Review is not currently required." },
+    { id: "authorize_release", label: "Authorize release", allowed: order.releaseDecision === "awaiting_authorization", reason: order.releaseDecision === "awaiting_authorization" ? undefined : "Deterministic verification and review must be resolved first." },
+  ];
+}
+
+function normalizeOrder(raw, fallbackFactoryId = factoryId()) {
+  const status = String(raw.status ?? "").toLowerCase(); const graph = raw.graph || raw.projection || {};
+  const verification = normalizeDecision(raw.verificationVerdict ?? graph.verificationVerdict, raw.currentStage ? "not_run" : "unknown");
+  const reviewSource = raw.reviewDecision ?? graph.reviewDecision ?? (raw.reviewAssessment === "REVISE" ? "changes_requested" : raw.reviewAssessment === "NEEDS_HUMAN_REVIEW" ? "awaiting_human" : raw.reviewAssessment === "CLEAR" ? "not_required" : undefined);
+  const review = normalizeDecision(reviewSource, "awaiting_human");
+  const release = normalizeDecision(raw.releaseDecision ?? graph.releaseDecision, status === "released" ? "released" : verification === "pass" && review === "approved" ? "awaiting_authorization" : "not_eligible");
+  const outcome = normalizeDecision(raw.outcomeStatus ?? graph.outcomeStatus, status === "released" ? "accepted" : "pending");
+  const decisions = { verification, review, release, outcome }; const id = raw.workOrderId || raw.id || raw.work_order_id || "unknown-work-order";
+  const actor = normalizedActor(raw.actor || raw.owner || raw.heldBy, raw.owner ? "Assigned operator" : "System");
+  const order = { ...raw, id, workOrderId: id, factoryId: raw.factoryId || raw.factory_id || fallbackFactoryId, title: raw.title || raw.issueOrPullRequest || raw.intent || id, repository: raw.repository || (raw.repositoryId ? { id: raw.repositoryId, name: raw.repositoryId } : undefined), stage: stageKey(raw), actor, risk: String(raw.risk || (status === "failed" || status === "blocked" ? "high" : "unknown")).toLowerCase(), decisions, verificationVerdict: verification, reviewDecision: review, releaseDecision: release, outcomeStatus: outcome, unresolvedUnknownCount: Number(raw.unresolvedUnknownCount ?? raw.unresolved_unknown_count ?? (verification === "unknown" ? 1 : 0)), updatedAt: raw.updatedAt || raw.updated_at || raw.updated || "Recently" };
+  order.group = normalizeGroup(raw.group, decisions, status); order.availableActions = raw.availableActions || raw.capabilities || defaultActions(order); return order;
+}
+
+function statusBadge(label, tone = "neutral") { return `<span class="slds-badge tb-badge tb-badge--${esc(tone)}"><span class="tb-status-dot"></span>${esc(label)}</span>`; }
+function avatar(label, tone = "brand") { return `<span class="slds-avatar slds-avatar_x-small tb-avatar tb-avatar--${esc(tone)}"><span class="slds-avatar__initials">${esc(String(label || "?").slice(0, 2).toUpperCase())}</span></span>`; }
+function button(label, kind = "neutral", attrs = "") { return `<button type="button" class="slds-button slds-button_${kind} tb-button" ${attrs}>${esc(label)}</button>`; }
+function linkButton(label, href, kind = "neutral") { return `<a class="slds-button slds-button_${kind} tb-button" href="${esc(href)}">${esc(label)}</a>`; }
+
+function pageHeader(eyebrow, title, description, actions = "") {
+  return html`<div class="slds-page-header tb-page-header"><div class="slds-page-header__row"><div class="slds-page-header__col-title"><div class="slds-media slds-media_center"><div class="slds-media__body"><div class="slds-page-header__name"><div class="slds-page-header__name-title"><span class="slds-text-title_caps tb-eyebrow">${esc(eyebrow)}</span><h1 class="slds-page-header__title slds-truncate" title="${esc(title)}">${esc(title)}</h1></div></div><p class="slds-page-header__name-meta tb-page-description">${esc(description)}</p></div></div></div>${actions ? html`<div class="slds-page-header__col-actions"><div class="slds-page-header__controls"><div class="slds-page-header__control"><div class="slds-button-group" role="group">${actions}</div></div></div></div>` : ""}</div></div>`;
+}
+
+function tableShell(headers, rows, extraClass = "") { return html`<div class="slds-scrollable_x tb-table-wrap ${extraClass}"><table class="slds-table slds-table_cell-buffer slds-table_bordered slds-table_col-bordered tb-table"><thead><tr>${headers.map((header) => `<th scope="col"><div class="slds-truncate" title="${esc(header)}">${esc(header)}</div></th>`).join("")}</tr></thead><tbody>${rows}</tbody></table></div>`; }
+function loadingRows(count = 5, columns = 7) { return Array.from({ length: count }, () => `<tr class="tb-skeleton-row">${Array.from({ length: columns }, () => "<td><span class=\"tb-skeleton\"></span></td>").join("")}</tr>`).join(""); }
+function emptyState(title, description, action = "") { return html`<div class="slds-card tb-empty-state"><div class="slds-card__body slds-card__body_inner"><span class="tb-empty-icon">${icon("archive")}</span><h2 class="slds-text-heading_small">${esc(title)}</h2><p>${esc(description)}</p>${action ? `<div class="tb-empty-action">${action}</div>` : ""}</div></div>`; }
+function errorState(error, retryHref = "") { const correlation = error?.correlationId || error?.payload?.correlationId; return html`<div class="slds-card tb-error-state"><div class="slds-card__body slds-card__body_inner"><span class="tb-empty-icon tb-empty-icon--error">${icon("exclamation")}</span><h2>Something could not load</h2><p>${esc(error?.message || "The control plane returned an unexpected error.")}</p>${correlation ? `<p class="tb-mono">Reference ${esc(correlation)}</p>` : ""}<div class="tb-error-actions">${retryHref ? button("Retry", "neutral", `data-retry="${esc(retryHref)}"`) : ""}</div></div></div>`; }
+
+function toneForOrder(order) { return GROUP_TONES[order.group] || "neutral"; }
+function orderOwner(order) { return order.actor?.name || order.owner || "Unassigned"; }
+function riskTone(risk) { return ["high", "critical"].includes(String(risk).toLowerCase()) ? "error" : String(risk).toLowerCase() === "medium" ? "warning" : "neutral"; }
+function workRow(order) {
+  const href = factoryHref(order.factoryId || factoryId(), "work-orders", order.id); const owner = order.actor || normalizedActor(order.owner, "Unassigned");
+  return html`<tr class="tb-table-row" data-row-id="${esc(order.id)}" tabindex="0"><td><div class="tb-work-cell"><a class="slds-truncate tb-primary-link" href="${esc(href)}" title="${esc(order.title)}">${esc(order.title)}</a><span class="tb-mono">${esc(order.id)}</span></div></td><td><div class="tb-work-cell"><span class="tb-mono">${esc(order.repository?.name || order.repositoryId || "Unassigned repository")}</span><span class="tb-muted">${esc(order.lineId || order.outputKind || "Factory work")}</span></div></td><td>${statusBadge(GROUP_LABELS[order.group], toneForOrder(order))}</td><td><span class="tb-muted">${esc(stageLabel(order))}</span></td><td><span class="tb-actor-cell">${avatar(owner.name, owner.kind === "human" ? "brand" : "neutral")}<span>${esc(owner.name)}</span></span></td><td>${statusBadge(titleCase(order.risk), riskTone(order.risk))}</td><td><time class="tb-mono">${esc(order.updatedAt)}</time></td></tr>`;
+}
+
+function groupOrders(orders = state.workOrders) { const groups = Object.fromEntries(GROUPS.map((group) => [group, []])); orders.forEach((order) => groups[order.group || "unknown"]?.push(order)); return groups; }
+function stageProgress(orders) { const maxIndex = Math.max(-1, ...orders.map((order) => STAGES.indexOf(order.stage))); const released = orders.length > 0 && orders.every((order) => order.group === "released"); return STAGES.map((stage, index) => ({ stage, state: released || index < maxIndex ? "complete" : index === maxIndex ? "current" : "incomplete" })); }
+function pipeline() { const items = stageProgress(state.workOrders); return html`<div class="slds-path tb-path" aria-label="Factory pipeline"><div class="slds-grid slds-path__track"><div class="slds-grid slds-path__scroller-container"><div class="slds-path__scroller"><div class="slds-path__scroller_inner"><ul class="slds-path__nav" role="listbox" aria-orientation="horizontal">${items.map(({ stage, state: stageState }) => html`<li class="slds-path__item ${stageState === "current" ? "slds-is-current slds-is-active" : stageState === "complete" ? "slds-is-complete" : "slds-is-incomplete"}" role="presentation"><a class="slds-path__link" href="${factoryHref(factoryId(), "work-orders")}" role="option" aria-selected="${stageState === "current" ? "true" : "false"}"><span class="slds-path__stage">${esc(STAGE_LABELS[stage])}</span><span class="slds-path__title">${esc(STAGE_SUBTITLES[stage])}</span></a></li>`).join("")}</ul></div></div></div></div></div>`; }
+
+function activityItems(items = state.factoryView?.activity || state.workOrders, limit = 6) { return items.slice(0, limit).map((raw) => { const order = raw.id ? raw : normalizeOrder(raw); const actor = normalizedActor(raw.actor || order.actor); return html`<li class="tb-activity-item"><span class="tb-activity-marker tb-activity-marker--${toneForOrder(order)}"></span><div><strong>${esc(raw.title || order.title)}</strong><span>${esc(actor.name)} · ${esc(raw.eventType || stageLabel(order))}</span><time>${esc(raw.occurredAt || order.updatedAt)}</time></div></li>`; }).join(""); }
+function costSummary() { const economics = state.costs || state.factoryView?.costs || {}; const total = Number(economics.totalCents ?? economics.cogsCents ?? 0); const duration = economics.medianDurationSeconds ?? economics.durationSeconds; return html`<section class="slds-card tb-cost-summary"><div class="slds-card__body slds-card__body_inner"><div><span class="tb-muted">Factory economics</span><strong>${total ? `$${(total / 100).toFixed(2)}` : "No measured spend"}</strong><small>${economics.ownershipLabel || "Measured and customer-owned spend stay separate."}</small></div><dl><div><dt>Accepted outcomes</dt><dd>${esc(economics.acceptedChanges ?? economics.acceptedOutcomes ?? "—")}</dd></div><div><dt>Median duration</dt><dd>${duration ? `${Math.round(Number(duration) / 60)}m` : "—"}</dd></div></dl></div></section>`; }
+
+function groupedQueue(groups) {
+  const visible = GROUPS.filter((group) => groups[group]?.length);
+  if (!visible.length) return emptyState("No work orders yet", "Submit a work order or connect an intake integration.", button("Create work order", "brand", "data-open-modal=workOrder"));
+  return html`<div class="tb-grouped-queue">${visible.map((group) => html`<section class="slds-card tb-queue-group"><div class="slds-card__header slds-grid"><header class="slds-media slds-media_center slds-has-flexi-truncate"><div class="slds-media__body"><h2 class="slds-card__header-title">${esc(GROUP_LABELS[group])}</h2><p class="tb-muted">${group === "blocked" ? "Resolve the gate before work can move." : group === "awaiting_review" ? "Human authority is the next decision." : group === "ready" ? "All required gates are satisfied." : "Latest factory state."}</p></div></header><span class="slds-badge tb-count-badge">${groups[group].length}</span></div>${tableShell(["Work order", "Repository", "Decision", "Stage", "Owner / agent", "Risk", "Updated"], groups[group].map((order) => workRow(order)).join(""), "tb-queue-table")}</section>`).join("")}</div>`;
+}
+
+function factoryFloor() {
+  const groups = groupOrders(); const metrics = state.factoryView?.metrics || {}; const factory = selectedFactory();
+  const cards = [["In progress", metrics.inProgress ?? groups.in_progress.length, "Work in motion", "info"], ["Blocked", metrics.blocked ?? groups.blocked.length, "Needs intervention", "error"], ["Awaiting review", metrics.awaitingReview ?? groups.awaiting_review.length, "Human decision", "warning"], ["Released", metrics.released ?? groups.released.length, "Outcome recorded", "success"]];
+  return html`<div class="tb-route-content tb-factory-floor">${pageHeader("FACTORY FLOOR", "Factory floor", `${factory.name} · what is moving, blocked, and ready for human authority.`, html`${linkButton("View all work orders", factoryHref(factory.factoryId, "work-orders"), "neutral")} ${button("Create work order", "brand", "data-open-modal=workOrder")}`)}<div class="tb-factory-tabs slds-tabs_default"><ul class="slds-tabs_default__nav" role="tablist"><li class="slds-tabs_default__item slds-is-active" role="presentation"><a class="slds-tabs_default__link" href="${factoryHref(factory.factoryId)}" role="tab" aria-selected="true">Overview</a></li><li class="slds-tabs_default__item" role="presentation"><a class="slds-tabs_default__link" href="${factoryHref(factory.factoryId, "work-orders")}" role="tab">Work orders</a></li><li class="slds-tabs_default__item" role="presentation"><a class="slds-tabs_default__link" href="${factoryHref(factory.factoryId, "activity")}" role="tab">Activity</a></li></ul></div><div class="tb-metric-layout"><div class="tb-metric-strip">${cards.map(([label, value, note, tone]) => html`<article class="slds-card tb-metric-card"><div class="slds-card__body slds-card__body_inner"><span class="tb-muted">${label}</span><strong class="tb-metric-value tb-metric-value--${tone}">${esc(value)}</strong><small>${note}</small></div></article>`).join("")}</div>${costSummary()}</div>${pipeline()}${state.routeLoading && !state.workOrders.length ? `<div class="slds-card tb-list-card"><div class="tb-card-table-body">${tableShell(["Work order", "Repository", "Decision", "Stage", "Owner / agent", "Risk", "Updated"], loadingRows())}</div></div>` : groupedQueue(groups)}<div class="tb-dashboard-lower"><aside class="slds-card tb-activity-card"><div class="slds-card__header slds-grid"><header class="slds-media slds-media_center slds-has-flexi-truncate"><div class="slds-media__body"><h2 class="slds-card__header-title">Activity</h2><p class="tb-muted">Evidence and authority changes</p></div></header><a class="tb-primary-link" href="${factoryHref(factory.factoryId, "activity")}">View all</a></div><div class="slds-card__body slds-card__body_inner"><ol class="tb-activity-list">${activityItems()}</ol><div class="slds-notify slds-notify_alert tb-callout" role="status"><span class="tb-callout-icon">${icon("shield")}</span><div><strong>Decision traceability is on</strong><p>Every material change stays linked to evidence and authorization.</p></div></div></div></aside></div></div>`;
+}
+
+function filterState() { return routeQuery(); }
+function filteredOrders() { const filters = filterState(); return state.workOrders.filter((order) => (!filters.q || `${order.title} ${order.id} ${order.repository?.name || order.repositoryId || ""}`.toLowerCase().includes(filters.q.toLowerCase())) && (!filters.group || order.group === filters.group) && (!filters.stage || order.stage === filters.stage) && (!filters.risk || order.risk === filters.risk)); }
+function filterChips() { const filters = filterState(); const entries = [["group", filters.group, GROUP_LABELS[filters.group]], ["stage", filters.stage, STAGE_LABELS[filters.stage]], ["risk", filters.risk, titleCase(filters.risk)]]; return entries.filter(([, value]) => value).map(([key, value, label]) => `<button type="button" class="slds-button slds-button_neutral tb-filter-pill tb-filter-pill--active" data-clear-filter="${key}">${esc(label)} ${icon("x", "xx-small")}</button>`).join(""); }
+
+function workOrdersPage(route) {
+  const filters = filterState(); const orders = filteredOrders(); const rows = state.routeLoading && !state.workOrders.length ? loadingRows(6, 7) : orders.map((order) => workRow(order)).join(""); const panel = route.entityId ? entityPanel("work-orders", route.entityId) : "";
+  return html`<div class="tb-route-content tb-work-route"><div class="tb-route-list ${panel ? "tb-route-list--with-panel" : ""}">${pageHeader("WORK ORDERS", "Work orders", "All work entering or moving through the selected factory.", html`${button("Filter", "neutral", "data-filter-toggle")} ${button("New work order", "brand", "data-open-modal=workOrder")}`)}<div class="slds-card tb-list-card"><div class="slds-card__body slds-card__body_inner tb-list-toolbar"><div class="tb-toolbar-tabs"><button class="slds-button slds-button_neutral tb-filter-button ${!filters.group ? "tb-filter-button--active" : ""}" data-set-filter="group:" type="button">All work <b>${state.workOrders.length}</b></button>${GROUPS.slice(0, 3).map((group) => `<button class="slds-button slds-button_neutral tb-filter-button ${filters.group === group ? "tb-filter-button--active" : ""}" data-set-filter="group:${group}" type="button">${esc(GROUP_LABELS[group])} <b>${groupOrders()[group].length}</b></button>`).join("")}</div><div class="slds-form-element tb-inline-search"><label class="slds-form-element__label slds-assistive-text" for="work-search">Filter work orders</label><div class="slds-form-element__control slds-input-has-icon slds-input-has-icon_left">${icon("search")}<input id="work-search" class="slds-input" data-work-filter="q" value="${esc(filters.q)}" placeholder="Filter work orders" /></div></div></div><div class="tb-filter-bar ${filterChips() ? "tb-filter-bar--visible" : ""}">${filterChips()}${filterChips() ? `<button type="button" class="slds-button slds-button_reset tb-clear-filters" data-clear-filters>Clear filters</button>` : ""}</div>${orders.length || state.routeLoading ? tableShell(["Work order", "Repository", "Decision", "Stage", "Owner / agent", "Risk", "Updated"], rows, "tb-work-table") : emptyState("No matching work orders", "Clear the filters or submit a new work order to continue.", button("Clear filters", "neutral", "data-clear-filters"))}</div></div>${panel}</div>`;
+}
+
+const FACTORY_RESOURCES = {
+  activity: { title: "Activity", eyebrow: "ACTIVITY", description: "Chronological agent, human, system, policy, and release events.", empty: "Activity will appear as factory work moves." },
+  runs: { title: "Runs", eyebrow: "RUNS", description: "Execution history with verification, evidence coverage, duration, and cost.", empty: "Runs appear after a factory accepts work." },
+  evidence: { title: "Evidence", eyebrow: "EVIDENCE", description: "Evidence inventory and graph entry points for every decision.", empty: "Evidence will appear after a run produces a result." },
+  agents: { title: "Agents", eyebrow: "AGENTS", description: "The specialized workforce assigned to this factory.", empty: "Add the first specialized factory role." },
+  automations: { title: "Automations", eyebrow: "AUTOMATIONS", description: "Scheduled and event-triggered factory behavior.", empty: "Create an automation to start work automatically." },
+  policies: { title: "Policies", eyebrow: "POLICIES", description: "Factory gates for risk, security, testing, release, cost, and approval.", empty: "Policies will appear when the factory definition publishes them." },
+  repositories: { title: "Repositories", eyebrow: "REPOSITORIES", description: "Repositories connected to the factory and their assurance coverage.", empty: "Connect a repository to start receiving work." },
+  releases: { title: "Releases", eyebrow: "RELEASES", description: "Release candidates, approvals, deployments, and outcome history.", empty: "Release candidates appear after verified work is ready." },
+  costs: { title: "Costs", eyebrow: "COSTS", description: "Compute, platform, inference, provider, and accepted-outcome cost reporting.", empty: "Cost records appear after factory runs produce usage." },
 };
+const WORKSPACE_RESOURCES = {
+  runs: { title: "Runs", eyebrow: "WORKSPACE RUNS", description: "Cross-factory run history and operational search.", empty: "Runs will appear after factory work starts." },
+  environments: { title: "Environments", eyebrow: "ENVIRONMENTS", description: "Execution surfaces where work is built, tested, previewed, staged, or released.", empty: "Connect an execution environment to give the factory somewhere to run." },
+  integrations: { title: "MCPs and apps", eyebrow: "MCPs AND APPS", description: "Connected MCP servers, provider apps, webhooks, and integration health.", empty: "Connect an app or add a custom MCP." },
+  secrets: { title: "Secrets", eyebrow: "SECRETS", description: "Workspace secret inventory, access, rotation, and audit history.", empty: "Add a managed secret or connect a customer-owned provider." },
+  factories: { title: "Factories", eyebrow: "FACTORIES", description: "The operating units that organize work, people, evidence, and authority.", empty: "Create your first factory." },
+};
+function resourceHref(resource, id = "") { return FACTORY_RESOURCES[resource] ? factoryHref(factoryId(), resource, id) : workspaceHref(resource, id); }
 
-function link(href, label, active = false, extra = "") {
-  return h("<a class=\"nav-link", active ? " active" : "", "\" href=\"", esc(href), "\" ", extra, ">", icon(navIconByLabel[label] ?? "shield"), "<span class=\"nav-text\">", esc(label), "</span></a>");
+function resourceRows(resource, items) {
+  if (resource === "activity") return items.map((item) => { const order = normalizeOrder(item, factoryId()); const actor = normalizedActor(item.actor || order.actor); return html`<div class="tb-event-row"><span class="tb-event-icon tb-event-icon--${toneForOrder(order)}">${icon(actor.kind === "human" ? "user" : actor.kind === "agent" ? "agents" : "shield")}</span><div><div class="tb-event-heading"><strong>${esc(item.title || order.title)}</strong>${statusBadge(GROUP_LABELS[order.group], toneForOrder(order))}</div><p>${esc(actor.name)} · ${esc(item.eventType || stageLabel(order))} · ${esc(item.repositoryId || order.repository?.name || "Factory")}</p><time class="tb-mono">${esc(item.occurredAt || order.updatedAt)}</time></div></div>`; }).join("");
+  if (resource === "agents") return tableShell(["Agent", "Role", "State", "Assignment", "Health", "Last run", "Cost"], items.map((item) => html`<tr class="tb-table-row" tabindex="0"><td><a class="tb-primary-link" href="${resourceHref(resource, item.id || item.agentId)}">${esc(item.name || item.agentId || "Unnamed agent")}</a></td><td>${esc(item.role || item.description || "Specialist")}</td><td>${statusBadge(titleCase(item.state || (item.enabled === false ? "disabled" : "active")), item.enabled === false ? "neutral" : "success")}</td><td>${esc(item.activeAssignment || item.activeWorkOrderId || "Unassigned")}</td><td>${esc(item.health || "Unknown")}</td><td>${esc(item.lastRun || "—")}</td><td>${esc(item.cost || "—")}</td></tr>`).join(""), "tb-resource-table");
+  if (resource === "automations") return tableShell(["Automation", "Trigger", "State", "Owner", "Last execution", "Next execution", "Result"], items.map((item) => html`<tr class="tb-table-row" tabindex="0"><td><a class="tb-primary-link" href="${resourceHref(resource, item.id || item.automationId)}">${esc(item.name || item.automationId || "Unnamed automation")}</a></td><td>${esc(item.trigger || item.triggers || "Event")}</td><td>${statusBadge(item.enabled === false ? "Disabled" : "Enabled", item.enabled === false ? "neutral" : "success")}</td><td>${esc(item.owner || item.agent || "Factory")}</td><td>${esc(item.lastExecution || "—")}</td><td>${esc(item.nextExecution || "—")}</td><td>${esc(item.result || "—")}</td></tr>`).join(""), "tb-resource-table");
+  if (resource === "evidence") return tableShell(["Evidence", "Work order", "Type", "Producer", "Provenance", "Recorded"], items.map((item) => html`<tr class="tb-table-row" tabindex="0"><td><a class="tb-primary-link" href="${resourceHref(resource, item.id || item.evidenceId)}">${esc(item.name || item.title || item.evidenceId || "Evidence item")}</a></td><td>${esc(item.workOrderId || "—")}</td><td>${esc(item.type || "Evidence")}</td><td>${esc(item.producer || item.sourceRunId || "System")}</td><td>${esc(item.provenance || item.status || "Recorded")}</td><td>${esc(item.recordedAt || item.createdAt || "Recently")}</td></tr>`).join(""), "tb-resource-table");
+  if (resource === "runs") return tableShell(["Run", "Work order", "State", "Verification", "Evidence", "Duration", "Cost"], items.map((item) => html`<tr class="tb-table-row" tabindex="0"><td><a class="tb-primary-link" href="${resourceHref(resource, item.run_id || item.runId)}">${esc(item.run_id || item.runId || "Run")}</a></td><td>${esc(item.work_order_id || item.workOrderId || "—")}</td><td>${statusBadge(titleCase(item.status || "unknown"), item.status === "completed" ? "success" : "info")}</td><td>${decisionLabel(item.verificationVerdict || item.verdict || "not_run")}</td><td>${esc(item.evidenceCoverage || "—")}</td><td>${esc(item.duration || "—")}</td><td>${esc(item.cost || "—")}</td></tr>`).join(""), "tb-resource-table");
+  return tableShell(["Name", "Status", "Owner", "Updated", "Reference"], items.map((item) => html`<tr class="tb-table-row" tabindex="0"><td><a class="tb-primary-link" href="${resourceHref(resource, item.id || item.policyId || item.repositoryId || item.release_id)}">${esc(item.name || item.title || item.id || "Resource")}</a></td><td>${statusBadge(titleCase(item.status || (item.enabled === false ? "disabled" : "active")), item.status === "blocked" ? "error" : "neutral")}</td><td>${esc(item.owner || item.agent || "Factory")}</td><td>${esc(item.updatedAt || item.updated_at || item.createdAt || "Recently")}</td><td class="tb-mono">${esc(item.id || item.policyId || item.repositoryId || item.release_id || "—")}</td></tr>`).join(""), "tb-resource-table");
 }
 
-function settingsLink(href, label, active = false, iconName = "settings", extra = "") {
-  return h("<a class=\"settings-link", active ? " active" : "", "\" href=\"", esc(href), "\" ", active ? "aria-current=\"page\"" : "", " ", extra, ">", icon(iconName), "<span>", esc(label), "</span></a>");
+function collectionPage(route, items) {
+  const config = (route.kind === "factory" ? FACTORY_RESOURCES : WORKSPACE_RESOURCES)[route.resource || route.area] || { title: titleCase(route.resource || route.area), eyebrow: "CONTROL PLANE", description: "Operational records for this workspace.", empty: "No records are available." };
+  const resource = route.resource || route.area;
+  const createAction = resource === "secrets" ? button("Add secret", "brand", "data-open-modal=secret") : resource === "integrations" ? button("Add MCP/app", "brand", "data-open-modal=integration") : resource === "factories" ? button("New factory", "brand", "data-open-modal=factory") : resource === "agents" ? button("New agent", "brand", "data-open-modal=agent") : resource === "automations" ? button("New automation", "brand", "data-open-modal=automation") : "";
+  const panel = route.entityId ? entityPanel(resource, route.entityId) : "";
+  if (resource === "activity") return html`<div class="tb-route-content"><div class="tb-route-list ${panel ? "tb-route-list--with-panel" : ""}">${pageHeader(config.eyebrow, config.title, `${selectedFactory().name} · ${config.description}`, "")}${state.routeLoading && !items.length ? `<div class="slds-card tb-list-card"><div class="slds-card__body slds-card__body_inner">${loadingRows(6, 1)}</div></div>` : items.length ? `<div class="slds-card tb-list-card"><div class="slds-card__body slds-card__body_inner tb-event-list">${resourceRows(resource, items)}</div></div>` : emptyState(config.title, config.empty)}</div>${panel}</div>`;
+  return html`<div class="tb-route-content"><div class="tb-route-list ${panel ? "tb-route-list--with-panel" : ""}">${pageHeader(config.eyebrow, config.title, config.description, createAction)}${resource === "secrets" ? `<div class="tb-secret-note"><span>${icon("lock")}</span><div><strong>Secret values are never shown here.</strong><p>Only names, ownership, references, and audit metadata are visible.</p></div></div>` : ""}${state.routeLoading && !items.length ? `<div class="slds-card tb-list-card"><div class="tb-card-table-body">${tableShell(["Name", "Status", "Owner", "Updated", "Reference"], loadingRows(6, 5))}</div></div>` : items.length ? `<div class="slds-card tb-list-card"><div class="tb-card-table-body">${resourceRows(resource, items)}</div></div>` : emptyState(config.title, config.empty, createAction)}</div>${panel}</div>`;
 }
 
-function pageHeading(eyebrow, title, description = "", actions = "") {
-  return h(
-    "<div class=\"page-heading\"><div><div class=\"eyebrow\">",
-    esc(eyebrow),
-    "</div><h1>",
-    esc(title),
-    "</h1>",
-    description ? h("<p>", esc(description), "</p>") : "",
-    "</div>",
-    actions ? h("<div class=\"page-actions\">", actions, "</div>") : "",
-    "</div>",
-  );
+function detailData(resource, id) { if (resource === "work-orders") return state.entity?.workOrder || state.entity || state.workOrders.find((item) => item.id === id); return state.entity?.item || state.entity || state.routeItems.find((item) => String(item.id || item.run_id || item.runId || item.evidenceId || item.release_id || item.agentId || item.automationId) === String(id)); }
+function decisionRow(label, value, tone = "neutral") { return `<tr><th scope="row">${esc(label)}</th><td>${statusBadge(decisionLabel(value), tone)}</td></tr>`; }
+function decisionTone(value) { const v = normalizeDecision(value); return ["fail", "blocked", "rejected", "not_eligible", "rolled_back"].includes(v) ? "error" : ["awaiting_human", "awaiting_authorization", "changes_requested"].includes(v) ? "warning" : ["pass", "approved", "released", "accepted"].includes(v) ? "success" : "neutral"; }
+function evidenceNodes(order) { const nodes = order.evidence?.nodes || state.graph?.graph?.nodes || []; if (Array.isArray(nodes) && nodes.length) return nodes; return ["Diff", "Tests", "Policy", "Environment", "Artifact", "Outcome"].map((label) => ({ label, status: label === "Tests" && order.verificationVerdict !== "pass" ? "blocked" : "linked" })); }
+
+function workOrderPanel(order) {
+  const detail = state.entity?.workOrder ? normalizeOrder(state.entity.workOrder, order.factoryId) : order; const events = state.graph?.events || state.entity?.events || state.factoryView?.activity || []; const actions = detail.availableActions || defaultActions(detail); const action = (id) => actions.find((item) => item.id === id); const blockedReason = detail.blockedReason || detail.unknownReason || (detail.group === "blocked" ? "A deterministic gate or required evidence is unresolved." : detail.unresolvedUnknownCount ? `${detail.unresolvedUnknownCount} required unknown remains unresolved.` : ""); const runId = detail.latestRunId || state.entity?.run?.run_id || state.entity?.run?.runId; const evidenceId = detail.latestEvidenceId || state.entity?.evidenceId;
+  const footerActions = actions.filter((item) => ["take", "return", "retry", "review"].includes(item.id) || item.id === "authorize_release" && item.allowed);
+  return html`<aside class="slds-panel slds-panel_docked slds-panel_docked-right tb-entity-panel" aria-label="Work order detail"><div class="slds-panel__header tb-panel-header"><div><span class="slds-text-title_caps tb-eyebrow">WORK ORDER</span><h2 class="slds-panel__header-title slds-truncate" title="${esc(detail.title)}">${esc(detail.title)}</h2><p class="tb-mono">${esc(detail.repository?.name || detail.repositoryId || "Unassigned repository")} · ${esc(detail.id)}</p></div><a class="slds-button slds-button_icon slds-button_icon-border-filled" href="${factoryHref(detail.factoryId, "work-orders")}" aria-label="Close work-order panel">${icon("x")}</a></div><div class="slds-panel__body tb-panel-body"><section class="tb-detail-section"><div class="tb-panel-section-heading"><h3>Change summary</h3>${statusBadge(GROUP_LABELS[detail.group], toneForOrder(detail))}</div><p>${esc(detail.intent || detail.title || "No intent recorded.")}</p><dl class="tb-fact-grid"><div><dt>Factory</dt><dd>${esc(selectedFactory().name)}</dd></div><div><dt>Current stage</dt><dd>${esc(stageLabel(detail))}</dd></div><div><dt>Owner / agent</dt><dd>${esc(orderOwner(detail))}</dd></div><div><dt>Source</dt><dd>${esc(detail.sourceType || "Manual intake")}</dd></div><div><dt>Branch / commit</dt><dd>${esc(detail.branch || detail.commitSha || detail.sha || "Not recorded")}</dd></div><div><dt>Output</dt><dd>${esc(detail.outputKind || "Pull request")}</dd></div></dl>${detail.acceptanceCriteria ? `<div class="tb-detail-subsection"><dt>Acceptance criteria</dt><p>${esc(detail.acceptanceCriteria)}</p></div>` : ""}</section><section class="tb-detail-section"><div class="tb-panel-section-heading"><h3>Factory stage</h3><span class="tb-muted">${esc(stageLabel(detail))}</span></div><div class="tb-mini-path">${STAGES.map((stage) => `<span class="tb-mini-path__item ${STAGES.indexOf(stage) < STAGES.indexOf(detail.stage) ? "is-complete" : stage === detail.stage ? "is-current" : ""}">${esc(STAGE_LABELS[stage])}</span>`).join("")}</div></section><section class="tb-detail-section"><div class="tb-panel-section-heading"><h3>Decision ledger</h3><span class="tb-muted">Four separate decisions</span></div><table class="slds-table slds-table_cell-buffer slds-table_bordered tb-decision-table"><tbody>${decisionRow("Deterministic verdict", detail.verificationVerdict, decisionTone(detail.verificationVerdict))}${decisionRow("Review decision", detail.reviewDecision, decisionTone(detail.reviewDecision))}${decisionRow("Release decision", detail.releaseDecision, decisionTone(detail.releaseDecision))}${decisionRow("Outcome", detail.outcomeStatus, decisionTone(detail.outcomeStatus))}</tbody></table>${blockedReason ? `<div class="slds-notify slds-notify_alert tb-inline-alert" role="alert"><span>${icon("exclamation")}</span><div><strong>${detail.unresolvedUnknownCount ? "Unresolved unknowns" : "Blocked reason"}</strong><p>${esc(blockedReason)}</p></div></div>` : ""}</section><section class="tb-detail-section"><div class="tb-panel-section-heading"><h3>Evidence graph</h3>${evidenceId ? `<a class="tb-primary-link" href="${resourceHref("evidence", evidenceId)}">Open evidence</a>` : ""}</div><div class="tb-evidence-chain">${evidenceNodes(detail).map((node, index) => html`<span class="${node.status === "blocked" ? "tb-evidence-chain__blocked" : index === 0 ? "tb-evidence-chain__active" : ""}">${esc(node.label || node.type || titleCase(node))}</span>${index < evidenceNodes(detail).length - 1 ? "<i></i>" : ""}`).join("")}</div><dl class="tb-mini-facts"><div><dt>Run</dt><dd>${runId ? `<a class="tb-primary-link" href="${resourceHref("runs", runId)}">${esc(runId)}</a>` : "Not run"}</dd></div><div><dt>Evidence refs</dt><dd>${esc(detail.evidenceCount ?? evidenceNodes(detail).length)}</dd></div><div><dt>Policy</dt><dd>${esc(detail.policyVersion || "Default")}</dd></div></dl></section><section class="tb-detail-section"><div class="tb-panel-section-heading"><h3>Artifacts</h3><span class="tb-muted">${detail.artifacts?.length || 0} linked</span></div>${detail.artifacts?.length ? `<ul class="tb-artifact-list">${detail.artifacts.map((artifact) => `<li><span>${icon("files")}</span><a class="tb-primary-link" href="${esc(artifact.url || "#")}">${esc(artifact.name || artifact.type || "Artifact")}</a><small>${esc(artifact.kind || "Recorded output")}</small></li>`).join("")}</ul>` : `<p class="tb-muted">Artifacts will appear when the factory produces a diff, report, build, preview, or release candidate.</p>`}</section><section class="tb-detail-section"><div class="tb-panel-section-heading"><h3>Activity</h3><span class="tb-muted">Actor-attributed events</span></div><ul class="tb-panel-activity">${events.slice(0, 6).map((event) => { const actor = normalizedActor(event.actor || event.actorId, "System"); return `<li>${avatar(actor.name, actor.kind === "human" ? "brand" : "neutral")}<div><strong>${esc(actor.name)} ${esc(event.action || event.type || "updated the work order")}</strong><span>${esc(event.occurredAt || event.createdAt || detail.updatedAt)}</span></div></li>`; }).join("") || `<li><span class="tb-muted">No activity has been recorded yet.</span></li>`}</ul></section><section class="tb-detail-section"><div class="tb-panel-section-heading"><h3>Cost summary</h3><span class="tb-muted">Ownership visible</span></div><dl class="tb-cost-grid">${[["Compute", detail.cost?.computeCents], ["Platform", detail.cost?.platformCents], ["Inference", detail.cost?.inferenceCents], ["Provider", detail.cost?.providerCents]].map(([label, cents]) => `<div><dt>${label}</dt><dd>${cents == null ? "—" : `$${(Number(cents) / 100).toFixed(2)}`}</dd></div>`).join("")}</dl><p class="tb-muted">${esc(detail.cost?.ownershipLabel || "Measured, estimated, and customer-owned spend are kept distinct.")}</p></section><section class="tb-detail-section"><div class="tb-panel-section-heading"><h3>Operator note</h3><span class="tb-muted">Recorded in activity</span></div><form data-steer="${esc(detail.id)}"><label class="slds-form-element__label" for="steer-note">Steer the factory</label><textarea id="steer-note" class="slds-textarea" placeholder="Add context for the next authorized action"></textarea><div class="tb-form-footer"><span class="tb-muted">Notes do not change a deterministic verdict.</span>${button("Add note", "neutral")}</div></form></section></div><div class="slds-panel__footer tb-panel-footer"><span class="tb-muted">${esc(action("authorize_release")?.allowed ? "Release authorization is available when the evidence is acknowledged." : action("authorize_release")?.reason || "Release action is gated by verification, review, and policy.")}</span><div class="tb-panel-footer-actions">${footerActions.map((item) => button(item.label, item.id === "authorize_release" ? "brand" : "neutral", `data-work-action="${esc(item.id)}" data-work-id="${esc(detail.id)}" ${item.allowed ? "" : `disabled title="${esc(item.reason || "Not available")}"`}`)).join("")}</div></div></aside>`;
 }
 
-function previewBanner(title = "Hosted sync is not connected.", detail = "This local preview renders structured metadata and keeps provider-dependent actions visibly unavailable.") {
-  return h("<div class=\"preview-banner\"><span class=\"preview-badge\">Preview</span><div><strong>", esc(title), "</strong>", esc(detail), "</div></div>");
+function genericPanel(resource, item, id) {
+  const config = FACTORY_RESOURCES[resource] || WORKSPACE_RESOURCES[resource] || { title: titleCase(resource) }; const title = item?.name || item?.title || item?.run_id || item?.runId || item?.evidenceId || id; const fields = Object.entries(item || {}).filter(([key, value]) => value != null && !["contents", "value", "secret", "config", "files"].includes(key) && typeof value !== "object").slice(0, 12);
+  return html`<aside class="slds-panel slds-panel_docked slds-panel_docked-right tb-entity-panel" aria-label="${esc(config.title)} detail"><div class="slds-panel__header tb-panel-header"><div><span class="slds-text-title_caps tb-eyebrow">${esc(config.eyebrow || titleCase(resource))}</span><h2 class="slds-panel__header-title slds-truncate" title="${esc(title)}">${esc(title)}</h2><p class="tb-mono">${esc(id)}</p></div><a class="slds-button slds-button_icon slds-button_icon-border-filled" href="${esc(resourceHref(resource))}" aria-label="Close ${esc(resource)} panel">${icon("x")}</a></div><div class="slds-panel__body tb-panel-body"><section class="tb-detail-section"><div class="tb-panel-section-heading"><h3>Record summary</h3>${statusBadge(titleCase(item?.status || item?.state || "Recorded"), item?.status === "blocked" ? "error" : "neutral")}</div><p>${esc(item?.description || item?.summary || `Operational ${resource} record.`)}</p><dl class="tb-fact-grid">${fields.map(([key, value]) => `<div><dt>${esc(titleCase(key))}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl></section><section class="tb-detail-section"><div class="tb-panel-section-heading"><h3>Traceability</h3><span class="tb-muted">Safe metadata only</span></div><p class="tb-muted">This record remains linked to its factory, source, actor, and audit history. Protected values are intentionally omitted.</p></section></div><div class="slds-panel__footer tb-panel-footer"><span class="tb-muted">Use the parent list to compare related records.</span><div class="tb-panel-footer-actions">${button("Close", "neutral", "data-close-panel")}</div></div></aside>`;
+}
+function entityPanel(resource, id) { const item = detailData(resource, id); if (resource === "work-orders" && item) return workOrderPanel(normalizeOrder(item)); if (state.routeLoading && !item) return `<aside class="slds-panel slds-panel_docked slds-panel_docked-right tb-entity-panel" aria-label="Loading detail"><div class="slds-panel__header tb-panel-header"><span class="tb-eyebrow">LOADING</span></div><div class="tb-panel-body tb-panel-skeleton">${Array.from({ length: 8 }, () => `<span class="tb-skeleton"></span>`).join("")}</div></aside>`; return item ? genericPanel(resource, item, id) : errorState(new Error(`${titleCase(resource)} record not found.`), resourceHref(resource)); }
+
+function factoryListPage(items) { const rows = items.map((factory) => html`<tr class="tb-table-row" tabindex="0"><td><span class="tb-actor-cell">${avatar(factory.name, "brand")}<a class="tb-primary-link" href="${factoryHref(factory.factoryId)}">${esc(factory.name)}</a></span></td><td>${statusBadge(titleCase(factory.status || "active"), factory.status === "blocked" ? "error" : "success")}</td><td>${esc(factory.activeWorkOrders ?? "—")}</td><td>${esc(factory.recentRelease || "—")}</td><td>${esc(factory.updatedAt || factory.updated_at || "Recently")}</td></tr>`).join(""); return html`<div class="tb-route-content">${pageHeader("FACTORIES", "Factories", "The operating units that organize work, evidence, and authority.", button("New factory", "brand", "data-open-modal=factory"))}${items.length ? `<div class="slds-card tb-list-card"><div class="tb-card-table-body">${tableShell(["Factory", "Status", "Active work", "Recent release", "Updated"], rows)}</div></div>` : emptyState("Create your first factory", "A factory gives work, agents, evidence, and authority one operational truth.", button("New factory", "brand", "data-open-modal=factory"))}</div>`; }
+function settingsPage(area) { const labels = [["profile", "Profile"], ["roles", "Roles and access"], ["billing", "Billing"], ["usage", "Usage"]]; return html`<div class="tb-route-content">${pageHeader("SETTINGS", titleCase(area), "Workspace configuration and access controls.", "") }<div class="tb-settings-layout"><nav class="slds-nav-vertical tb-settings-nav" aria-label="Settings"><section class="slds-nav-vertical__section"><h2 class="slds-nav-vertical__title">Settings</h2>${labels.map(([key, label]) => `<a class="slds-nav-vertical__action ${area === key ? "slds-is-active" : ""}" href="/settings/${key}">${esc(label)}</a>`).join("")}</section></nav><section class="slds-card tb-settings-card"><div class="slds-card__body slds-card__body_inner"><h2 class="slds-text-heading_small">${esc(titleCase(area))}</h2><p class="tb-muted">${area === "usage" ? "Usage is shown by ownership and billing category." : "Changes here affect workspace behavior and permissions."}</p><div class="tb-settings-fields"><label class="slds-form-element"><span class="slds-form-element__label">Workspace name</span><input class="slds-input" value="Tinkerbot workspace" /></label><label class="slds-form-element"><span class="slds-form-element__label">Default review policy</span><select class="slds-select"><option>Human review for restricted changes</option><option>Review only on release</option></select></label></div></div></section></div></div>`; }
+
+function appShell() {
+  const route = routeInfo(); const factory = selectedFactory(); const factoryArea = route.kind === "factory" ? route.area : ""; const workspaceActive = (resource) => route.kind === "workspace" && route.resource === resource; const factoryActive = (area) => route.kind === "factory" && route.area === area;
+  const nested = [["Dashboard", "dashboard", "home"], ["Activity", "activity", "files"], ["Work orders", "work-orders", "archive"], ["Runs", "runs", "clock"], ["Agents", "agents", "agents"], ["Automations", "automations", "settings"], ["Evidence", "evidence", "shield"]]; const more = [["Policies", "policies"], ["Repositories", "repositories"], ["Releases", "releases"], ["Costs", "costs"]];
+  const body = state.loading ? `<div class="tb-route-content"><div class="tb-shell-skeleton">${Array.from({ length: 5 }, () => `<span class="tb-skeleton"></span>`).join("")}</div></div>` : routeBody(route);
+  return html`<div class="tb-app-shell"><aside class="tb-rail ${state.sidebarOpen ? "tb-rail--open" : ""}" aria-label="Primary navigation"><div class="tb-rail-inner"><div class="tb-rail-brand"><a class="tb-brand" href="/"><span class="tb-brand-mark">t</span><span class="tb-brand-wordmark">Tinkerbot</span></a></div><button type="button" class="slds-button slds-button_neutral tb-org-switcher" data-org-menu aria-expanded="${state.orgMenu}">${avatar(state.session?.user?.email || "OR", "brand")}<span class="tb-org-copy"><strong>${esc(state.session?.organizationId || "Workspace")}</strong><small>${esc(state.session?.user?.email || "Operator")}</small></span>${icon("chevron-down")}</button>${state.orgMenu ? `<div class="tb-org-menu"><button type="button">${esc(state.session?.organizationId || "Workspace")}</button><button type="button" data-close-org>Account settings</button></div>` : ""}<nav class="tb-rail-nav"><section class="tb-nav-section"><h2>Workspace</h2>${[["Runs", "runs", "clock"], ["Environments", "environments", "toolbox"], ["MCPs and apps", "integrations", "plugin"], ["Secrets", "secrets", "lock"]].map(([label, resource, glyph]) => `<a class="tb-nav-link ${workspaceActive(resource) ? "slds-is-active" : ""}" href="${workspaceHref(resource)}">${icon(glyph)}<span>${label}</span></a>`).join("")}</section><section class="tb-nav-section tb-factory-section"><div class="tb-nav-section-heading"><h2>Factories</h2><button type="button" class="slds-button slds-button_icon tb-add-factory" aria-label="Create factory" data-open-modal="factory">${icon("plus")}</button></div><a class="tb-factory-link ${route.kind === "factory" ? "tb-factory-link--active" : ""}" href="${factoryHref(factory.factoryId)}">${avatar(factory.name, "brand")}<span>${esc(factory.name)}</span><span class="tb-health-dot" title="${esc(factory.status || "active")}"></span></a><div class="tb-nested-nav">${nested.map(([label, area, glyph]) => `<a class="tb-nav-link tb-nav-link--nested ${factoryActive(area) ? "slds-is-active" : ""}" href="${factoryHref(factory.factoryId, area)}">${icon(glyph)}<span>${label}</span></a>`).join("")}</div><details class="tb-more-routes" ${["policies", "repositories", "releases", "costs"].includes(factoryArea) ? "open" : ""}><summary>More</summary>${more.map(([label, area]) => `<a class="tb-nav-link tb-nav-link--nested ${factoryActive(area) ? "slds-is-active" : ""}" href="${factoryHref(factory.factoryId, area)}">${icon(area === "releases" ? "arrow-right" : area === "costs" ? "card" : "files")}<span>${label}</span></a>`).join("")}</details></section></nav><footer class="tb-rail-footer"><div class="tb-identity">${avatar(state.session?.user?.email || "AL", "brand")}<div><strong>${esc(state.session?.user?.name || "Alex Morgan")}</strong><small>Factory operator</small></div><button type="button" class="slds-button slds-button_icon tb-more-button" aria-label="Account menu">•••</button></div><div class="tb-footer-links"><a href="/settings/profile">Settings</a><a href="/settings/usage">Usage</a></div></footer></div></aside>${state.sidebarOpen ? `<button class="tb-rail-scrim" type="button" aria-label="Close navigation" data-sidebar-dismiss></button>` : ""}<main class="tb-main"><div class="tb-main-frame"><header class="slds-global-header tb-global-header"><div class="slds-global-header__item tb-global-header-brand"><button type="button" class="slds-button slds-button_icon slds-button_icon-border-filled tb-mobile-toggle" data-sidebar-toggle aria-label="Toggle navigation">${icon("sidebar")}</button><a href="/" class="tb-brand"><span class="tb-brand-mark">t</span><span class="tb-brand-wordmark">Tinkerbot</span></a></div><div class="slds-global-header__item slds-global-header__item_search"><div class="slds-form-element tb-global-search"><label class="slds-form-element__label slds-assistive-text" for="global-search">Search</label><div class="slds-form-element__control slds-input-has-icon slds-input-has-icon_left">${icon("search")}<input id="global-search" class="slds-input" value="${esc(state.globalSearch)}" placeholder="Search work, factories, commands…" data-global-search /></div>${state.searchResults.length ? `<div class="tb-search-results">${state.searchResults.slice(0, 6).map((result) => `<a href="${esc(result.href)}"><span class="tb-search-result-kind">${esc(result.kind)}</span><strong>${esc(result.title)}</strong><small>${esc(result.meta || "")}</small></a>`).join("")}</div>` : ""}</div></div><ul class="slds-global-actions"><li class="slds-global-actions__item"><button type="button" class="slds-button slds-button_icon slds-button_icon-border-filled" data-palette aria-label="Open command palette">${icon("search")}</button></li><li class="slds-global-actions__item"><button type="button" class="slds-button slds-button_icon slds-button_icon-border-filled" aria-label="Notifications">${icon("bell")}</button></li><li class="slds-global-actions__item"><button type="button" class="slds-button slds-button_icon slds-button_icon-border-filled" aria-label="Account">${icon("user")}</button></li></ul></header>${contextBar(route, factory)}<div class="tb-main-scroll">${state.updateNotice ? `<div class="tb-update-banner" role="status"><span>${esc(state.updateNotice)}</span><button type="button" data-dismiss-update>Dismiss</button></div>` : ""}${state.routeError ? errorState(state.routeError, `${pathName()}${window.location.search}`) : body}</div></div></main>${state.paletteOpen ? commandPalette() : ""}${state.modal ? modal() : ""}</div>`;
 }
 
-function toastMarkup() {
-  if (!state.toast) return "";
-  return h("<div class=\"toast\" role=\"status\"><strong>", esc(state.toast.title), "</strong><span>", esc(state.toast.message), "</span>", iconButton("dismiss-toast", "x", "Dismiss message"), "</div>");
-}
-
-function showToast(title, message) {
-  state.toast = { title, message };
-  if (state.toastTimer) window.clearTimeout(state.toastTimer);
-  state.toastTimer = window.setTimeout(() => {
-    state.toast = null;
-    renderCurrent();
-  }, 5200);
-  renderCurrent();
-}
+function contextBar(route, factory) { const tabs = route.kind === "factory" ? [["Dashboard", factoryHref(factory.factoryId), route.area === "dashboard"], ["Work orders", factoryHref(factory.factoryId, "work-orders"), route.area === "work-orders"], ["Activity", factoryHref(factory.factoryId, "activity"), route.area === "activity"], ["Evidence", factoryHref(factory.factoryId, "evidence"), route.area === "evidence"]] : []; return html`<nav class="slds-context-bar tb-context-bar"><div class="slds-context-bar__primary"><div class="slds-context-bar__item slds-context-bar__app-name"><span class="slds-truncate" title="${esc(factory.name)}">${esc(factory.name)}</span></div></div><div class="tb-context-tabs">${tabs.map(([label, href, active]) => `<a class="${active ? "tb-context-tab--active" : ""}" href="${esc(href)}">${label}</a>`).join("")}</div><div class="slds-context-bar__secondary"><button type="button" class="slds-button slds-button_icon" aria-label="More navigation" data-toggle-more>${icon("chevron-down")}</button></div></nav>`; }
+function routeBody(route) { if (route.kind === "root") return state.factories.length ? factoryFloor() : factoryListPage([]); if (route.kind === "factory") { if (route.area === "dashboard") return factoryFloor(); if (route.area === "work-orders") return workOrdersPage(route); if (FACTORY_RESOURCES[route.area]) return collectionPage({ ...route, resource: route.area }, state.routeItems); return errorState(new Error("Factory route not found.")); } if (route.kind === "workspace") { if (route.resource === "factories") return factoryListPage(state.factories); return collectionPage(route, state.routeItems); } if (route.kind === "settings") return settingsPage(route.area); return route.kind === "login" ? loginPage() : marketingPage(route.page); }
 
 function commandPalette() {
-  const items = [
-    { href: "/app/overview", label: "Overview", detail: "Workspace health and attention" },
-    { href: "/app/repositories", label: "Repositories", detail: "Connections and latest evidence" },
-    { href: "/app/history", label: "Verification runs", detail: "Structured run summaries" },
-    { href: "/app/findings", label: "Findings", detail: "Evidence, severity, and resolution" },
-    { href: "/app/policies", label: "Policies", detail: "Workspace and repository controls" },
-    { href: "/app/settings/billing", label: "Settings / Billing", detail: "Plan, usage, and provider status" },
-    { href: "/local/report", label: "Local report viewer", detail: "Open a report without hosted auth" },
-  ];
-  return h(
-    "<div class=\"overlay\" data-action=\"close-palette\" role=\"presentation\"><div class=\"palette\" role=\"dialog\" aria-modal=\"true\" aria-label=\"Navigate\"><input class=\"palette-input\" data-palette-search autofocus placeholder=\"Search control plane\" aria-label=\"Search control plane\" /><div class=\"palette-list\">",
-    items.map((item) => h("<a class=\"palette-item\" href=\"", esc(item.href), "\" data-palette-item data-search=\"", esc((item.label + " " + item.detail).toLowerCase()), "\">", icon("arrow-right"), "<span><strong>", esc(item.label), "</strong><span>", esc(item.detail), "</span></span></a>")).join(""),
-    "</div></div></div>",
-  );
+  const query = state.paletteQuery.toLowerCase(); const commands = [["Factory floor", factoryHref(), "Open the selected factory"], ["Work orders", factoryHref(factoryId(), "work-orders"), "Triage work"], ["Open unresolved unknowns", factoryHref(factoryId(), "evidence") + "?view=unknowns", "Find missing evidence"], ["Create work order", "#modal:workOrder", "Start factory work"], ["Runs", workspaceHref("runs"), "Cross-factory execution history"], ["Environments", workspaceHref("environments"), "Execution surfaces"], ["MCPs and apps", workspaceHref("integrations"), "Connected resources"], ["Secrets", workspaceHref("secrets"), "Redacted workspace inventory"], ["Add secret", "#modal:secret", "Store a managed reference"], ["Add MCP/app", "#modal:integration", "Connect a provider"], ["Factories", "/factories", "Switch factory"], ["Settings", "/settings/profile", "Workspace configuration"]].filter(([label, href, meta]) => !query || `${label} ${meta}`.toLowerCase().includes(query));
+  return html`<div class="slds-backdrop slds-backdrop_open tb-palette-backdrop" data-palette-dismiss><section class="slds-modal slds-fade-in-open tb-palette" role="dialog" aria-modal="true" aria-label="Command palette"><div class="slds-modal__container"><div class="slds-modal__header"><div class="slds-form-element"><label class="slds-form-element__label slds-assistive-text" for="palette-search">Search commands</label><div class="slds-form-element__control slds-input-has-icon slds-input-has-icon_left">${icon("search")}<input id="palette-search" class="slds-input" data-palette-input value="${esc(state.paletteQuery)}" placeholder="Go to factory floor, work, settings…" autofocus /></div></div></div><div class="slds-modal__content slds-p-around_medium"><ul class="tb-command-list">${commands.map(([label, href, meta]) => `<li><a href="${esc(href)}" class="tb-command-item" data-command-href="${esc(href)}">${icon(label.includes("secret") ? "lock" : label.includes("MCP") ? "plugin" : label.includes("Factory") ? "home" : "files")}<span><strong>${esc(label)}</strong><small>${esc(meta)}</small></span><kbd>↵</kbd></a></li>`).join("") || `<li class="tb-command-empty">No commands match this search.</li>`}</ul></div></div></section></div>`;
 }
 
-function accountMenu() {
-  if (!state.accountMenu) return "";
-  const session = state.session;
-  return h(
-    "<div class=\"menu\" role=\"menu\"><div class=\"menu-section\"><strong>",
-    esc(session?.name ?? "Developer"),
-    "</strong><span>",
-    esc(session?.email ?? "development session"),
-    "</span></div><a class=\"menu-button\" href=\"/app/settings/account\">Account settings</a><a class=\"menu-button\" href=\"/app/settings/security\">Security</a><button class=\"menu-button danger\" data-action=\"sign-out\">Sign out</button></div>",
-  );
+function modal() {
+  const kind = state.modal; const title = { workOrder: "Create work order", factory: "Create factory", secret: "Add secret reference", integration: "Add MCP or app", agent: "Add agent", automation: "Create automation" }[kind] || "Create record";
+  const body = kind === "workOrder" ? html`<label class="slds-form-element"><span class="slds-form-element__label">Repository</span><input name="repositoryId" class="slds-input" required placeholder="acme/payments" /></label><label class="slds-form-element"><span class="slds-form-element__label">Intent</span><textarea name="intent" class="slds-textarea" required placeholder="Describe the change the factory should produce"></textarea></label>` : kind === "factory" ? html`<label class="slds-form-element"><span class="slds-form-element__label">Factory name</span><input name="name" class="slds-input" required placeholder="payments" /></label><label class="slds-form-element"><span class="slds-form-element__label">Definition YAML <small>(optional)</small></span><textarea name="yaml" class="slds-textarea" placeholder="schemaVersion: 1"></textarea></label>` : kind === "secret" ? html`<label class="slds-form-element"><span class="slds-form-element__label">Secret name</span><input name="name" class="slds-input" required placeholder="payments/codex-api-key" /></label><label class="slds-form-element"><span class="slds-form-element__label">Secret reference</span><input name="reference" class="slds-input" required placeholder="env:CODEX_API_KEY or keychain://tinkerbot/codex" autocomplete="off" /></label><p class="tb-muted">Only the reference is recorded. The hosted control plane never receives the secret value; resolve it on the local or self-hosted worker.</p>` : kind === "integration" ? html`<label class="slds-form-element"><span class="slds-form-element__label">Name</span><input name="name" class="slds-input" required placeholder="GitHub" /></label><label class="slds-form-element"><span class="slds-form-element__label">Type</span><select name="kind" class="slds-select"><option>github</option><option>linear</option><option>slack</option><option>custom_mcp</option></select></label><label class="slds-form-element"><span class="slds-form-element__label">Configuration JSON</span><textarea name="config" class="slds-textarea" placeholder="{}"></textarea></label>` : kind === "agent" ? html`<label class="slds-form-element"><span class="slds-form-element__label">Agent name</span><input name="name" class="slds-input" required placeholder="reviewer" /></label><label class="slds-form-element"><span class="slds-form-element__label">Role</span><input name="role" class="slds-input" required placeholder="Review agent" /></label>` : html`<label class="slds-form-element"><span class="slds-form-element__label">Automation name</span><input name="name" class="slds-input" required placeholder="Nightly verification" /></label><label class="slds-form-element"><span class="slds-form-element__label">Trigger</span><input name="trigger" class="slds-input" required placeholder="schedule:daily" /></label>`;
+  return html`<div class="slds-backdrop slds-backdrop_open tb-modal-backdrop" data-modal-dismiss><section class="slds-modal slds-fade-in-open tb-form-modal" role="dialog" aria-modal="true" aria-label="${esc(title)}"><div class="slds-modal__container"><header class="slds-modal__header"><h2 class="slds-text-heading_medium">${esc(title)}</h2><button type="button" class="slds-button slds-button_icon slds-modal__close" aria-label="Close" data-close-modal>${icon("x")}</button></header><form data-modal-form="${esc(kind)}"><div class="slds-modal__content slds-p-around_medium"><div class="tb-form-stack">${body}</div>${state.modalError ? `<div class="slds-notify slds-notify_alert tb-inline-alert" role="alert"><span>${icon("exclamation")}</span><p>${esc(state.modalError)}</p></div>` : ""}</div><footer class="slds-modal__footer"><button type="button" class="slds-button slds-button_neutral tb-button" data-close-modal>Cancel</button><button type="submit" class="slds-button slds-button_brand tb-button" ${state.routeLoading ? "disabled" : ""}>${state.routeLoading ? "Saving…" : "Save"}</button></footer></form></div></section></div>`;
 }
 
-function orgMenu() {
-  if (!state.orgMenu) return "";
-  return h("<div class=\"menu org-menu\" role=\"menu\"><div class=\"menu-section\"><strong>Atlas Engineering</strong><span>Developer plan · local preview</span></div><button class=\"menu-button\" data-action=\"organization-unavailable\">Organization switching is unavailable</button><a class=\"menu-button\" href=\"/app/team\">View team</a></div>");
-}
-
-function primarySidebar(pathname) {
-  return h(
-    "<nav class=\"sidebar-nav\" aria-label=\"Primary navigation\"><div class=\"nav-group nav-group-personal\"><div class=\"nav-list\">",
-    link("/app/overview", "Overview", pathname === "/app" || pathname === "/app/overview"),
-    link("/app/repositories", "Repositories", pathname.startsWith("/app/repositories")),
-    link("/app/history", "Verification runs", pathname === "/app/history" || pathname.startsWith("/app/runs")),
-    link("/app/findings", "Findings", pathname.startsWith("/app/findings")),
-    "</div></div><div class=\"nav-group\"><span class=\"nav-label\">Workspace</span><div class=\"nav-list\">",
-    link("/app/baselines", "Baselines", pathname.startsWith("/app/baselines")),
-    link("/app/policies", "Policies", pathname.startsWith("/app/policies")),
-    link("/app/change-sets", "Change Sets", pathname.startsWith("/app/change-sets")),
-    link("/app/releases", "Releases", pathname.startsWith("/app/releases")),
-    link("/app/outcomes", "Outcomes", pathname.startsWith("/app/outcomes")),
-    link("/app/team", "Team", pathname.startsWith("/app/team")),
-    link("/app/integrations", "Integrations", pathname === "/app/integrations"),
-    "</div></div><div class=\"nav-group nav-group-team\"><span class=\"nav-label\">Your team</span><div class=\"nav-list\"><a class=\"nav-link team-link\" href=\"/app/overview\"><span class=\"team-avatar\">PR</span><span class=\"nav-text\">PR Proof</span>", icon("chevron-down", "team-chevron"), "</a><div class=\"nav-sublist\">",
-    link("/app/overview", "Home", pathname === "/app" || pathname === "/app/overview"),
-    link("/app/repositories", "Evidence", pathname.startsWith("/app/repositories")),
-    link("/app/history", "Runs", pathname === "/app/history" || pathname.startsWith("/app/runs")),
-    "</div></div></div></nav>",
-  );
-}
-
-function shell(title, body) {
-  const pathname = currentPath();
-  const settingsMode = pathname.startsWith("/app/settings");
-  const sidebarExpanded = window.matchMedia("(max-width: 767px)").matches ? state.mobileNav : state.sidebarOpen;
-  const account = state.session
-    ? h("<div class=\"menu-wrap\"><button class=\"account-trigger\" data-action=\"toggle-account\" aria-expanded=\"", state.accountMenu ? "true" : "false", "\"><span class=\"org-avatar\">", esc((state.session.name || "D").slice(0, 1).toUpperCase()), "</span><span class=\"account-label\">", esc(state.session.name), "</span>", icon("chevron-down"), "</button>", accountMenu(), "</div>")
-    : h("<a class=\"button small\" href=\"/sign-in\">Sign in</a>");
-  const sidebar = settingsMode
-    ? h("<div class=\"settings-sidebar-wrap\">", settingsSidebar(), "</div><div class=\"sidebar-footer\"><a class=\"sidebar-footer-row\" href=\"/local/report\">", icon("files"), "<span>Local report</span></a><div class=\"sidebar-meta\"><span>pr-proof 0.1.0</span><span>dev mode</span></div></div>")
-    : h(
-      "<div class=\"sidebar-header\"><div class=\"sidebar-org-row\"><div class=\"menu-wrap\"><button class=\"org-switcher\" data-action=\"toggle-org\" aria-expanded=\"",
-      state.orgMenu ? "true" : "false",
-      "\"><span class=\"org-avatar\">PR</span><span class=\"org-copy\"><strong>pr-proof</strong><span>Control plane</span></span>",
-      icon("chevron-down"),
-      "</button>",
-      orgMenu(),
-      "</div><div class=\"sidebar-tools\">",
-      iconButton("open-palette", "search", "Search"),
-      iconButton("open-local-report", "plus", "Open local report"),
-      iconButton("toggle-account", "settings", "Account", "aria-expanded=\"" + (state.accountMenu ? "true" : "false") + "\""),
-      iconButton("toggle-mobile-nav", "x", "Close navigation", "", "mobile-nav-close"),
-      "</div></div><div class=\"sidebar-context\"><span>",
-      esc(workspace.name),
-      "</span><span>",
-      esc(workspace.plan),
-      " plan · preview</span></div></div>",
-      primarySidebar(pathname),
-      "<div class=\"sidebar-footer\"><a class=\"sidebar-footer-row\" href=\"/app/settings/account\" ",
-      pathname.startsWith("/app/settings") ? "aria-current=\"page\"" : "",
-      ">",
-      icon("settings"),
-      "<span>Settings</span></a><a class=\"sidebar-footer-row\" href=\"/local/report\">",
-      icon("files"),
-      "<span>Local report</span></a><div class=\"sidebar-meta\"><span>pr-proof 0.1.0</span><span>dev mode</span></div></div>",
-    );
-  return h(
-    "<div class=\"app-shell\"><aside id=\"app-sidebar\" class=\"sidebar",
-    state.sidebarOpen ? "" : " closed",
-    state.mobileNav ? " open" : "",
-    "\"><div class=\"sidebar-frame\">",
-    sidebar,
-    "</div></aside>",
-    state.mobileNav ? "<button type=\"button\" class=\"mobile-nav-scrim\" data-action=\"toggle-mobile-nav\" aria-label=\"Close navigation\"></button>" : "",
-    "<main class=\"main\"><div class=\"main-frame\"><header class=\"topbar\"><div class=\"topbar-left\"><button class=\"icon-button topbar-mobile-menu\" data-action=\"toggle-mobile-nav\" aria-label=\"Toggle sidebar\" aria-expanded=\"", sidebarExpanded ? "true" : "false", "\" aria-controls=\"app-sidebar\">",
-    icon("sidebar"),
-    "</button><div class=\"breadcrumbs\"><span>Atlas Engineering</span><span class=\"crumb-separator\">/</span><strong>",
-    esc(title),
-    "</strong></div></div><div class=\"topbar-actions\"><button class=\"command-button\" data-action=\"open-palette\">",
-    icon("search"),
-    "<span>Search</span><kbd>⌘K</kbd></button><a class=\"topbar-link\" href=\"/local/report\">",
-    icon("files"),
-    "<span>Local report</span></a>",
-    account,
-    "</div></header><div class=\"circle-header-strip\"><span>PR Proof workspace</span><span class=\"circle-header-hint\">Local-first verification</span></div><section class=\"content\">",
-    body,
-    "</section></div></main></div>",
-    state.paletteOpen ? commandPalette() : "",
-    state.selectedFindingId ? findingPanel(state.selectedFindingId) : "",
-    toastMarkup(),
-  );
-}
-
-function localAssuranceBundleSection(report) {
-  const assurance = report?.assurance;
-  if (!assurance) return "";
-  return h("<div class=\"card\" style=\"margin-top:12px\"><div class=\"card-header\"><div><h2>Change assurance</h2><p>Optional sections appear only when the local evidence bundle contains them.</p></div>", badge("Local evidence", "verified"), "</div><div class=\"card-body\"><div class=\"repo-metric-grid\">", metric("Record", assurance.record?.id ?? "Unavailable"), metric("Receipts", assurance.receipts?.length ?? 0), metric("Graph snapshots", assurance.graphs?.length ?? 0), metric("Coverage", assurance.coverage?.id ?? "Unknown"), metric("Contracts", assurance.contractAssessment?.status ?? "Unknown"), metric("Unknowns", assurance.unknowns?.length ?? 0), "</div>", assurance.unknowns?.length ? h("<div class=\"callout\" style=\"margin-top:12px\"><strong>Unknown or partial evidence remains visible.</strong><ul>", assurance.unknowns.map((item) => h("<li>", esc(item), "</li>")).join(""), "</ul></div>") : "", "</div></div>");
-}
-
-function localReportShell(body) {
-  return h("<div class=\"local-report-shell\"><header class=\"local-report-topbar\"><div class=\"brand\"><span class=\"brand-wordmark\">pr-proof</span><span class=\"brand-subtitle\">local report viewer</span></div><div class=\"topbar-actions\"><span class=\"local-only-label\">127.0.0.1 · local only</span><a class=\"button small secondary\" href=\"/sign-in\">Open control plane</a></div></header><main class=\"content\">", body, localAssuranceBundleSection(state.report), "</main></div>", toastMarkup());
-}
-
-function statCard(label, value, detail, tone = "") {
-  return h("<div class=\"stat-card\" data-tone=\"", esc(tone), "\"><span class=\"stat-label\">", esc(label), "</span><strong class=\"stat-value\">", esc(value), "</strong><span class=\"stat-caption\">", esc(detail), "</span></div>");
-}
-
-function attentionRow(finding) {
-  return h("<button class=\"attention-row\" data-action=\"open-finding\" data-finding=\"", esc(finding.id), "\"><span>", badge(finding.severity, finding.tone), "</span><span class=\"row-main\"><strong>", esc(finding.title), "</strong><span>", esc(finding.repository), " · ", esc(finding.file), ":", esc(finding.line), "</span></span><span class=\"row-meta\">", esc(finding.status), "</span></button>");
-}
-
-function runRow(run, options = {}) {
-  const repository = repositoryById(run.repositoryId);
-  return h("<a class=\"run-row\" href=\"", esc(options.href ?? ("/app/runs/" + run.id)), "\"><span class=\"repo-mark\">", esc(run.repository.slice(0, 2).toUpperCase()), "</span><span class=\"row-main\"><strong>", esc(run.repository), "</strong><span>", esc(run.ref), " · ", esc(run.commit), "</span></span>", badge(run.verdict, run.tone), "<span class=\"row-meta\">", esc(repository?.coverage ?? run.coverage), " · ", esc(run.time), "</span></a>");
-}
-
-function overview() {
-  const needsReview = repositories.filter((repository) => repository.verdictTone === "review").length;
-  const unknown = repositories.reduce((sum, repository) => sum + repository.unknowns, 0);
-  const highFindings = findings.filter((finding) => finding.severity === "High");
-  return shell("Overview", h(
-    pageHeading("Workspace overview", "Evidence at a glance", "A compact view of verification health across the repositories connected to this workspace.", h(button("Connect repository", "connect-repository", "primary"), button("View local report", "open-local-report"))),
-    previewBanner(),
-    "<div class=\"stat-grid\">",
-    statCard("Connected repositories", repositories.length, workspace.activePrivateRepositories + " private in use"),
-    statCard("Needs review", needsReview, "Across this workspace", "review"),
-    statCard("Open unknowns", unknown, "Evidence gaps remain visible", "unknown"),
-    statCard("Private capacity", workspace.activePrivateRepositories + "/" + workspace.privateRepositoryLimit, workspace.billingStatus),
-    "</div><div class=\"two-column\"><div class=\"card\"><div class=\"card-header\"><div><h2>Needs attention</h2><p>Findings with the clearest next action.</p></div><a class=\"button small text\" href=\"/app/findings\">View all</a></div><div class=\"attention-list\">",
-    (highFindings.length ? highFindings : findings.slice(0, 3)).map(attentionRow).join(""),
-    "</div></div><div class=\"card\"><div class=\"card-header\"><div><h2>Workspace setup</h2><p>Provider-independent readiness tasks.</p></div></div><div class=\"task-list\">",
-    setupTasks.map((task) => h("<div class=\"task-row ", esc(task.state), "\"><span class=\"task-check\">", icon(task.state === "done" ? "checkmark" : "exclamation"), "</span><span class=\"row-main\"><strong>", esc(task.label), "</strong><span>", esc(task.detail), "</span></span></div>")).join(""),
-    "</div></div></div><div class=\"two-column\"><div class=\"card\"><div class=\"card-header\"><div><h2>Repositories</h2><p>Latest verdicts and evidence completeness.</p></div><a class=\"button small text\" href=\"/app/repositories\">View all</a></div><div class=\"run-list\">",
-    repositories.map((repository) => h("<a class=\"run-row\" href=\"/app/repositories/", esc(repository.id), "\"><span class=\"repo-mark\">", esc(repository.name.slice(0, 2).toUpperCase()), "</span><span class=\"row-main\"><strong>", esc(repository.name), "</strong><span>", esc(repository.visibility), " · ", esc(repository.lastRun), "</span></span>", badge(repository.verdict, repository.verdictTone), "</a>")).join(""),
-    "</div></div><div class=\"card\"><div class=\"card-header\"><div><h2>Recent runs</h2><p>Summaries only; full evidence stays local.</p></div><a class=\"button small text\" href=\"/app/history\">History</a></div><div class=\"run-list\">",
-    runs.slice(0, 4).map(runRow).join(""),
-    "</div></div></div>",
-  ));
-}
-
-function repositoriesPage() {
-  const used = workspace.activePrivateRepositories / workspace.privateRepositoryLimit * 100;
-  return shell("Repositories", h(
-    pageHeading("Workspace", "Repositories", "Repository connections and the latest local verification state.", h(button("Connect repository", "connect-repository", "primary"))),
-    previewBanner("Repository sync is local-first.", "The preview keeps repository metadata and structured summaries visible; provider connection setup is not configured."),
-    "<div class=\"card\"><div class=\"card-header\"><div><h2>Private repository capacity</h2><p>Entitlements are authoritative on the server in production.</p></div><a class=\"button small text\" href=\"/app/settings/billing\">View plan</a></div><div class=\"card-body\"><div class=\"usage-bar\"><span style=\"width:",
-    String(Math.min(100, used)),
-    "%\"></span></div><div class=\"usage-meta\"><span>",
-    workspace.activePrivateRepositories,
-    " of ",
-    workspace.privateRepositoryLimit,
-    " private repositories connected</span><span>",
-    workspace.plan,
-    "</span></div></div></div><div class=\"card table-card\" style=\"margin-top:12px\"><table class=\"data-table\"><thead><tr><th>Repository</th><th>Connection</th><th>Verdict</th><th>Coverage</th><th>Last run</th></tr></thead><tbody>",
-    repositories.map((repository) => h("<tr><td><a class=\"repo-name\" href=\"/app/repositories/", esc(repository.id), "\"><span class=\"repo-mark\">", esc(repository.name.slice(0, 2).toUpperCase()), "</span><span><strong>", esc(repository.name), "</strong><span>", esc(repository.visibility), " · ", esc(repository.defaultBranch), "</span></span></a></td><td>", badge(repository.connection, "verified"), "</td><td>", badge(repository.verdict, repository.verdictTone), "</td><td class=\"table-number\">", esc(repository.coverage), "</td><td class=\"muted\">", esc(repository.lastRun), "</td></tr>")).join(""),
-    "</tbody></table></div>",
-  ));
-}
-
-function repoSubnav(repository, active) {
-  const base = "/app/repositories/" + repository.id;
-  return h("<nav class=\"subnav\" aria-label=\"Repository sections\">", [
-    ["", "Overview"],
-    ["/assurance", "Assurance"],
-    ["/graph", "Verification graph"],
-    ["/coverage", "Behavioral coverage"],
-    ["/contracts", "Contracts"],
-    ["/runs", "Runs"],
-    ["/policies", "Policies"],
-    ["/baselines", "Baselines"],
-    ["/findings", "Findings"],
-    ["/change-sets", "Change sets"],
-    ["/releases", "Releases"],
-    ["/outcomes", "Outcomes"],
-  ].map(([suffix, label]) => h("<a class=\"", active === (suffix ? suffix.slice(1) : "overview") ? "active" : "", "\" href=\"", esc(base + suffix), "\">", esc(label), "</a>")).join(""), "</nav>");
-}
-
-function metric(label, value) {
-  return h("<div class=\"metric\"><dt>", esc(label), "</dt><dd>", esc(value), "</dd></div>");
-}
-
-function evidenceCard(label, value, detail, tone = "") {
-  return h("<div class=\"evidence-card\"><h3>", esc(label), "</h3><p>", esc(detail), "</p><strong class=\"evidence-value ", esc(tone), "\">", esc(value), "</strong></div>");
-}
-
-function findingRow(finding) {
-  return h("<button class=\"finding-row\" data-action=\"open-finding\" data-finding=\"", esc(finding.id), "\"><span>", badge(finding.severity, finding.tone), "</span><span class=\"row-main\"><strong>", esc(finding.title), "</strong><span class=\"finding-rule\">", esc(finding.rule), " · ", esc(finding.repository), "</span><span class=\"finding-location\">", esc(finding.file), ":", esc(finding.line), " · ", esc(finding.confidence), " confidence</span></span><span class=\"row-end\">", badge(finding.status, finding.status === "Unknown" ? "unknown" : "neutral"), "</span></button>");
-}
-
-function repoOverview(repository, repositoryFindings) {
-  return h("<div class=\"repo-metric-grid\">", metric("Verdict", repository.verdict), metric("Open findings", repository.openFindings), metric("Unknowns", repository.unknowns), metric("Coverage", repository.coverage), metric("Changed files", repository.changedFiles), metric("Changed lines", repository.changedLines), "</div><div class=\"evidence-grid\">", evidenceCard("Test integrity", repository.verdict === "Verified" ? "Verified" : "Review", "Assertions and changed-test evidence", repository.verdict === "Verified" ? "verified" : "warning"), evidenceCard("Impact", repository.unknowns ? "Partial" : "Mapped", repository.unknowns ? repository.unknowns + " path unknowns" : "Downstream consumers mapped", repository.unknowns ? "unknown" : "verified"), evidenceCard("Coverage", repository.coverage, "Changed-line coverage", repository.coverage === "Unavailable" ? "unknown" : "verified"), evidenceCard("Mutation", repository.mutation, "Targeted mutation result", repository.mutation === "Not run" ? "unknown" : "verified"), "</div><div class=\"card\" style=\"margin-top:12px\"><div class=\"card-header\"><div><h2>Latest evidence</h2><p>Review evidence, then open a finding for the precise next action.</p></div></div>", repositoryFindings.length ? h("<div class=\"finding-list\">", repositoryFindings.map(findingRow).join(""), "</div>") : h("<div class=\"card-body\"><div class=\"empty-state\"><h3>No open findings</h3><p>This repository has no current findings in the local preview data.</p></div></div>"), "</div>");
-}
-
-function repoRuns(repository) {
-  const repositoryRuns = runs.filter((run) => run.repositoryId === repository.id);
-  return h("<div class=\"card\"><div class=\"card-header\"><div><h2>Runs for ", esc(repository.name), "</h2><p>Full reports remain local to the repository or local viewer.</p></div>", button("Run local check", "run-local-check", "small"), "</div><div class=\"run-list\">", repositoryRuns.length ? repositoryRuns.map(runRow).join("") : "<div class=\"card-body\"><div class=\"empty-state\"><h3>No runs recorded</h3><p>Run the CLI locally to create the first structured report.</p></div></div>", "</div></div>");
-}
-
-function policyCard(title, detail, status, tone, action) {
-  return h("<div class=\"settings-card\"><div class=\"settings-row\"><div><h3>", esc(title), "</h3><p>", esc(detail), "</p></div><div class=\"settings-control\">", badge(status, tone), action ? button(action.label, action.action, "small") : "", "</div></div></div>");
-}
-
-function repoPolicies(repository) {
-  return h("<div class=\"two-column\"><div>", policyCard("Strict review", "Flags weakened assertions and incomplete evidence for review.", repository.policy === "Strict review" ? "Active" : "Available", repository.policy === "Strict review" ? "verified" : "neutral", { label: repository.policy === "Strict review" ? "Active" : "Use policy", action: "policy-unavailable" }), "</div><div>", policyCard("Default advisory", "Reports evidence gaps without making a hosted merge decision.", repository.policy === "Default advisory" ? "Active" : "Available", repository.policy === "Default advisory" ? "verified" : "neutral", { label: repository.policy === "Default advisory" ? "Active" : "Use policy", action: "policy-unavailable" }), "</div></div><div class=\"callout\" style=\"margin-top:12px\"><strong>Policy changes are not persisted by this preview.</strong>Production policy writes must be authorized server-side and recorded in the audit log.</div>");
-}
-
-function repoBaselines(repository) {
-  return h("<div class=\"card\"><div class=\"card-header\"><div><h2>Baseline state</h2><p>Only structured fingerprints and resolution state are shown here.</p></div>", button("Update baseline", "baseline-unavailable", "small"), "</div><div class=\"card-body\"><div class=\"billing-facts\"><div class=\"billing-fact\"><span>Current state</span><strong>", esc(repository.baseline), "</strong></div><div class=\"billing-fact\"><span>Source</span><strong>Local .pr-proof baseline</strong></div><div class=\"billing-fact\"><span>New findings</span><strong>", repository.openFindings, "</strong></div><div class=\"billing-fact\"><span>Waivers</span><strong>None in preview</strong></div></div></div></div><div class=\"callout\" style=\"margin-top:12px\"><strong>Baseline data stays in the repository.</strong>The control plane does not upload source or full diff content to make this view work.</div>");
-}
-
-function repoFindings(repository, repositoryFindings) {
-  return h("<div class=\"card\"><div class=\"filter-bar\"><input data-filter=\"finding-query\" placeholder=\"Filter findings\" aria-label=\"Filter findings\" /><select data-filter=\"finding-severity\" aria-label=\"Filter severity\"><option value=\"all\">All severities</option><option value=\"high\">High</option><option value=\"warning\">Warning</option><option value=\"info\">Info</option></select><select data-filter=\"finding-status\" aria-label=\"Filter status\"><option value=\"all\">All states</option><option value=\"new\">New</option><option value=\"unknown\">Unknown</option><option value=\"resolved\">Resolved</option></select></div><div class=\"finding-list\">", repositoryFindings.length ? repositoryFindings.map((finding) => h("<div data-filter-row data-filter-group=\"findings\" data-search=\"", esc((finding.title + " " + finding.rule + " " + finding.file).toLowerCase()), "\" data-severity=\"", esc(finding.tone), "\" data-status=\"", esc(finding.status.toLowerCase()), "\">", findingRow(finding), "</div>")).join("") : "<div class=\"card-body\"><div class=\"empty-state\"><h3>No findings</h3><p>There are no findings for this repository in the preview data.</p></div></div>", "</div></div>");
-}
-
-function assuranceStateCard(title, state, detail) {
-  const tone = /present|complete|configured|verified/i.test(state) ? "verified" : /missing|blocked|stale/i.test(state) ? "warning" : "unknown";
-  return h("<div class=\"evidence-card\"><h3>", esc(title), "</h3><p>", esc(detail), "</p>", badge(state, tone), "</div>");
-}
-
-function assuranceDimensionRow(dimension, state, detail) {
-  return h("<tr><td><strong>", esc(dimension), "</strong></td><td>", badge(state, /present/i.test(state) ? "verified" : /missing|stale/i.test(state) ? "warning" : "unknown"), "</td><td class=\"muted\">", esc(detail), "</td></tr>");
-}
-
-function repositoryAssurancePage(repository, active = "assurance") {
-  const common = h("<div class=\"repo-metric-grid\">", metric("Record", "Available", "Structured metadata only"), metric("Receipts", "Unknown", "No receipt bundle loaded in preview"), metric("Graph", "Partial", "Parser-backed data is not synchronized here"), metric("Outcomes", "Unknown", "No external runtime adapter connected"), "</div>");
-  const sections = {
-    assurance: h("<div class=\"card\"><div class=\"card-header\"><div><h2>Change Assurance Record</h2><p>The lifecycle record connects intent, change, evidence, review, release, and outcomes without storing source.</p></div>", badge("Preview metadata", "neutral"), "</div><div class=\"card-body\"><p class=\"muted\">The bundled preview has repository summaries but no assurance bundle loaded for this repository. Receipt, freshness, and approval states remain UNKNOWN until local evidence is exported.</p></div></div><div class=\"evidence-grid\">", assuranceStateCard("Verification receipt", "Unknown", "No portable receipt is synchronized in this preview."), assuranceStateCard("Evidence freshness", "Unknown", "Head, policy, tool, and artifact freshness need a receipt context."), assuranceStateCard("Required reviewers", "Unknown", "Review metadata is not available in the local preview."), assuranceStateCard("Runtime outcome", "Unknown", "Runtime and deployment adapters are not connected."), "</div>"),
-    graph: h("<div class=\"card\"><div class=\"card-header\"><div><h2>Verification Graph</h2><p>Typed impact paths are evidence only when backed by deterministic parser, test, artifact, or provenance data.</p></div>", badge("Partial", "unknown"), "</div><div class=\"card-body\"><div class=\"callout\"><strong>Graph snapshot unavailable.</strong> The hosted preview does not fabricate nodes or edges. Run <code>tb repo map --format json</code> locally and upload structured metadata only when hosted ingestion is authorized.</div></div></div><div class=\"evidence-grid\">", assuranceStateCard("Changed symbols", "Unknown", "No graph snapshot loaded."), assuranceStateCard("Impacted tests", "Unknown", "No deterministic test-to-change edges loaded."), assuranceStateCard("Owners", "Unknown", "Ownership evidence is not configured."), assuranceStateCard("Runtime edges", "Unknown", "Dynamic runtime relationships remain unresolved."), "</div>"),
-    coverage: h("<div class=\"card\"><div class=\"card-header\"><div><h2>Behavioral Verification Coverage</h2><p>Coverage dimensions stay separate from ordinary line coverage and never invent evidence.</p></div>", badge("Unknown", "unknown"), "</div><div class=\"table-card\"><table class=\"data-table\"><thead><tr><th>Dimension</th><th>State</th><th>Evidence note</th></tr></thead><tbody>", assuranceDimensionRow("Test evidence", "Unknown", "No assurance coverage surface is loaded."), assuranceDimensionRow("Test execution", "Unknown", "Execution receipts are not synchronized."), assuranceDimensionRow("Branch evidence", "Unknown", "Branch evidence requires an explicit artifact."), assuranceDimensionRow("Mutation evidence", "Unknown", "Mutation evidence is optional and absent here."), assuranceDimensionRow("Contract evidence", "Unknown", "Contract state is not configured for this preview."), assuranceDimensionRow("Fixture evidence", "Unknown", "Fixture and snapshot evidence is not loaded."), assuranceDimensionRow("Ownership / policy", "Unknown", "Owner and policy references are not present."), assuranceDimensionRow("Rollback / runtime", "Unknown", "External release and runtime adapters are not connected."), "</tbody></table></div></div>"),
-    contracts: h("<div class=\"card\"><div class=\"card-header\"><div><h2>Change Contracts</h2><p>Contracts are optional repository configuration. Missing configuration is not compliance.</p></div>", badge("Not configured", "unknown"), "</div><div class=\"card-body\"><div class=\"empty-state\"><h3>No contract loaded</h3><p>Add <code>.tinkerbot/change-contract.yml</code> and run <code>tb change contract validate</code> locally. Scope drift, required tests, reviewers, documentation, and rollback evidence will remain deterministic findings.</p></div></div></div>"),
-    "change-sets": h("<div class=\"card\"><div class=\"card-header\"><div><h2>Cross-repository Change Sets</h2><p>Related repositories, shared API/schema references, merge order, and partial evidence.</p></div>", badge("Unavailable", "unknown"), "</div><div class=\"card-body\"><div class=\"empty-state\"><h3>No change set in this preview</h3><p>Use <code>tb change-set assess</code> with an explicit ChangeSet export. Missing repositories and incompatible relationships remain UNKNOWN.</p></div></div></div>"),
-    releases: h("<div class=\"card\"><div class=\"card-header\"><div><h2>Release Safety Assessment</h2><p>Advisory release evidence for receipts, migrations, flags, approvals, rollback, deployment, and runtime state.</p></div>", badge("Unknown", "unknown"), "</div><div class=\"card-body\"><div class=\"empty-state\"><h3>No release manifest</h3><p>Tinkerbot does not execute deployments, rollbacks, or feature-flag changes. Supply a manifest and external adapter evidence with <code>tb release assess</code>.</p></div></div></div>"),
-    outcomes: h("<div class=\"card\"><div class=\"card-header\"><div><h2>Outcome History</h2><p>Observed facts and imported signals stay separate from human-confirmed or inferred associations.</p></div>", badge("No outcomes", "neutral"), "</div><div class=\"card-body\"><div class=\"empty-state\"><h3>No post-merge outcomes recorded</h3><p>CI failures, reverts, rollbacks, incidents, regressions, successful releases, and false alarms are only shown when explicitly recorded.</p></div></div></div>"),
-  };
-  return shell(repository.name, h("<div class=\"repo-hero\"><div class=\"repo-title\"><span class=\"repo-mark\">", esc(repository.name.slice(0, 2).toUpperCase()), "</span><div><h1>", esc(repository.name), "</h1><p>", esc(repository.visibility), " · ", esc(repository.defaultBranch), " · ", esc(repository.connection), "</p></div></div></div>", repoSubnav(repository, active), previewBanner("Source remains in the repository.", "This hosted preview renders structured assurance metadata only; unavailable evidence remains visible."), common, sections[active] ?? sections.assurance));
-}
-
-function repositoryPage(id, active = "overview") {
-  const repository = repositoryById(id);
-  if (!repository) return notFoundPage();
-  if (["assurance", "graph", "coverage", "contracts", "change-sets", "releases", "outcomes"].includes(active)) return repositoryAssurancePage(repository, active);
-  const repositoryFindings = findings.filter((finding) => finding.repository === repository.name);
-  const content = active === "runs"
-    ? repoRuns(repository)
-    : active === "policies"
-      ? repoPolicies(repository)
-      : active === "baselines"
-        ? repoBaselines(repository)
-        : active === "findings"
-          ? repoFindings(repository, repositoryFindings)
-          : repoOverview(repository, repositoryFindings);
-  return shell(repository.name, h("<div class=\"repo-hero\"><div class=\"repo-title\"><span class=\"repo-mark\">", esc(repository.name.slice(0, 2).toUpperCase()), "</span><div><h1>", esc(repository.name), "</h1><p>", esc(repository.visibility), " · ", esc(repository.defaultBranch), " · ", esc(repository.connection), "</p></div></div><div class=\"repo-actions\">", button("Run local check", "run-local-check", "primary"), button("Repository settings", "repository-settings"), "</div></div>", repoSubnav(repository, active), previewBanner("Source remains in the repository.", "The control plane uses structured report metadata, fingerprints, and explicit limitations for this view."), content));
-}
-
-function historyTable(runsToRender = runs) {
-  return h("<div class=\"card table-card\"><div class=\"filter-bar\"><input data-filter=\"run-query\" placeholder=\"Filter runs\" aria-label=\"Filter runs\" /><select data-filter=\"run-verdict\" aria-label=\"Filter run verdict\"><option value=\"all\">All verdicts</option><option value=\"verified\">Verified</option><option value=\"review\">Needs review</option><option value=\"unknown\">Unknown</option></select></div><table class=\"data-table\"><thead><tr><th>Repository</th><th>Ref</th><th>Verdict</th><th>Changed</th><th>Coverage</th><th>Recorded</th></tr></thead><tbody>", runsToRender.map((run) => h("<tr data-filter-row data-filter-group=\"runs\" data-search=\"", esc((run.repository + " " + run.ref + " " + run.commit).toLowerCase()), "\" data-verdict=\"", esc(run.tone), "\"><td><a href=\"/app/runs/", esc(run.id), "\"><strong>", esc(run.repository), "</strong><div class=\"muted mono\">", esc(run.commit), "</div></a></td><td class=\"mono\">", esc(run.ref), "</td><td>", badge(run.verdict, run.tone), "</td><td class=\"table-number\">", run.changedFiles, " files · ", run.changedLines, " lines</td><td class=\"table-number\">", esc(run.coverage), "</td><td class=\"muted\">", esc(run.time), "</td></tr>")).join(""), "</tbody></table></div>");
-}
-
-function historyPage() {
-  return shell("Verification runs", h(pageHeading("Evidence", "Verification runs", "Structured summaries from local PR Proof checks.", button("Open local report", "open-local-report")), previewBanner("Runs are report summaries, not source mirrors.", "The full report and repository content remain local to the checked-out repository."), historyTable()));
-}
-
-function runsPage() {
-  return shell("Runs", h(pageHeading("Evidence", "Run explorer", "Inspect individual verification results and their explicit evidence limits."), historyTable()));
-}
-
-function runPage(id) {
-  const run = runById(id);
-  if (!run) return notFoundPage();
-  const repository = repositoryById(run.repositoryId);
-  if (!repository) return notFoundPage();
-  const runFindings = findings.filter((finding) => finding.repository === run.repository);
-  return shell("Run " + run.commit, h("<div class=\"run-detail-head\"><div><div class=\"eyebrow\">Verification run</div><h1>", esc(run.repository), " · ", esc(run.ref), "</h1><p>", esc(run.time), " · ", esc(run.tool), " · structured metadata only</p></div><div class=\"page-actions\">", badge(run.verdict, run.tone), button("View local report", "open-local-report"), "</div></div><div class=\"run-facts\">", [["Head", run.commit], ["Base", run.base], ["Changed files", run.changedFiles], ["Changed lines", run.changedLines], ["Coverage", run.coverage], ["Findings", run.findings], ["Unknowns", run.unknowns], ["Repository", repository.name]].map(([label, value]) => h("<div class=\"fact\"><dt>", esc(label), "</dt><dd>", esc(value), "</dd></div>")).join(""), "</div><div class=\"evidence-grid\">", evidenceCard("Test integrity", run.verdict === "Verified" ? "Verified" : "Review", "Assertions and test behavior", run.verdict === "Verified" ? "verified" : "warning"), evidenceCard("Impact", run.unknowns ? "Partial" : "Mapped", run.unknowns ? run.unknowns + " unknown paths" : "Downstream consumers mapped", run.unknowns ? "unknown" : "verified"), evidenceCard("Coverage", run.coverage, "Changed-line coverage evidence", run.coverage === "Unavailable" ? "unknown" : "verified"), evidenceCard("Policy", repository.policy, "Policy applied to this summary", "verified"), "</div><div class=\"card\" style=\"margin-top:12px\"><div class=\"card-header\"><div><h2>Findings in this run</h2><p>Open a finding to review its evidence and suggested action.</p></div></div><div class=\"finding-list\">", runFindings.length ? runFindings.map(findingRow).join("") : "<div class=\"card-body\"><div class=\"empty-state\"><h3>No findings in this run</h3><p>The run completed without findings in this preview.</p></div></div>", "</div></div>"));
-}
-
-function findingsPage() {
-  return shell("Findings", h(pageHeading("Evidence", "Findings", "Reviewable evidence with explicit severity, confidence, and resolution state.", h(button("Open local report", "open-local-report"), button("Export metadata", "download-report"))), previewBanner("Evidence is intentionally bounded.", "Finding rows include structured locations and explanations. They do not require uploading source or a full diff."), "<div class=\"card\"><div class=\"filter-bar\"><input data-filter=\"finding-query\" placeholder=\"Filter by title, rule, or file\" aria-label=\"Filter findings\" /><select data-filter=\"finding-severity\" aria-label=\"Filter severity\"><option value=\"all\">All severities</option><option value=\"high\">High</option><option value=\"warning\">Warning</option><option value=\"info\">Info</option></select><select data-filter=\"finding-status\" aria-label=\"Filter status\"><option value=\"all\">All states</option><option value=\"new\">New</option><option value=\"unknown\">Unknown</option></select></div><div class=\"finding-list\">", findings.map((finding) => h("<div data-filter-row data-filter-group=\"findings\" data-search=\"", esc((finding.title + " " + finding.rule + " " + finding.file + " " + finding.repository).toLowerCase()), "\" data-severity=\"", esc(finding.tone), "\" data-status=\"", esc(finding.status.toLowerCase()), "\">", findingRow(finding), "</div>")).join(""), "</div></div>"));
-}
-
-function policiesPage() {
-  return shell("Policies", h(pageHeading("Administration", "Policies", "Policy packs define how the control plane handles failures, unknown evidence, and review states.", button("Create policy", "policy-unavailable", "primary")), previewBanner("Policy evaluation is local-first.", "The CLI applies the policy pack during verification; a hosted policy editor and server-side persistence are not configured."), "<div class=\"two-column\"><div>", policyCard("Default advisory", "Reports findings and unknowns without turning them into a hosted merge decision.", "Available", "neutral", { label: "Use in local config", action: "policy-unavailable" }), policyCard("Strict review", "Highlights weakened assertions and incomplete evidence for human review.", "Workspace default", "verified", { label: "Active", action: "policy-unavailable" }), "</div><div>", policyCard("Blocking unknowns", "A production-only option that requires a server-authorized policy decision.", "Unavailable", "unknown", { label: "Provider unavailable", action: "policy-unavailable" }), h("<div class=\"card\"><div class=\"card-header\"><div><h2>Repositories</h2><p>Current policy assignment.</p></div></div><div class=\"run-list\">", repositories.map((repository) => h("<a class=\"run-row\" href=\"/app/repositories/", esc(repository.id), "/policies\"><span class=\"repo-mark\">", esc(repository.name.slice(0, 2).toUpperCase()), "</span><span class=\"row-main\"><strong>", esc(repository.name), "</strong><span>", esc(repository.policy), "</span></span>", badge("Configured", "verified"), "</a>")).join(""), "</div></div>"), "</div></div>"));
-}
-
-function baselinesPage() {
-  return shell("Baselines", h(pageHeading("Evidence", "Baselines", "Baseline fingerprints make new, resolved, and unknown findings explicit without retaining source content.", button("Initialize baseline", "baseline-unavailable", "primary")), previewBanner("Baseline files stay local.", "The preview exposes metadata from repository reports; baseline writes require a local CLI action."), "<div class=\"card table-card\"><table class=\"data-table\"><thead><tr><th>Repository</th><th>State</th><th>Open findings</th><th>Last run</th><th>Action</th></tr></thead><tbody>", repositories.map((repository) => h("<tr><td><a href=\"/app/repositories/", esc(repository.id), "/baselines\"><strong>", esc(repository.name), "</strong><div class=\"muted\">", esc(repository.visibility), "</div></a></td><td>", badge(repository.baseline, repository.baseline.includes("Stale") ? "warning" : "verified"), "</td><td class=\"table-number\">", repository.openFindings, "</td><td class=\"muted\">", esc(repository.lastRun), "</td><td>", button("Open", "open-repository", "small", "data-repository=\"" + esc(repository.id) + "\""), "</td></tr>")).join(""), "</tbody></table></div>"));
-}
+function marketingPage(page) { if (page === "pricing") return html`<div class="tb-marketing"><header class="tb-marketing-header"><a class="tb-brand" href="/"><span class="tb-brand-mark">t</span><span class="tb-brand-wordmark">Tinkerbot</span></a><a class="slds-button slds-button_neutral tb-button" href="/login">Log in</a></header><main class="tb-marketing-main"><span class="slds-text-title_caps tb-eyebrow">FACTORY OPERATING SYSTEM</span><h1>Software production, under control.</h1><p>A governed production system that turns software intent into verified, traceable, releasable changes.</p><a class="slds-button slds-button_brand tb-button" href="/login">Open the factory</a></main></div>`; return html`<div class="tb-marketing"><header class="tb-marketing-header"><a class="tb-brand" href="/"><span class="tb-brand-mark">t</span><span class="tb-brand-wordmark">Tinkerbot</span></a><nav><a href="/product">Product</a><a href="/docs">Docs</a><a href="/pricing">Pricing</a></nav><div><a class="slds-button slds-button_neutral tb-button" href="/login">Log in</a><a class="slds-button slds-button_brand tb-button" href="/login">Start trial</a></div></header><main class="tb-marketing-main"><span class="slds-text-title_caps tb-eyebrow">FACTORY OPERATING SYSTEM</span><h1>Software production, under control.</h1><p>A governed production system that turns software intent into verified, traceable, releasable changes.</p><a class="slds-button slds-button_brand tb-button" href="/login">Start a factory</a></main></div>`; }
+function loginPage() { return html`<div class="tb-auth"><div class="tb-auth-story"><a class="tb-brand" href="/"><span class="tb-brand-mark">t</span><span class="tb-brand-wordmark">Tinkerbot</span></a><span class="slds-text-title_caps tb-eyebrow">FACTORY CONTROL PLANE</span><h1>Log in to the factory.</h1><p>Operators land on the factory floor, where evidence and authority stay visible.</p></div><section class="slds-card tb-auth-card"><div class="slds-card__body slds-card__body_inner"><h2 class="slds-text-heading_medium">Log in</h2><p class="tb-muted">Continue with Google, GitHub, or SSO.</p><a class="slds-button slds-button_brand tb-button slds-button_stretch" href="${esc(apiBase())}/auth/workos/start?returnTo=${encodeURIComponent("/factories")}">Continue</a><a class="tb-primary-link tb-auth-back" href="/">Back to website</a></div></section></div>`; }
 
-function invitationRow(invitation) {
-  return h("<div class=\"member-row\"><span class=\"org-avatar\">", esc(invitation.email.slice(0, 2).toUpperCase()), "</span><span class=\"row-main\"><strong>", esc(invitation.email), "</strong><span>", esc(invitation.role), " · invited through WorkOS</span></span>", badge(invitation.state, invitation.state === "pending" ? "warning" : "neutral"), "<span class=\"row-meta\">", esc(invitation.createdAt ? new Date(invitation.createdAt).toLocaleDateString() : ""), "</span></div>");
-}
-
-function teamPage() {
-  const hosted = Boolean(hostedApiBase());
-  const members = [
-    { name: "Alex Morgan", email: "alex@example.test", role: "Owner", state: "Active" },
-    { name: "Taylor Chen", email: "taylor@example.test", role: "Maintainer", state: "Active" },
-    { name: "Sam Rivera", email: "sam@example.test", role: "Reviewer", state: "Active" },
-  ];
-  const hostedState = state.hosted;
-  const banner = hosted
-    ? previewBanner(hostedState.error ? "Hosted team data needs attention." : "Hosted invitations are connected.", hostedState.error ?? "Invitation requests are checked against the server-side role, feature, and member entitlements before WorkOS sends email.")
-    : previewBanner("Identity provider unavailable.", "The local preview uses a development-only owner session. Production member changes must be authorized and audited server-side.");
-  const inviteForm = hosted && hostedState.inviteOpen
-    ? h("<div class=\"card\" style=\"margin-top:12px\"><div class=\"card-header\"><div><h2>Invite a teammate</h2><p>Only viewer, reviewer, and maintainer invitations can be issued from this surface.</p></div>", button("Cancel", "close-invite", "small"), "</div><div class=\"card-body\"><form data-invite-form><div class=\"field\"><label for=\"invite-email\">Email</label><input id=\"invite-email\" name=\"email\" type=\"email\" autocomplete=\"email\" required maxlength=\"320\" /></div><div class=\"field\"><label for=\"invite-role\">Role</label><select id=\"invite-role\" name=\"role\"><option value=\"viewer\">Viewer</option><option value=\"reviewer\">Reviewer</option><option value=\"maintainer\">Maintainer</option></select></div>", hostedState.inviteMessage ? h("<div class=\"auth-error\" role=\"alert\">", esc(hostedState.inviteMessage), "</div>") : "", "<button class=\"button primary\" type=\"submit\" ", hostedState.inviteSubmitting ? "disabled" : "", ">", hostedState.inviteSubmitting ? "Sending…" : "Send invitation", "</button></form></div></div>")
-    : "";
-  const memberMarkup = hosted
-    ? h("<div class=\"empty-state\"><h3>Server roster is authoritative</h3><p>WorkOS membership synchronization supplies the active roster. This surface shows invitation state without fabricating members in the browser.</p></div>")
-    : members.map((member) => h("<div class=\"member-row\"><span class=\"org-avatar\">", esc(member.name.split(" ").map((part) => part[0]).join("").slice(0, 2)), "</span><span class=\"row-main\"><strong>", esc(member.name), "</strong><span>", esc(member.email), "</span></span>", badge(member.role, member.role === "Owner" ? "verified" : "neutral"), "<span class=\"row-meta\">", esc(member.state), "</span></div>")).join("");
-  const invitations = hosted && hostedState.teamLoading
-    ? "<div class=\"card-body\"><p class=\"muted\">Loading pending invitations…</p></div>"
-    : hosted && hostedState.invitations.length
-      ? hostedState.invitations.map(invitationRow).join("")
-      : hosted
-        ? "<div class=\"card-body\"><div class=\"empty-state\"><h3>No invitations</h3><p>Pending, accepted, and revoked invitation state will appear here.</p></div></div>"
-        : "";
-  return shell("Team", h(pageHeading("Administration", "Team", hosted ? "Organization membership and invitations are connected to the hosted control-plane API." : "Organization membership and roles are represented here without claiming a hosted identity provider.", button("Invite member", "invite-member", "primary")), banner, "<div class=\"card\"><div class=\"card-header\"><div><h2>", hosted ? "Members" : "Preview members", "</h2><p>", hosted ? "WorkOS is the identity source of truth; invitation changes are server-authorized." : workspace.memberCount + " seats represented in the workspace summary.", "</p></div><span class=\"muted\">", hosted ? "Hosted" : workspace.plan + " plan", "</span></div><div class=\"member-list\">", memberMarkup, "</div></div>", inviteForm, hosted ? h("<div class=\"card\" style=\"margin-top:12px\"><div class=\"card-header\"><div><h2>Invitations</h2><p>Provider-backed invitation state, synchronized through WorkOS webhooks or replay.</p></div></div><div class=\"member-list\">", invitations, "</div></div>") : "", "<div class=\"callout\" style=\"margin-top:12px\"><strong>Role model is enforced server-side.</strong>Client-side visibility never grants billing, policy, member, audit, or repository authority.</div>"));
-}
-
-function integrationsPage() {
-  return shell("Integrations", h(pageHeading("Administration", "Integrations", "Connectors are explicit capability boundaries. This preview has local CLI and report viewing, but no hosted provider credentials.", button("Add integration", "integration-unavailable", "primary")), "<div class=\"two-column\"><div class=\"card\"><div class=\"card-header\"><div><h2>Local workflow</h2><p>Available without an account provider.</p></div>", badge("Available", "verified"), "</div><div class=\"card-body\"><div class=\"settings-row\"><div><h3>pr-proof CLI</h3><p>Run verification in the repository and open the structured report here.</p></div>", button("Open report viewer", "open-local-report", "small"), "</div><div class=\"settings-row\"><div><h3>Local server</h3><p>Bound to 127.0.0.1 by default with a strict static response policy.</p></div>", badge("Local only", "verified"), "</div></div></div><div class=\"card\"><div class=\"card-header\"><div><h2>Hosted providers</h2><p>Not connected in this environment.</p></div>", badge("Unavailable", "unknown"), "</div><div class=\"card-body\"><div class=\"settings-row\"><div><h3>GitHub App</h3><p>Required for hosted repository sync and pull request checks.</p></div>", button("Provider unavailable", "integration-unavailable", "small"), "</div><div class=\"settings-row\"><div><h3>Billing provider</h3><p>Required before checkout, invoices, or paid entitlement changes.</p></div>", button("Provider unavailable", "integration-unavailable", "small"), "</div></div></div></div>"));
-}
-
-function changeSetsPage() {
-  return shell("Change Sets", h(pageHeading("Assurance", "Change Sets", "Bounded cross-repository relationships without automatic merging or deployment.", button("Export local change set", "download-report", "small")), previewBanner("No cross-repository evidence is connected.", "A missing repository, incompatible consumer, or stale receipt remains UNKNOWN until explicitly represented."), "<div class=\"card\"><div class=\"card-body\"><div class=\"empty-state\"><h3>No Change Sets</h3><p>Export a structured ChangeSet from <code>tb change-set export</code> or connect an authorized hosted repository group. Tinkerbot does not own merges or deployments.</p></div></div></div>"));
-}
-
-function releasesPage() {
-  return shell("Releases", h(pageHeading("Assurance", "Release Assessments", "Advisory release evidence and explicit deployment/runtime uncertainty."), previewBanner("Deployment actions are unavailable.", "Tinkerbot consumes feature-flag, deployment, rollback, canary, telemetry, and incident evidence through adapters; it does not execute production actions."), "<div class=\"evidence-grid\">", assuranceStateCard("Release manifest", "Not configured", "No manifest is loaded in this preview."), assuranceStateCard("Verification receipts", "Unknown", "Required receipt references are not available."), assuranceStateCard("Migration / rollback", "Unknown", "Rollback or compensation evidence is an explicit input."), assuranceStateCard("Deployment / runtime", "Unknown", "External deployment and runtime evidence is not connected."), "</div><div class=\"card\" style=\"margin-top:12px\"><div class=\"card-body\"><p class=\"muted\">Use <code>tb release assess</code> locally to produce an advisory assessment. Unknown deployment state is not a pass.</p></div></div>"));
-}
-
-function outcomesPage() {
-  return shell("Outcomes", h(pageHeading("Assurance", "Outcome History", "Post-merge facts, imported signals, and explicitly confirmed associations."), previewBanner("No causal claims are inferred.", "A PR preceding an incident is not treated as causation. Associations remain unknown or hypotheses until supported."), "<div class=\"card\"><div class=\"card-header\"><div><h2>Recorded outcomes</h2><p>CI failure, revert, hotfix, rollback, incident, regression, successful release, and false-alarm records.</p></div>", badge("Empty", "neutral"), "</div><div class=\"card-body\"><div class=\"empty-state\"><h3>No outcome records</h3><p>Run <code>tb outcome record</code> with an explicit event. Retention and deletion metadata remain part of the export.</p></div></div></div>"));
-}
-
-function runAssurancePage(id) {
-  const run = runById(id);
-  if (!run) return notFoundPage();
-  return shell("Run " + run.commit, h(pageHeading("Pull request assurance", run.repository + " · " + run.ref, "Evidence context for this run, separated from the source repository and GitHub as the source of truth.", h("<a class=\"button small secondary\" href=\"/app/runs/", esc(id), "\">Run summary</a>", button("Open local report", "open-local-report"))), previewBanner("Receipt and graph state are explicit.", "The preview does not claim a hosted receipt, graph, agent provenance, approval, or runtime outcome when those objects are absent."), "<div class=\"evidence-grid\">", assuranceStateCard("Assurance record", "Available", "Run summary metadata is present."), assuranceStateCard("Verification receipt", "Unknown", "No portable receipt is synchronized."), assuranceStateCard("Impact paths", run.unknowns ? "Partial" : "Unknown", run.unknowns ? run.unknowns + " unresolved path(s)" : "No graph snapshot loaded."), assuranceStateCard("Finding lifecycle", "Unknown", "Freshness context is not present in this preview."), assuranceStateCard("Agent execution", "Not supplied", "No explicit agent receipt was provided; authorship is not inferred."), assuranceStateCard("Reviewer calibration", "Not reviewed", "Calibration events are opt-in and not present."), "</div><div class=\"card\" style=\"margin-top:12px\"><div class=\"card-body\"><p class=\"muted\">Use <code>tb evidence --format review-context</code> or <code>tb proof create</code> locally to export source-minimized evidence for this pull request.</p></div></div>"));
-}
-
-const settingsGroups = [
-  { title: "Personal", items: [["account", "Account", "user"], ["security", "Security", "shield"], ["notifications", "Notifications", "bell"]] },
-  { title: "Integrations", items: [["integrations", "MCP connections", "plugin"], ["billing", "Billing", "card"]] },
-  { title: "Coding", items: [["policies", "Policies", "settings"], ["baselines", "Baselines", "archive"], ["report", "Report viewer", "files"]] },
-  { title: "System", items: [["audit", "Audit log", "toolbox"]] },
-  { title: "Archived", items: [["archived", "Deferred features", "archive"]] },
-];
-
-function settingsNav(section) {
-  return h("<nav class=\"settings-nav\" aria-label=\"Settings sections\">", settingsGroups.map((group) => h("<div class=\"settings-nav-group\"><h2>", esc(group.title), "</h2>", group.items.map(([id, label, iconName]) => settingsLink("/app/settings/" + id, label, section === id, iconName)).join(""), "</div>")).join(""), "</nav>");
-}
-
-function settingsSidebar() {
-  const activeSection = currentPath().split("/")[3] || "account";
-  return h(
-    "<nav class=\"settings-sidebar\" aria-label=\"Settings navigation\"><div class=\"settings-sidebar-header\"><a class=\"settings-back\" href=\"/app/overview\">",
-    icon("arrow-left"),
-    "<span>Back to app</span></a>",
-    iconButton("toggle-mobile-nav", "x", "Close navigation", "", "mobile-nav-close"),
-    "</div><label class=\"settings-search\"><span class=\"sr-only\">Search settings</span>",
-    icon("search"),
-    "<input data-settings-search placeholder=\"Search settings…\" aria-label=\"Search settings\" /></label>",
-    settingsGroups.map((group) => h("<div class=\"settings-sidebar-group\" data-settings-group><h2>", esc(group.title), "</h2>", group.items.map(([id, label, iconName]) => settingsLink("/app/settings/" + id, label, activeSection === id, iconName, "data-settings-link data-search=\"" + esc(label.toLowerCase()) + "\"")).join(""), "</div>")).join(""),
-    "<div class=\"settings-search-empty\" data-settings-empty hidden>No settings match that search.</div>",
-    "</nav>",
-  );
-}
-
-function settingsRow(title, description, control) {
-  return h("<div class=\"settings-row\"><div><h3>", esc(title), "</h3><p>", esc(description), "</p></div><div class=\"settings-control\">", control, "</div></div>");
-}
-
-function accountSettings() {
-  const session = state.session;
-  return h("<div class=\"settings-group\"><h2>Profile</h2><div class=\"settings-card\">", settingsRow("Display name", "Used only in this development session.", "<input class=\"text-input\" value=\"" + esc(session?.name ?? "Developer") + "\" aria-label=\"Display name\" />"), settingsRow("Email", "A production provider would own email verification and change flows.", "<input class=\"text-input\" value=\"" + esc(session?.email ?? "") + "\" aria-label=\"Email\" type=\"email\" />"), settingsRow("Organization", "Current workspace selected for this local session.", "<span class=\"muted\">Atlas Engineering</span>"), "</div></div><div class=\"settings-group\"><h2>Environment</h2><div class=\"settings-card\">", settingsRow("Session mode", "This adapter is development-only and stores a short-lived session in local storage.", badge("Development only", "warning")), settingsRow("Plan", "Server-authoritative in production; preview data is not a billing claim.", badge(workspace.plan, "verified")), "</div></div><div class=\"page-actions\">", button("Save profile", "save-settings", "primary"), "</div>");
-}
-
-function securitySettings() {
-  return h("<div class=\"settings-group\"><h2>Authentication</h2><div class=\"settings-card\">", settingsRow("Session lifetime", "Development sessions expire after eight hours.", "<span class=\"muted\">8 hours</span>"), settingsRow("Password reset", "Reset links require a configured production provider and token store.", badge("Unavailable", "unknown")), settingsRow("Current session", "Revoke the local session from this browser.", button("Sign out", "sign-out", "danger")), "</div></div><div class=\"callout\"><strong>No secrets are sent by the preview.</strong>The development adapter does not contact an identity provider and must be replaced before production use.</div>");
-}
-
-function notificationSettings() {
-  return h("<div class=\"settings-group\"><h2>Notifications</h2><div class=\"settings-card\">", settingsRow("Finding digest", "A hosted notification channel is not configured.", "<button class=\"switch\" data-action=\"toggle-setting\" aria-label=\"Toggle finding digest\"></button>"), settingsRow("Run completion", "Local CLI output remains available without notification delivery.", "<button class=\"switch on\" data-action=\"toggle-setting\" aria-label=\"Toggle run completion\"></button>"), settingsRow("Billing alerts", "Billing alerts require a provider webhook and server-side delivery.", badge("Unavailable", "unknown")), "</div></div><div class=\"page-actions\">", button("Save notification settings", "save-settings", "primary"), "</div>");
-}
-
-function integrationSettings() {
-  return h("<div class=\"settings-group\"><h2>Connected services</h2><div class=\"settings-card\">", settingsRow("GitHub App", "Repository sync and hosted checks are not configured.", badge("Not connected", "unknown")), settingsRow("Billing provider", "Checkout, webhook ingestion, and invoices are not configured.", badge("Unavailable", "unknown")), settingsRow("Local report viewer", "Reads a structured report file in this local browser session.", badge("Available", "verified")), "</div></div><div class=\"callout\"><strong>Provider status is honest by design.</strong>No button in this preview starts a checkout, creates a hosted session, or claims a webhook was processed.</div>");
-}
-
-function billingSettings() {
-  if (hostedApiBase()) {
-    if (state.hosted.billingLoading && !state.hosted.billingLoaded) return h("<div class=\"empty-state\"><h3>Loading billing</h3><p>Reading server-authorized subscription and entitlement state.</p></div>");
-    if (state.hosted.billingError) return h("<div class=\"callout\"><strong>Billing could not be loaded.</strong>", esc(state.hosted.billingError), "</div>");
-    const summary = state.hosted.billing;
-    if (summary) {
-      const account = summary.account ?? {};
-      const entitlement = summary.entitlements ?? {};
-      const catalog = Array.isArray(summary.plans) ? summary.plans : [];
-      const currentPlan = account.planId || entitlement.planId || "No paid plan";
-      const status = account.status || entitlement.billingStatus || "inactive";
-      const planOptions = catalog.map((plan) => h("<div class=\"plan-option", plan.id === currentPlan ? " current" : "", "\"><h3>", esc(plan.id), "</h3><p>", esc(plan.privateRepositoryLimit), " private repositories · ", esc(plan.memberLimit), " members · ", esc(plan.retentionDays), " days retention</p>", plan.id === currentPlan ? badge("Current", "verified") : button("Choose monthly", "billing-checkout", "small", "data-plan=\"" + esc(plan.id) + "\" data-interval=\"month\""), plan.annualBillingAvailable && plan.id !== currentPlan ? button("Choose annual", "billing-checkout", "small", "data-plan=\"" + esc(plan.id) + "\" data-interval=\"year\"") : "", "</div>")).join("");
-      const management = account.customerId ? button("Billing portal", "billing-portal", "secondary") : "";
-      const subscriptionAction = account.subscriptionId ? account.cancelAtPeriodEnd ? button("Reactivate subscription", "billing-reactivate", "secondary") : button("Cancel at period end", "billing-cancel", "secondary") : "";
-      return h("<div class=\"billing-grid\"><div class=\"card\"><div class=\"card-header\"><div><h2>Current plan</h2><p>Authoritative Stripe and entitlement state.</p></div>", badge(status, ["active", "trialing"].includes(status) ? "verified" : "warning"), "</div><div class=\"card-body\"><div class=\"plan-hero\"><div><h2>", esc(currentPlan), "</h2><p>", esc(entitlement.privateRepositoryLimit ?? 0), " private repositories · ", esc(entitlement.memberLimit ?? 0), " members</p></div></div><div class=\"page-actions\" style=\"margin-top:18px\">", management, subscriptionAction, "</div></div></div><div class=\"card\"><div class=\"card-header\"><div><h2>Available plans</h2><p>Checkout uses server-configured Stripe Price IDs.</p></div></div><div class=\"plan-list\">", planOptions || "<div class=\"empty-state\"><p>No server-side plans are configured.</p></div>", "</div></div></div><div class=\"callout\" style=\"margin-top:18px\"><strong>Entitlements are enforced server-side.</strong>Webhook state, not this page, controls paid capabilities.</div>");
-    }
-  }
-  const used = workspace.activePrivateRepositories / workspace.privateRepositoryLimit * 100;
-  return h("<div class=\"billing-grid\"><div class=\"card\"><div class=\"card-header\"><div><h2>Current plan</h2><p>Preview entitlement snapshot for Atlas Engineering.</p></div>", badge("Preview", "warning"), "</div><div class=\"card-body\"><div class=\"plan-hero\"><div><h2>", esc(workspace.plan), "</h2><p>", workspace.activePrivateRepositories, " of ", workspace.privateRepositoryLimit, " private repositories connected</p></div><strong class=\"plan-price\">$19/mo</strong></div><div class=\"usage-bar\" style=\"margin-top:22px\"><span style=\"width:", String(Math.min(100, used)), "%\"></span></div><div class=\"usage-meta\"><span>Private repository capacity</span><span>", workspace.activePrivateRepositories, "/", workspace.privateRepositoryLimit, "</span></div><div class=\"callout\" style=\"margin-top:18px\"><strong>Billing provider unavailable.</strong>A production provider, checkout session, webhook ledger, and server-side entitlement service are not configured.</div></div></div><div class=\"card\"><div class=\"card-header\"><div><h2>Available plans</h2><p>Catalog values are configuration, not a live price quote.</p></div></div><div class=\"plan-list\">", plans.map((plan) => h("<div class=\"plan-option", plan.name === workspace.plan ? " current" : "", "\"><h3>", esc(plan.name), "</h3><strong>", esc(plan.price), plan.price === "$0" || plan.price === "Custom" ? "" : "/mo", "</strong><p>", esc(plan.detail), "</p>", plan.name === workspace.plan ? badge("Current", "verified") : button("Learn more", "billing-unavailable", "small"), "</div>")).join(""), "</div></div></div><div class=\"settings-group\" style=\"margin-top:18px\"><h2>Billing facts</h2><div class=\"billing-facts\"><div class=\"billing-fact\"><span>Payment method</span><strong>Not collected</strong></div><div class=\"billing-fact\"><span>Subscription status</span><strong>Provider unavailable</strong></div><div class=\"billing-fact\"><span>Entitlement source</span><strong>Server-side in production</strong></div><div class=\"billing-fact\"><span>Webhook state</span><strong>Not configured</strong></div></div></div>");
-}
+function render() { const route = routeInfo(); if (!signedIn() && !state.loading) app.innerHTML = route.kind === "login" ? loginPage() : marketingPage(route.page); else app.innerHTML = appShell(); }
 
-function auditSettings() {
-  const events = [
-    ["Report viewed", "Local report viewer", "just now"],
-    ["Development session created", "Local auth adapter", "today"],
-    ["Run summary imported", "pr-proof / run-2026-08-17", "12 min ago"],
-  ];
-  return h("<div class=\"settings-group\"><h2>Audit log</h2><div class=\"settings-card\"><div class=\"audit-list\">", events.map(([event, actor, time]) => h("<div class=\"audit-row\"><span class=\"task-check\">", icon("checkmark"), "</span><span class=\"row-main\"><strong>", esc(event), "</strong><span>", esc(actor), "</span></span><span class=\"row-meta\">", esc(time), "</span></div>")).join(""), "</div></div></div><div class=\"callout\"><strong>Preview audit events are local display data.</strong>Production audit records must be append-only, server-authorized, retention-bound, and exportable according to the organization plan.</div>");
-}
-
-function settingsPage(section = "account") {
-  const panels = {
-    account: ["Account", "Profile and workspace context.", accountSettings()],
-    security: ["Security", "Authentication, sessions, and recovery state.", securitySettings()],
-    notifications: ["Notifications", "Delivery preferences for hosted channels.", notificationSettings()],
-    integrations: ["Integrations", "Provider configuration and capability status.", integrationSettings()],
-    billing: ["Billing", "Plan, usage, and entitlement provider status.", billingSettings()],
-    audit: ["Audit log", "Local preview events and production requirements.", auditSettings()],
-    policies: ["Policies", "Local policy packs and review thresholds.", h("<div class=\"settings-group\"><h2>Policy controls</h2><div class=\"settings-card\">", settingsRow("Default review posture", "The local CLI reports evidence gaps without claiming a hosted merge decision.", badge("Advisory", "neutral")), settingsRow("Blocking unknowns", "Enable this only in a server-authorized production policy.", badge("Unavailable", "unknown")), settingsRow("Open policy workspace", "Review the full policy assignment across repositories.", button("Open policies", "open-policies", "small")), "</div></div>")],
-    baselines: ["Baselines", "Repository-local fingerprints for new and resolved findings.", h("<div class=\"settings-group\"><h2>Baseline controls</h2><div class=\"settings-card\">", settingsRow("Baseline storage", "Baseline writes remain in the repository and are not uploaded by this preview.", badge("Local only", "verified")), settingsRow("Unknown findings", "Unknown evidence is kept visible until a local run verifies the path.", badge("Visible", "neutral")), settingsRow("Open baseline workspace", "Inspect baseline state for every connected repository.", button("Open baselines", "open-baselines", "small")), "</div></div>")],
-    report: ["Report viewer", "Render structured PR Proof JSON without hosted authentication.", h("<div class=\"settings-group\"><h2>Local report viewer</h2><div class=\"settings-card\">", settingsRow("Source handling", "Only the selected JSON report is read in this browser session; source and full diffs stay local.", badge("Local only", "verified")), settingsRow("Viewer availability", "The bundled preview report is ready to inspect.", button("Open report viewer", "open-local-report", "small")), "</div></div>")],
-    archived: ["Archived", "Deferred control-plane surfaces and retired settings.", h("<div class=\"empty-state\"><h3>No archived settings</h3><p>Deferred surfaces stay out of the active paid control-plane workflow until their provider contracts are ready.</p></div>")],
-  };
-  const selected = panels[section] ?? panels.account;
-  return shell("Settings", h("<div class=\"settings-layout settings-content-only\"><div class=\"settings-panel\"><h1>", esc(selected[0]), "</h1><p>", esc(selected[1]), "</p>", selected[2], "</div></div>"));
-}
-
-function findingPanel(id) {
-  const finding = findingById(id);
-  if (!finding) return "";
-  return h("<div class=\"finding-scrim\" data-action=\"close-finding\" aria-hidden=\"true\"></div><aside class=\"finding-panel\" aria-label=\"Finding details\"><div class=\"finding-panel-header\"><div><div class=\"eyebrow\">", esc(finding.evidence), "</div><h2>", esc(finding.title), "</h2><p class=\"finding-rule\">", esc(finding.rule), " · ", esc(finding.file), ":", esc(finding.line), "</p></div>", iconButton("close-finding", "x", "Close finding"), "</div><div class=\"finding-panel-body\"><div class=\"cluster\">", badge(finding.severity, finding.tone), badge(finding.status, finding.status === "Unknown" ? "unknown" : "neutral"), badge(finding.confidence + " confidence", finding.confidence === "High" ? "verified" : "warning"), "</div><div class=\"detail-section\"><h3>Why it matters</h3><p>", esc(finding.explanation), "</p></div><div class=\"detail-section\"><h3>Evidence</h3><div class=\"code-compare\"><div class=\"code-block before\">", esc(finding.before), "</div><div class=\"code-block after\">", esc(finding.after), "</div></div></div><div class=\"detail-section\"><h3>Suggested action</h3><p>", esc(finding.action), "</p></div><div class=\"detail-section\"><h3>Baseline</h3><p>", esc(finding.baseline), "</p></div></div></aside>");
-}
-
-function reportVerdictTone(verdict) {
-  const normalized = String(verdict ?? "").toLowerCase();
-  if (normalized === "pass" || normalized === "verified") return "verified";
-  if (normalized === "fail" || normalized === "failed") return "failed";
-  if (normalized.includes("review")) return "review";
-  return "unknown";
-}
-
-function reportFindingRow(finding) {
-  const tone = finding.severity === "high" ? "high" : finding.severity === "warning" ? "warning" : "info";
-  const line = finding.startLine ?? finding.line ?? "—";
-  return h("<div class=\"finding-row\"><span>", badge(String(finding.severity ?? "unknown").toUpperCase(), tone), "</span><span class=\"row-main\"><strong>", esc(finding.title ?? finding.message ?? finding.ruleId), "</strong><span class=\"finding-rule\">", esc(finding.ruleId ?? "finding"), " · ", esc(finding.file ?? "repository"), ":", esc(line), "</span><span>", esc(finding.suggestedAction ?? finding.explanation ?? finding.message ?? "Review the report evidence."), "</span></span><span class=\"row-end\">", badge(finding.resolution ?? "unknown", finding.resolution === "open" ? "neutral" : "unknown"), "</span></div>");
-}
-
-function validLocalReport(value) {
-  return Boolean(value && typeof value === "object" && value.schemaVersion === 1 && typeof value.repository === "string" && typeof value.verdict === "string" && value.summary && typeof value.summary === "object" && Array.isArray(value.findings) && Array.isArray(value.limitations));
-}
-
-function localReportPage() {
-  const report = state.report;
-  const summary = report.summary ?? {};
-  const tone = reportVerdictTone(report.verdict);
-  return localReportShell(h(pageHeading("Local-only", "Report viewer", "Render a structured PR Proof report without hosted authentication or outbound upload.", h("<label class=\"button small secondary\" for=\"report-file\">Open JSON report</label>", button("Download preview JSON", "download-report", "small"))), "<div class=\"report-toolbar\"><div><strong>Source:</strong> ", esc(state.reportSource), "</div><input class=\"sr-only\" id=\"report-file\" type=\"file\" accept=\"application/json,.json\" data-report-file aria-label=\"Open local JSON report\" /></div><div class=\"preview-banner\"><span class=\"preview-badge\">Local only</span><div><strong>No source or full diff is uploaded.</strong>The viewer reads the selected JSON file in this browser and only renders its structured report fields.</div></div><div class=\"card\"><div class=\"card-header\"><div><h2>", esc(report.repository), "</h2><p>", esc(report.base), " → ", esc(report.head), " · generated ", esc(report.generatedAt ?? "unknown"), "</p></div>", badge(report.verdict, tone), "</div><div class=\"card-body\"><div class=\"repo-metric-grid\">", metric("Findings", report.findings.length), metric("Unknowns", report.limitations.length), metric("Changed-line coverage", summary.changedLinesCoveredPercentage == null ? "Unavailable" : String(summary.changedLinesCoveredPercentage) + "%"), metric("Changed symbols", summary.changedSymbols ?? "Unavailable"), metric("Impacted tests", summary.impactedTests ?? "Unavailable"), metric("Unverified paths", summary.unverifiedPaths ?? "Unavailable"), "</div></div><div class=\"card-header\"><div><h2>Findings</h2><p>Structured locations, explanations, and suggested actions.</p></div></div><div class=\"finding-list\">", report.findings.length ? report.findings.map(reportFindingRow).join("") : "<div class=\"card-body\"><div class=\"empty-state\"><h3>No findings</h3><p>This report contains no findings.</p></div></div>", "</div>", report.limitations.length ? h("<div class=\"card-body\"><div class=\"callout\"><strong>Limitations</strong><ul>", report.limitations.map((limitation) => h("<li>", esc(limitation), "</li>")).join(""), "</ul></div></div>") : "", "</div>"));
-}
-
-function authPage(mode = "sign-in") {
-  const signUp = mode === "sign-up";
-  const forgot = mode === "forgot-password";
-  const reset = mode === "reset-password";
-  const title = signUp ? "Create a preview account" : forgot ? "Recover access" : reset ? "Reset password" : "Welcome back";
-  const description = signUp ? "Create a local-only session to explore the control plane." : forgot ? "Request a recovery link from the configured identity provider." : reset ? "Complete a reset using a provider-issued token." : "Sign in to the local control-plane preview.";
-  let fields = "";
-  if (signUp) fields += "<div class=\"field\"><label for=\"name\">Name</label><input id=\"name\" name=\"name\" autocomplete=\"name\" required /></div>";
-  fields += "<div class=\"field\"><label for=\"email\">Email</label><input id=\"email\" name=\"email\" type=\"email\" autocomplete=\"email\" required /></div>";
-  if (!forgot) fields += "<div class=\"field\"><label for=\"password\">Password</label><input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"" + (signUp ? "new-password" : "current-password") + "\" minlength=\"8\" required /><span class=\"field-hint\">Use any 8+ character development password.</span></div>";
-  if (reset) fields += "<div class=\"field\"><label for=\"confirm-password\">Confirm password</label><input id=\"confirm-password\" name=\"confirmPassword\" type=\"password\" autocomplete=\"new-password\" minlength=\"8\" required /></div>";
-  const submitLabel = signUp ? "Create preview session" : forgot ? "Request reset link" : reset ? "Reset password" : "Sign in";
-  const links = signUp ? "<a href=\"/sign-in\">Already have a session? Sign in</a><a href=\"/forgot-password\">Forgot password?</a>" : forgot || reset ? "<a href=\"/sign-in\">Back to sign in</a><a href=\"/sign-up\">Create preview account</a>" : "<a href=\"/sign-up\">Create preview account</a><a href=\"/forgot-password\">Forgot password?</a>";
-  return h("<div class=\"auth-page\"><div class=\"auth-story\"><div class=\"brand\"><span class=\"brand-wordmark\">pr-proof</span><span class=\"brand-subtitle\">control plane</span></div><div class=\"auth-copy\"><div class=\"eyebrow\">Local-first verification</div><h1>Make evidence legible.</h1><p>Review proof-of-test, impact, coverage, mutation, baseline, and policy state in one calm workspace.</p><div class=\"auth-points\"><div class=\"auth-point\"><strong>Structured</strong>Reports keep facts and unknowns separate.</div><div class=\"auth-point\"><strong>Private by default</strong>Source stays in the repository.</div><div class=\"auth-point\"><strong>Honest states</strong>Unavailable providers remain unavailable.</div></div></div><div class=\"auth-footer\"><span>Development preview</span><a href=\"/local/report\">View local report</a></div></div><div class=\"auth-panel\"><div class=\"auth-card\"><h2>", title, "</h2><p>", description, "</p><form class=\"auth-form\" data-auth-form=\"", esc(mode), "\">", fields, "<div data-auth-message></div><button class=\"button primary full\" type=\"submit\">", submitLabel, "</button></form><div class=\"auth-links\">", links, "</div><div class=\"dev-note\">No email, password, token, or production session is sent anywhere by this preview.</div></div></div></div>", toastMarkup());
-}
-
-function notFoundPage() {
-  return shell("Not found", h(pageHeading("Control plane", "Page not found", "This route is not part of the paid control-plane surface."), "<div class=\"empty-state\"><h3>Nothing here yet</h3><p>Use the workspace navigation to return to evidence, repositories, or settings.</p><a class=\"button primary\" href=\"/app/overview\">Back to overview</a></div>"));
-}
-
-function renderRoute(pathname) {
-  const segments = pathname.split("/").filter(Boolean);
-  if (pathname === "/app" || pathname === "/app/overview") return overview();
-  if (pathname === "/app/repositories") return repositoriesPage();
-  if (segments[0] === "app" && segments[1] === "repositories" && segments[2]) return repositoryPage(segments[2], segments[3] ?? "overview");
-  if (pathname === "/app/history") return historyPage();
-  if (pathname === "/app/runs") return runsPage();
-  if (segments[0] === "app" && segments[1] === "runs" && segments[2] && segments[3] === "assurance") return runAssurancePage(segments[2]);
-  if (segments[0] === "app" && segments[1] === "runs" && segments[2]) return runPage(segments[2]);
-  if (pathname === "/app/findings") return findingsPage();
-  if (segments[0] === "app" && segments[1] === "findings" && segments[2]) return findingById(segments[2]) ? findingsPage() : notFoundPage();
-  if (pathname === "/app/policies") return policiesPage();
-  if (pathname === "/app/baselines") return baselinesPage();
-  if (pathname === "/app/change-sets") return changeSetsPage();
-  if (pathname === "/app/releases") return releasesPage();
-  if (pathname === "/app/outcomes") return outcomesPage();
-  if (pathname === "/app/team") return teamPage();
-  if (pathname === "/app/integrations") return integrationsPage();
-  if (pathname === "/app/settings" || pathname === "/app/settings/") return settingsPage("account");
-  if (segments[0] === "app" && segments[1] === "settings" && segments[2]) return settingsPage(segments[2]);
-  return notFoundPage();
-}
-
-function renderCurrent() {
-  const pathname = currentPath();
-  const authModes = {
-    "/sign-in": "sign-in",
-    "/sign-up": "sign-up",
-    "/forgot-password": "forgot-password",
-    "/reset-password": "reset-password",
-  };
-  if (authModes[pathname]) {
-    app.innerHTML = authPage(authModes[pathname]);
-    return;
-  }
-  if (pathname === "/local/report") {
-    app.innerHTML = localReportPage();
-    return;
-  }
-  if (!state.session) {
-    app.innerHTML = authPage("sign-in");
-    return;
-  }
-  if (pathname.startsWith("/app/findings/")) {
-    const findingId = pathname.split("/")[3] ?? null;
-    state.selectedFindingId = findingById(findingId) ? findingId : null;
-  }
-  if (pathname !== "/app/findings" && !pathname.startsWith("/app/findings/")) state.selectedFindingId = null;
-  app.innerHTML = renderRoute(pathname);
-  applyFilters();
-  if (state.paletteOpen) window.setTimeout(() => document.querySelector("[data-palette-search]")?.focus(), 0);
-}
-
-async function navigate(pathname = currentPath()) {
-  state.session = await auth.getSession();
-  if (pathname.startsWith("/app") && !state.session) {
-    const returnTo = safeReturnTo(pathname + window.location.search);
-    window.history.replaceState({}, "", "/sign-in?returnTo=" + encodeURIComponent(returnTo));
-    state.mobileNav = false;
-    renderCurrent();
-    return;
-  }
-  if (state.session && ["/sign-in", "/sign-up"].includes(pathname)) {
-    window.history.replaceState({}, "", "/app/overview");
-  }
-  state.mobileNav = false;
-  state.accountMenu = false;
-  state.orgMenu = false;
-  renderCurrent();
-  if (pathname === "/app/team") void loadHostedTeam();
-  if (pathname === "/app/settings/billing") void loadHostedBilling();
-}
-
-function applyFilters() {
-  const findingQuery = state.filters.findingQuery.toLowerCase().trim();
-  const severity = state.filters.findingSeverity;
-  const status = state.filters.findingStatus;
-  document.querySelectorAll("[data-filter-row][data-filter-group=\"findings\"]").forEach((row) => {
-    const matches = (!findingQuery || (row.dataset.search ?? "").includes(findingQuery)) && (severity === "all" || row.dataset.severity === severity) && (status === "all" || row.dataset.status === status);
-    row.hidden = !matches;
-  });
-  const runQuery = state.filters.runQuery.toLowerCase().trim();
-  const verdict = state.filters.runVerdict;
-  document.querySelectorAll("[data-filter-row][data-filter-group=\"runs\"]").forEach((row) => {
-    row.hidden = !(!runQuery || (row.dataset.search ?? "").includes(runQuery)) || !(verdict === "all" || row.dataset.verdict === verdict);
-  });
-  applySettingsSearch(document.querySelector("[data-settings-search]")?.value ?? "");
-}
-
-function applySettingsSearch(value) {
-  const query = String(value).toLowerCase().trim();
-  let visibleLinks = 0;
-  document.querySelectorAll("[data-settings-group]").forEach((group) => {
-    let groupHasMatch = false;
-    group.querySelectorAll("[data-settings-link]").forEach((link) => {
-      const matches = !query || (link.dataset.search ?? "").includes(query);
-      link.hidden = !matches;
-      groupHasMatch ||= matches;
-      if (matches) visibleLinks += 1;
-    });
-    group.hidden = !groupHasMatch;
-  });
-  const emptyState = document.querySelector("[data-settings-empty]");
-  if (emptyState) emptyState.hidden = Boolean(!query || visibleLinks);
-}
-
-function handleFilterInput(target) {
-  const name = target.dataset.filter;
-  if (name === "finding-query") state.filters.findingQuery = target.value;
-  if (name === "finding-severity") state.filters.findingSeverity = target.value;
-  if (name === "finding-status") state.filters.findingStatus = target.value;
-  if (name === "run-query") state.filters.runQuery = target.value;
-  if (name === "run-verdict") state.filters.runVerdict = target.value;
-  applyFilters();
-}
-
-function downloadReport() {
-  const blob = new Blob([JSON.stringify(state.report, null, 2) + "\n"], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = "pr-proof-report.json";
-  anchor.click();
-  window.setTimeout(() => URL.revokeObjectURL(url), 0);
-  showToast("Report exported", "The structured report was downloaded locally. No source or full diff was added.");
-}
+async function loadFactoryList() { const response = await api("/factories"); state.factories = response.factories ?? (response.factory ? [response.factory] : []); const route = routeInfo(); const id = route.kind === "factory" ? route.factoryId : storedFactoryId() || state.factories[0]?.factoryId; if (id) saveFactoryId(id); }
 
-async function loadReportFile(file) {
+async function loadRoute() {
+  if (!signedIn()) return; const route = routeInfo();
+  if (route.kind === "root") { if (state.factories.length) { navigate(factoryHref(factoryId()), true); return; } state.routeItems = []; state.routeLoading = false; render(); return; }
+  state.routeLoading = true; state.routeError = null; render();
   try {
-    const value = JSON.parse(await file.text());
-    if (!validLocalReport(value)) throw new Error("The file is not a compatible PR Proof report v1.");
-    state.report = value;
-    state.reportSource = "local file: " + file.name;
-    showToast("Report loaded locally", "The JSON was parsed in this browser session only.");
-  } catch (error) {
-    showToast("Report not loaded", error instanceof Error ? error.message : "The selected file could not be read.");
-  }
+    if (route.kind === "factory") {
+      saveFactoryId(route.factoryId); const viewResponse = await api(`/factories/${encodeURIComponent(route.factoryId)}`); state.factoryView = viewResponse.factory?.factoryId ? viewResponse : state.factoryView;
+      const workResponse = await api(`/work-orders?factoryId=${encodeURIComponent(route.factoryId)}`).catch(() => ({ workOrders: state.factoryView?.activity || [] })); state.workOrders = (workResponse.workOrders || state.factoryView?.activity || []).map((item) => normalizeOrder(item, route.factoryId)); state.costs = state.factoryView?.costs || null;
+      if (route.area === "work-orders" && route.entityId) { state.entity = await api(`/work-orders/${encodeURIComponent(route.entityId)}`).catch(() => ({ workOrder: state.workOrders.find((item) => item.id === route.entityId) })); state.graph = await api(`/work-orders/${encodeURIComponent(route.entityId)}/graph`).catch(() => null); }
+      else if (FACTORY_RESOURCES[route.area] && route.area !== "work-orders" && route.area !== "dashboard") { const endpoint = `/factories/${encodeURIComponent(route.factoryId)}/${route.area}`; const response = await api(endpoint).catch(() => ({ items: state.factoryView?.[route.area] || [] })); state.routeItems = response.items || response[route.area] || state.factoryView?.[route.area] || []; if (route.entityId) state.entity = await api(`${endpoint}/${encodeURIComponent(route.entityId)}`).catch(() => ({ item: state.routeItems.find((item) => String(item.id || item.run_id || item.runId || item.evidenceId || item.release_id) === route.entityId) })).then((payload) => payload.item || payload); }
+    } else if (route.kind === "workspace") {
+      if (route.resource === "factories") { await loadFactoryList(); state.routeItems = state.factories; }
+      else { const response = await api(`/${route.resource}`).catch(() => ({ items: [] })); state.routeItems = response.items || response[route.resource] || response.runs || response.environments || response.integrations || response.secrets || []; if (route.entityId) state.entity = await api(`/${route.resource}/${encodeURIComponent(route.entityId)}`).catch(() => state.routeItems.find((item) => String(item.id || item.run_id || item.runId || item.secretId || item.integrationId) === route.entityId)); }
+    }
+    state.routeLoading = false; state.error = null; render();
+  } catch (error) { state.routeLoading = false; state.routeError = error; render(); }
 }
+
+async function boot() { state.loading = true; render(); try { state.session = await api("/auth/session").catch(() => ({ authenticated: false })); if (!signedIn()) { state.loading = false; render(); return; } await loadFactoryList().catch(() => { state.factories = []; }); state.loading = false; render(); await loadRoute(); } catch (error) { state.loading = false; state.error = error; render(); } }
+async function refreshRoute(silent = false) { if (!signedIn()) return; const before = state.workOrders.map((order) => `${order.id}:${order.updatedAt}`).join("|"); await loadRoute(); const after = state.workOrders.map((order) => `${order.id}:${order.updatedAt}`).join("|"); if (silent && before && before !== after) { state.updateNotice = "List updated"; render(); } }
+function setQueryValue(key, value) { const params = queryParams(); if (value) params.set(key, value); else params.delete(key); const suffix = params.toString() ? `?${params.toString()}` : ""; navigate(`${pathName()}${suffix}`, true); }
+function openModal(kind) { state.modal = kind; state.modalError = null; render(); setTimeout(() => document.querySelector(`[data-modal-form="${kind}"] input, [data-modal-form="${kind}"] textarea`)?.focus(), 0); }
+
+async function submitModal(form, kind) {
+  const value = Object.fromEntries(new FormData(form).entries()); state.routeLoading = true; state.modalError = null; render();
+  try {
+    let response; if (kind === "workOrder") response = await api("/work-orders", "POST", { factoryId: factoryId(), repositoryId: value.repositoryId, intent: value.intent }); else if (kind === "factory") response = await api("/factories", "POST", { name: value.name, yaml: value.yaml || undefined }); else if (kind === "secret") response = await api("/secrets", "POST", { name: value.name, secretRef: value.reference }); else if (kind === "integration") response = await api("/integrations", "POST", { name: value.name, kind: value.kind, config: value.config || "{}" }); else if (kind === "agent") response = await api(`/factories/${encodeURIComponent(factoryId())}/agents`, "POST", { name: value.name, role: value.role }); else response = await api(`/factories/${encodeURIComponent(factoryId())}/automations`, "POST", { name: value.name, trigger: value.trigger });
+    state.modal = null; state.routeLoading = false; state.modalError = null; if (response?.factory?.factoryId) saveFactoryId(response.factory.factoryId); render(); await loadFactoryList().catch(() => {}); await loadRoute(); if (kind === "workOrder" && response?.workOrder?.workOrderId) navigate(factoryHref(factoryId(), "work-orders", response.workOrder.workOrderId));
+  } catch (error) { state.routeLoading = false; state.modalError = error.message || "Could not save this record."; render(); }
+}
+
+async function runWorkAction(id, action) { state.actionError = null; try { if (action === "review" || action === "authorize_release") await api(`/work-orders/${encodeURIComponent(id)}/decisions`, "POST", { type: action === "review" ? "review" : "release_authorization", decision: "approved", evidenceAcknowledged: true }); else await api(`/work-orders/${encodeURIComponent(id)}/${action}`, "POST", {}); await refreshRoute(); } catch (error) { state.actionError = error; render(); } }
+function renderSearchResults(results) { state.searchResults = (results || []).map((result) => ({ ...result, href: result.href || result.url || "/factories" })); render(); }
+let searchTimer;
+async function searchGlobal(query) { state.globalSearch = query; if (searchTimer) clearTimeout(searchTimer); if (query.trim().length < 2) { state.searchResults = []; render(); return; } searchTimer = setTimeout(async () => { const response = await api(`/search?q=${encodeURIComponent(query.trim())}`).catch(() => ({ results: [] })); renderSearchResults(response.results || []); }, 220); render(); }
 
 document.addEventListener("click", (event) => {
-  const actionElement = event.target.closest("[data-action]");
-  const action = actionElement?.dataset.action;
-  if (action === "close-palette") {
-    if (event.target === actionElement) {
-      state.paletteOpen = false;
-      renderCurrent();
-    }
-    return;
-  }
-  if (action === "open-palette") {
-    state.paletteOpen = true;
-    state.accountMenu = false;
-    state.orgMenu = false;
-    renderCurrent();
-    return;
-  }
-  if (action === "toggle-mobile-nav") {
-    if (window.matchMedia("(max-width: 767px)").matches) {
-      state.mobileNav = !state.mobileNav;
-    } else {
-      state.sidebarOpen = !state.sidebarOpen;
-    }
-    renderCurrent();
-    return;
-  }
-  if (action === "toggle-account") {
-    state.accountMenu = !state.accountMenu;
-    state.orgMenu = false;
-    renderCurrent();
-    return;
-  }
-  if (action === "toggle-org") {
-    state.orgMenu = !state.orgMenu;
-    state.accountMenu = false;
-    renderCurrent();
-    return;
-  }
-  if (action === "open-finding") {
-    event.preventDefault();
-    state.selectedFindingId = actionElement.dataset.finding;
-    renderCurrent();
-    return;
-  }
-  if (action === "close-finding") {
-    if (currentPath().startsWith("/app/findings/")) window.history.replaceState({}, "", "/app/findings");
-    state.selectedFindingId = null;
-    renderCurrent();
-    return;
-  }
-  if (action === "dismiss-toast") {
-    state.toast = null;
-    renderCurrent();
-    return;
-  }
-  if (action === "sign-out") {
-    event.preventDefault();
-    void auth.signOut().then(() => {
-      state.session = null;
-      window.history.pushState({}, "", "/sign-in");
-      navigate("/sign-in");
-    });
-    return;
-  }
-  if (action === "open-local-report") {
-    event.preventDefault();
-    window.history.pushState({}, "", "/local/report");
-    navigate("/local/report");
-    return;
-  }
-  if (action === "download-report") {
-    event.preventDefault();
-    downloadReport();
-    return;
-  }
-  if (action === "open-policies" || action === "open-baselines") {
-    event.preventDefault();
-    const destination = action === "open-policies" ? "/app/policies" : "/app/baselines";
-    window.history.pushState({}, "", destination);
-    navigate(destination);
-    return;
-  }
-  if (action === "open-repository") {
-    event.preventDefault();
-    window.history.pushState({}, "", "/app/repositories/" + actionElement.dataset.repository);
-    navigate();
-    return;
-  }
-  if (action === "invite-member") {
-    event.preventDefault();
-    if (!hostedApiBase()) {
-      showToast("Invitation unavailable", "Configure the hosted control-plane API and WorkOS before sending member invitations.");
-      return;
-    }
-    state.hosted.inviteOpen = true;
-    state.hosted.inviteMessage = null;
-    renderCurrent();
-    window.setTimeout(() => document.querySelector("#invite-email")?.focus(), 0);
-    return;
-  }
-  if (action === "close-invite") {
-    event.preventDefault();
-    state.hosted.inviteOpen = false;
-    state.hosted.inviteSubmitting = false;
-    state.hosted.inviteMessage = null;
-    renderCurrent();
-    return;
-  }
-  if (["billing-checkout", "billing-portal", "billing-cancel", "billing-reactivate"].includes(action)) {
-    event.preventDefault();
-    if (state.hosted.billingSubmitting) return;
-    state.hosted.billingSubmitting = true;
-    const path = action === "billing-checkout" ? "/billing/checkout" : action === "billing-portal" ? "/billing/portal" : action === "billing-cancel" ? "/billing/subscription/cancel" : "/billing/subscription/reactivate";
-    const body = action === "billing-checkout" ? { planId: actionElement.dataset.plan, interval: actionElement.dataset.interval } : {};
-    void hostedRequest(path, { method: "POST", body: JSON.stringify(body) })
-      .then((result) => {
-        const redirect = result.checkout?.url || result.portal?.url;
-        if (redirect) {
-          window.location.assign(redirect);
-          return;
-        }
-        showToast(action === "billing-cancel" ? "Cancellation scheduled" : "Subscription updated", "Stripe accepted the server-authorized billing change.");
-        return loadHostedBilling(true);
-      })
-      .catch((error) => showToast("Billing action failed", error instanceof Error ? error.message : "The billing action could not be completed."))
-      .finally(() => {
-        state.hosted.billingSubmitting = false;
-      });
-    return;
-  }
-  if (["connect-repository", "repository-settings", "run-local-check", "policy-unavailable", "baseline-unavailable", "organization-unavailable", "invite-member", "integration-unavailable", "billing-unavailable", "save-settings", "toggle-setting"].includes(action)) {
-    event.preventDefault();
-    const messages = {
-      "connect-repository": ["Repository provider unavailable", "Connectors are not configured; use the local CLI and report viewer for now."],
-      "repository-settings": ["Repository settings unavailable", "Hosted repository sync is not connected in this preview."],
-      "run-local-check": ["Run locally", "Use pr-proof check in the repository, then open the generated JSON report here."],
-      "policy-unavailable": ["Policy change not persisted", "The preview shows policy state but does not fake a server-authorized write."],
-      "baseline-unavailable": ["Baseline stays local", "Use the CLI baseline command to write repository-local baseline metadata."],
-      "organization-unavailable": ["Organization switching unavailable", "The development adapter exposes one local organization."],
-      "invite-member": ["Invitation unavailable", "A production identity provider is required before member invitations can be sent."],
-      "integration-unavailable": ["Integration unavailable", "No hosted provider credentials are configured in this environment."],
-      "billing-unavailable": ["Checkout unavailable", "No billing provider or server-side entitlement service is configured."],
-      "save-settings": ["Settings not persisted", "This development preview keeps settings controls honest and does not claim a hosted write."],
-      "toggle-setting": ["Preference preview only", "Notification preferences require a configured delivery provider."],
-    };
-    showToast(messages[action][0], messages[action][1]);
-    return;
-  }
-  const anchor = event.target.closest("a[href]");
-  const href = anchor?.getAttribute("href");
-  if (href && href.startsWith("/") && !href.startsWith("//")) {
-    event.preventDefault();
-    window.history.pushState({}, "", href);
-    navigate();
-  }
-});
-
-document.addEventListener("submit", (event) => {
-  const invitationForm = event.target.closest("form[data-invite-form]");
-  if (invitationForm) {
-    event.preventDefault();
-    const values = Object.fromEntries(new FormData(invitationForm).entries());
-    state.hosted.inviteSubmitting = true;
-    state.hosted.inviteMessage = null;
-    renderCurrent();
-    void hostedRequest("/tenant/invitations", { method: "POST", body: JSON.stringify({ email: String(values.email ?? ""), role: String(values.role ?? "viewer") }) })
-      .then((result) => {
-        if (result.invitation) state.hosted.invitations = [result.invitation, ...state.hosted.invitations];
-        state.hosted.inviteOpen = false;
-        state.hosted.teamLoaded = true;
-        showToast("Invitation sent", "WorkOS accepted the invitation and the provider will deliver the email.");
-      })
-      .catch((error) => {
-        state.hosted.inviteMessage = error instanceof Error ? error.message : "The invitation could not be sent.";
-      })
-      .finally(() => {
-        state.hosted.inviteSubmitting = false;
-        renderCurrent();
-      });
-    return;
-  }
-  const form = event.target.closest("form[data-auth-form]");
-  if (!form) return;
-  event.preventDefault();
-  const mode = form.dataset.authForm;
-  const values = Object.fromEntries(new FormData(form).entries());
-  const message = form.querySelector("[data-auth-message]");
-  if (mode === "forgot-password") {
-    auth.requestPasswordReset(String(values.email ?? "")).then((result) => {
-      message.innerHTML = "<div class=\"" + (result.accepted ? "auth-success" : "auth-error") + "\" role=\"status\">" + esc(result.message) + "</div>";
-    });
-    return;
-  }
-  if (mode === "reset-password") {
-    message.innerHTML = "<div class=\"auth-error\" role=\"alert\">A provider-issued reset token is required. The development adapter does not accept password reset writes.</div>";
-    return;
-  }
-  const request = mode === "sign-up"
-    ? auth.signUp({ name: String(values.name ?? ""), email: String(values.email ?? ""), password: String(values.password ?? "") })
-    : auth.signIn({ email: String(values.email ?? ""), password: String(values.password ?? "") });
-  request.then((result) => {
-    if (result.error) {
-      message.innerHTML = "<div class=\"auth-error\" role=\"alert\">" + esc(result.error) + "</div>";
-      return;
-    }
-    state.session = result.session ?? null;
-    const returnTo = mode === "sign-in" ? safeReturnTo(currentSearch().get("returnTo")) : "/app/overview";
-    window.history.pushState({}, "", returnTo);
-    navigate(returnTo);
-  });
-});
-
-document.addEventListener("change", (event) => {
   const target = event.target;
-  if (target.matches("[data-filter]")) handleFilterInput(target);
-  if (target.matches("[data-report-file]") && target.files?.[0]) void loadReportFile(target.files[0]);
+  if (target.closest?.("[data-sidebar-toggle]")) { event.preventDefault(); state.sidebarOpen = !state.sidebarOpen; render(); return; }
+  if (target.closest?.("[data-sidebar-dismiss]")) { event.preventDefault(); state.sidebarOpen = false; render(); return; }
+  if (target.closest?.("[data-palette]")) { event.preventDefault(); state.paletteOpen = true; state.paletteQuery = ""; render(); return; }
+  if (target.closest?.("[data-palette-dismiss]") && target === target.closest("[data-palette-dismiss]")) { event.preventDefault(); state.paletteOpen = false; render(); return; }
+  if (target.closest?.("[data-org-menu]")) { event.preventDefault(); state.orgMenu = !state.orgMenu; render(); return; }
+  if (target.closest?.("[data-close-org]")) { state.orgMenu = false; render(); return; }
+  if (target.closest?.("[data-open-modal]")) { event.preventDefault(); openModal(target.closest("[data-open-modal]").getAttribute("data-open-modal")); return; }
+  if (target.closest?.("[data-close-modal]") || (target.closest?.("[data-modal-dismiss]") && target === target.closest("[data-modal-dismiss]"))) { event.preventDefault(); state.modal = null; state.modalError = null; render(); return; }
+  if (target.closest?.("[data-dismiss-update]")) { state.updateNotice = ""; render(); return; }
+  if (target.closest?.("[data-clear-filters]")) { event.preventDefault(); ["q", "group", "stage", "risk"].forEach((key) => setQueryValue(key, "")); return; }
+  if (target.closest?.("[data-clear-filter]")) { event.preventDefault(); setQueryValue(target.closest("[data-clear-filter]").getAttribute("data-clear-filter"), ""); return; }
+  if (target.closest?.("[data-set-filter]")) { event.preventDefault(); const [key, value] = target.closest("[data-set-filter]").getAttribute("data-set-filter").split(":"); setQueryValue(key, value); return; }
+  if (target.closest?.("[data-toggle-more]")) { const details = document.querySelector(".tb-more-routes"); if (details) details.open = !details.open; return; }
+  if (target.closest?.("[data-retry]")) { event.preventDefault(); void loadRoute(); return; }
+  if (target.closest?.("[data-close-panel]")) { event.preventDefault(); navigate(routeInfo().parentPath); return; }
+  const workAction = target.closest?.("[data-work-action]"); if (workAction && !workAction.disabled) { event.preventDefault(); void runWorkAction(workAction.getAttribute("data-work-id"), workAction.getAttribute("data-work-action")); return; }
+  const command = target.closest?.("[data-command-href]"); if (command) { const href = command.getAttribute("data-command-href"); if (href.startsWith("#modal:")) { event.preventDefault(); state.paletteOpen = false; openModal(href.slice(7)); return; } }
+  const link = target.closest?.("a"); if (!link || link.target === "_blank") return; const url = new URL(link.href, window.location.origin); if (url.origin !== window.location.origin || url.pathname.startsWith("/auth/")) return; event.preventDefault(); navigate(`${url.pathname}${url.search}`);
 });
 
-document.addEventListener("input", (event) => {
-  const target = event.target;
-  if (target.matches("[data-filter]")) handleFilterInput(target);
-  if (target.matches("[data-settings-search]")) applySettingsSearch(target.value);
-  if (target.matches("[data-palette-search]")) {
-    const query = target.value.toLowerCase().trim();
-    document.querySelectorAll("[data-palette-item]").forEach((item) => {
-      item.hidden = Boolean(query) && !(item.dataset.search ?? "").includes(query);
-    });
-  }
-});
-
-document.addEventListener("keydown", (event) => {
-  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
-    event.preventDefault();
-    state.paletteOpen = true;
-    renderCurrent();
-    return;
-  }
-  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "b") {
-    event.preventDefault();
-    if (window.matchMedia("(max-width: 767px)").matches) {
-      state.mobileNav = !state.mobileNav;
-    } else {
-      state.sidebarOpen = !state.sidebarOpen;
-    }
-    renderCurrent();
-    return;
-  }
-  if (event.key === "Escape") {
-    if (state.paletteOpen || state.accountMenu || state.orgMenu || state.selectedFindingId || state.mobileNav || !state.sidebarOpen) {
-      state.paletteOpen = false;
-      state.accountMenu = false;
-      state.orgMenu = false;
-      state.selectedFindingId = null;
-      state.mobileNav = false;
-      state.sidebarOpen = true;
-      renderCurrent();
-    }
-  }
-});
-
-window.addEventListener("popstate", () => void navigate());
-void navigate();
+document.addEventListener("submit", (event) => { const form = event.target.closest?.("form[data-steer], form[data-modal-form]"); if (!form) return; event.preventDefault(); if (form.matches("[data-steer]")) { const id = form.getAttribute("data-steer"); const note = form.querySelector("textarea")?.value || ""; if (!note.trim()) return; void api(`/work-orders/${encodeURIComponent(id)}/steer`, "POST", { note }).then(() => refreshRoute()).catch((error) => { state.actionError = error; render(); }); } else void submitModal(form, form.getAttribute("data-modal-form")); });
+document.addEventListener("input", (event) => { if (event.target.matches?.("[data-palette-input]")) { state.paletteQuery = event.target.value; render(); setTimeout(() => document.querySelector("[data-palette-input]")?.focus(), 0); return; } if (event.target.matches?.("[data-global-search]")) { void searchGlobal(event.target.value); return; } if (event.target.matches?.("[data-work-filter]")) { const key = event.target.getAttribute("data-work-filter"); if (state.filterTimer) clearTimeout(state.filterTimer); state.filterTimer = setTimeout(() => setQueryValue(key, event.target.value.trim()), 220); } });
+document.addEventListener("keydown", (event) => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); state.paletteOpen = !state.paletteOpen; render(); return; } if (event.key === "Escape") { if (state.modal) { state.modal = null; render(); return; } if (state.paletteOpen) { state.paletteOpen = false; render(); return; } const route = routeInfo(); if (route.entityId) { event.preventDefault(); navigate(route.parentPath); } } if (event.key === "Enter" && event.target.matches?.("[data-row-id]")) { const row = event.target; const route = routeInfo(); if (route.kind === "factory") { event.preventDefault(); navigate(factoryHref(route.factoryId, route.area, row.getAttribute("data-row-id"))); } } });
+window.addEventListener("popstate", () => { render(); void loadRoute(); });
+setInterval(() => { if (signedIn() && !state.modal) void refreshRoute(true); }, 30_000);
+void boot();

@@ -1,0 +1,72 @@
+version: 1
+name: tinkerbot-self
+alias: tinkerbot
+description: Processes Tinkerbot work onto production lines. tb check is the verdict; humans merge.
+repositories:
+  - josiah1203/tinkerbot
+sources:
+  - type: github_pull_request
+  - type: github_issue
+  - type: github_dependabot
+  - type: github_code_scanning
+  - type: github_secret_scanning
+  - type: manual
+  - type: mcp
+  - type: slack
+  - type: linear
+  - type: jira
+  - type: incident
+  - type: support
+  - type: roadmap
+  - type: scheduled
+agents:
+  - id: foreman
+    provider: workers-ai
+    model: "@cf/openai/gpt-oss-120b"
+    harness: default
+  - id: triage
+    provider: workers-ai
+    model: "@cf/zhipuai/glm-4.7-flash"
+    harness: default
+  - id: specification
+    provider: workers-ai
+    model: "@cf/openai/gpt-oss-120b"
+    harness: default
+  - id: implement
+    provider: workers-ai
+    model: "@cf/zhipuai/glm-5.2"
+    harness: tinkerbot-sandbox
+  - id: review
+    provider: workers-ai
+    model: "@cf/openai/gpt-oss-120b"
+    harness: default
+  - id: security
+    provider: workers-ai
+    model: "@cf/openai/gpt-oss-120b"
+    harness: default
+  - id: release
+    provider: workers-ai
+    model: "@cf/openai/gpt-oss-120b"
+    harness: default
+runner:
+  type: github_actions
+  workflow: tinkerbot.yml
+  image: cloudflare/sandbox:next
+permissions:
+  - contents:read
+  - checks:write
+  - pull_requests:write
+secretRefs:
+  - env:GITHUB_APP_PRIVATE_KEY
+timeouts:
+  stageSeconds: 900
+  runSeconds: 3600
+budgets:
+  tokens: 100000
+  usdCents: 500
+approvals:
+  required: true
+  roles:
+    - maintainer
+    - admin
+    - owner

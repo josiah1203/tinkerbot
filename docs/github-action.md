@@ -1,11 +1,23 @@
 # Tinkerbot Verify GitHub Action
 
-The Action runs in the customer’s runner and uses the local `tb`/`tinkerbot` engine. It emits a local report, Markdown summary, SARIF when enabled, a verification receipt, a versioned `evidence-contract.json`, workflow annotations, a step summary, and best-effort native `Tinkerbot Verify` Check Run/sticky comment output. The example workflow uploads only source-minimized assurance artifacts by default; the full local report remains available in the workspace.
+The Action runs `tb check` on the customer runner and submits a source-minimized assurance bundle. That verification cell is the quality laboratory for every production line. The GitHub App is the authoritative Check Run and inline-comment publisher. Action-side `GITHUB_TOKEN` publication is a fork/degraded fallback only.
 
-Inputs include `base`, `head`, `config`, `mode`, `fail-on`, `mutation-enabled`, `mutation-max`, `policy`, `timeout`, `max-files`, `max-findings`, `comment`, `check-run`, and `sarif`. `control-plane-url` and `session-token` optionally submit the source-minimized assurance bundle to the hosted control plane; a missing or invalid pair skips submission rather than leaking a token. Outputs expose the local report, SARIF, receipt, review context, evidence contract, and assurance-bundle paths. The published Action reference is intentionally a placeholder until the actual repository owner/name is selected.
+## OIDC
 
-Use `pull_request` with least-privilege permissions and `persist-credentials: false` on checkout. Do not change the example to `pull_request_target`: that event can expose privileged secrets while executing contributor-controlled code. Fork PRs are explicitly write-disabled; they retain local artifacts, deterministic workflow annotations, and the step summary while safely degrading when Check Run/comment permissions are unavailable.
+Hosted admission is signature-verified and fail-closed. Unsigned JWT helpers (`e30.*.sig`) are rejected.
 
-The canonical Check Run name is `Tinkerbot Verify`. Existing `PR Proof` Check Runs are discovered for compatibility and updated in place when possible. The sticky comment uses `<!-- tinkerbot:verify -->`; the legacy `<!-- pr-proof:sticky -->` marker is also recognized, so repeated pushes update one comment instead of creating duplicate reports. Inline annotations are deterministic, path-normalized, line-bound, sorted by stable finding identity, and capped at 50.
+1. Workflow `permissions: id-token: write`
+2. Action requests a GitHub OIDC token with audience `tinkerbot` (GitLab CI is supported only for the explicitly allowlisted public `https://gitlab.com` issuer)
+3. `POST /actions/oidc/exchange` verifies RS256 against the issuer JWKS (`https://token.actions.githubusercontent.com/.well-known/jwks` or the fixed GitLab.com JWKS), then `exp` / `nbf` / `iat`, `iss`, `aud`, `repository`, optional `sha`, and consumes `jti` (or a token fingerprint) against replay. Self-managed GitLab issuers require a separately reviewed allowlist/adapter; arbitrary issuer hostnames are rejected.
+4. Exchange fails closed when the repository has no GitHub App installation
+5. Worker returns a short-lived run token
+6. Action `POST /assurance/ingest` with that token
+7. App publishes Check Run + inline comments, deduped by `runId + fingerprint + commitSha`
 
-GitHub App installations use [`github-app/manifest.json`](../github-app/manifest.json) as a template. App webhooks must verify signatures and delivery IDs; the App is never an execution environment for untrusted pull-request code. The customer runner remains the only verification execution boundary.
+`session-token` remains a deprecated developer fallback. Fork PRs stay write-disabled. Use `pull_request` only, never `pull_request_target`. Unauthorized publication leaves local artifacts and an explicit UNKNOWN.
+
+## Packaging
+
+`action/index.js` requires compiled `dist/action/index.js`. Root `dist/` is gitignored. GitHub Action **release tags** must include the built `dist/` tree (`pnpm build` on the tag machine, then publish that artifact). A source-only checkout cannot run the Action.
+
+App permissions: `metadata: read`, `contents: read`, `pull_requests: write`, `issues: write`, `checks: write`. Webhook URL: `/integrations/github/webhook`.

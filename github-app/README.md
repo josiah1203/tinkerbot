@@ -1,7 +1,9 @@
-# Tinkerbot Verify GitHub App template
+# Deprecated GitHub App template
 
-This manifest is a release-owner template. Replace the `example.invalid` URLs with the approved production HTTPS control-plane callback and webhook URLs before creating the App. The placeholder is deliberately non-deployable; do not register it with GitHub.
+This directory is retained only for historical installations and migration reference. It is not a Tinkerbot product surface and is not required to use Tinkerbot. New integrations use the provider-neutral `@tinkerbot` command/event protocol and map GitHub records to canonical Factory Graph objects through external references. Prefer the customer-owned GitHub Action or another least-privilege connector.
 
-The App is an assurance publisher only. Verification runs in the customer-owned GitHub Actions runner through the `Tinkerbot Verify` Action. The App must not check out, execute, or interpret pull-request code on its own server. Webhook handlers must verify `X-Hub-Signature-256`, deduplicate `X-GitHub-Delivery`, redact secrets, and fail closed when installation or repository permissions are unavailable.
+[`manifest.json`](./manifest.json) points at `https://control.tinkerbot.dev`. Replace those URLs with the approved production control-plane host before creating the App.
 
-The App requests metadata read, pull-request read, and only the write capabilities needed for one Check Run, bounded annotations, and one sticky PR comment. It does not request repository contents or Actions access. GitHub remains authoritative for reviews, discussions, approvals, branch protection, merge controls, and audit history.
+The App publishes Check Runs, bounded annotations, and inline review comments. Verification runs on the customer GitHub Actions runner. The App must not check out or execute pull-request code. Webhook handlers verify `X-Hub-Signature-256`, deduplicate deliveries, and stop writes when the installation is suspended or deleted.
+
+Permissions: `metadata: read`, `contents: read`, `pull_requests: write`, `issues: write`, `checks: write`. Events: `issues`, `pull_request`, `installation`, `installation_repositories`. Webhook path: `/integrations/github/webhook`.

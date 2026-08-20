@@ -1,0 +1,55 @@
+name: Tinkerbot
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: tinkerbot-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test -- --reporter=default --reporter=json --outputFile=vitest-results.json
+      - if: always()
+        run: node scripts/report-vitest-failures.mjs vitest-results.json
+      - uses: ./
+        with:
+          base: ${{ github.event.pull_request.base.sha || github.sha }}
+          head: ${{ github.event.pull_request.head.sha || github.sha }}
+          control-plane-url: ${{ vars.TINKERBOT_CONTROL_PLANE_URL }}
+      - if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: tinkerbot-verify-${{ matrix.os }}
+          if-no-files-found: ignore
+          path: |
+            .pr-proof/report.md
+            .pr-proof/report.sarif
+            .pr-proof/receipt.json
+            .pr-proof/review-context.json
+            .pr-proof/evidence-contract.json
+            vitest-results.json
