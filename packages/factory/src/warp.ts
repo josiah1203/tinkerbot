@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { buildFactoryStarter } from "./starter";
+import { createWorkerEnvelope } from "./authority";
 
 type FactoryStageId = "foreman" | "triage" | "specification" | "architecture" | "implementation" | "review" | "verification" | "release" | "test" | "security" | "outcome";
 type WorkOrderState = "intake" | "triage" | "specification" | "implementation" | "review" | "verification" | "approval" | "ready" | "merged" | "released" | "blocked" | "failed" | "cancelled" | "unknown";
@@ -401,6 +402,19 @@ export async function handleFactoryMcpTool(name: string, args: Record<string, un
     result: {
       workOrder: task.workOrder,
       git: startWorking ? task.git ?? { branch: implementBranchName(workOrderId), commands: [`git fetch origin`, `git worktree add ../${implementBranchName(workOrderId)} origin/${implementBranchName(workOrderId)}`] } : undefined,
+      workerEnvelope: startWorking ? createWorkerEnvelope({
+        workOrderId,
+        cellLeaseId: `cell_${workOrderId.slice(0, 8)}`,
+        workerId: "customer-optional",
+        role: "implementer",
+        instructionVersion: "1",
+        allowedTools: ["git", "test"],
+        inputArtifactRefs: [],
+        artifactManifest: [],
+        evidenceRefs: [],
+        cellReturnStatus: "held",
+      }) : undefined,
+      verificationVerdictForbidden: true,
     },
   };
 }

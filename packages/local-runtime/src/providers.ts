@@ -100,7 +100,10 @@ export function selectInferenceProvider(input: {
   if (!liveRequested) return stubInferenceProvider();
   if (input.mode === "local" || input.provider === "ollama") return ollamaProvider(undefined, input.fetchImpl);
   if (input.provider === "anthropic") return anthropicProvider(input.credentialRef ?? "env:ANTHROPIC_API_KEY", env, input.fetchImpl);
-  if (input.provider === "openai") return openaiProvider(input.credentialRef ?? "env:OPENAI_API_KEY", undefined, env, input.fetchImpl);
+  const openAiBase = env.OPENROUTER_API_BASE ?? env.OPENAI_BASE_URL ?? (input.provider === "openrouter" ? "https://openrouter.ai/api/v1" : undefined);
+  if (input.provider === "openai" || input.provider === "openrouter") {
+    return openaiProvider(input.credentialRef ?? (input.provider === "openrouter" ? "env:OPENROUTER_API_KEY" : "env:OPENAI_API_KEY"), openAiBase, env, input.fetchImpl);
+  }
   if (env.TINKERBOT_STUB_INFERENCE === "0") throw new Error("Live inference was requested but no BYOK credentialRef resolved. Use env:VAR or keychain://…");
   return stubInferenceProvider();
 }

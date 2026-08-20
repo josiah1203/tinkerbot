@@ -165,7 +165,7 @@ export class D1FactoryStore {
   }
 
   async consumeOidcReplayKey(key: string, now: string): Promise<"ok" | "replay"> {
-    const result = await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_oidc_jti (jti, consumed_at) VALUES (?1, ?2)").bind(key, now).run();
+    const result = await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_oidc_jti (jti, consumed_at) VALUES (?1, ?2)").bind(key, now).run() as { meta?: { changes?: number } };
     return result.meta?.changes === 0 ? "replay" : "ok";
   }
 
@@ -355,6 +355,18 @@ export class D1FactoryStore {
 
   async insertOutcome(input: { outcomeId: string; workOrderId?: string; releaseId?: string; kind: string; association: string; now: string }): Promise<void> {
     await this.database.prepare("INSERT INTO tinkerbot_outcomes (outcome_id, work_order_id, release_id, kind, association, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(input.outcomeId, input.workOrderId ?? null, input.releaseId ?? null, input.kind, input.association, input.now).run();
+  }
+
+  async insertFactoryCommand(command: import("../../../packages/factory/src").FactoryCommand): Promise<void> {
+    await this.database.prepare("INSERT INTO tinkerbot_factory_commands (command_id, organization_id, source_system, source_object_id, actor_id, authorized, idempotency_key, work_order_id, action, confirmation_required, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(command_id) DO NOTHING").bind(
+      command.commandId, command.organizationId, command.sourceSystem, command.sourceObjectId, command.actorId, command.authorized ? 1 : 0, command.idempotencyKey, command.workOrderId ?? null, command.action, command.confirmationRequired ? 1 : 0, JSON.stringify(command), command.createdAt,
+    ).run();
+  }
+
+  async insertAftercare(record: import("../../../packages/factory/src").AftercareRecord): Promise<void> {
+    await this.database.prepare("INSERT INTO tinkerbot_aftercare (release_id, owner, environment, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(release_id) DO UPDATE SET payload_json = excluded.payload_json").bind(
+      record.releaseId, record.owner, record.environment, JSON.stringify(record), new Date().toISOString(),
+    ).run();
   }
 
   async putExecutionPlan(plan: import("../../../packages/factory/src/runtime").ExecutionPlan): Promise<void> {

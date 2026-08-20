@@ -8,6 +8,7 @@ export { detectAgents, resolveAgentBin, spawnSpec, AGENT_IDS } from "./agents";
 export { applyLeaderChord, applyMasterIntent, createMasterState, MASTER_HELP, parseMasterIntent, renderStatusBar, renderTabBody, renderTabStrip } from "./tabs";
 export { attachAgentPty } from "./pty";
 export { renderMasterChrome } from "./chrome";
+export { CLAUDE_CODE_KIT_PACKAGES, renderKitWorkstation, tuiRejectsTinkerMention, KIT_COMMANDS } from "./kit";
 export type { AgentId, DetectedAgent } from "./agents";
 
 export interface MasterTuiDeps {

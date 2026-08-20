@@ -4,6 +4,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import {
   calculateVerdict,
+  combineVerification,
   finalizeReport,
   FEATURE_CAPABILITIES,
   loadConfig,
@@ -64,7 +65,8 @@ import {
 import { runDoctor, renderDoctor } from "./doctor";
 import { clearStoredCredentials, hostedSession, saveStoredCredentials } from "./credentials";
 import { loadFactoryDefinition, validateAgentReceipt, buildFactoryStarter } from "../../factory/src";
-import { evalCli, executeLocalRun, factoryPlanPayload, localDashboardPayload } from "./runtime-cli";
+import { evalCli, evalCliAsync, executeLocalRun, factoryPlanPayload, localDashboardPayload } from "./runtime-cli";
+import { cellCheckPayload, factoryCheckPayload, factoryInitPayload, localWorkNewPayload, outcomeCheckPayload } from "./factory-os";
 import { createLocalDashboardServer, localDashboardUrl } from "./local-dashboard";
 import { formatCostTab, formatEvalTab, formatPlanTab } from "../../local-runtime/src";
 import { isInteractiveTty, runTui, TUI_HELP, type TuiDeps, type TuiOptions } from "./tui/index";
@@ -217,17 +219,17 @@ function parseArgs(argv: string[]): CliOptions {
   if (command === "change" && options.subcommand === "contract" && options.subcommand2 && !["validate", "assess"].includes(options.subcommand2)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown change contract command: ${options.subcommand2}`);
   if (command === "change-set" && options.subcommand && !["assess", "export"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown change-set command: ${options.subcommand}`);
   if (command === "release" && options.subcommand && !["assess", "manifest"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown release command: ${options.subcommand}`);
-  if (command === "outcome" && options.subcommand && !["record", "export"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown outcome command: ${options.subcommand}`);
+  if (command === "outcome" && options.subcommand && !["record", "export", "check"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown outcome command: ${options.subcommand}`);
   if (command === "evidence" && options.subcommand && !["export"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown evidence command: ${options.subcommand}`);
   if (command === "org" && options.subcommand && !["list", "switch", "seats"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown org command: ${options.subcommand}`);
   if (command === "org" && options.subcommand === "switch" && !options.positional) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, "org switch requires an organization identifier");
   if (command === "billing" && options.subcommand && !["summary", "catalog", "portal"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown billing command: ${options.subcommand}`);
   if (command === "github" && options.subcommand && options.subcommand !== "run") throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown github command: ${options.subcommand}`);
-  if (command === "factory" && options.subcommand && !["list", "show", "validate", "sync", "mcp", "new", "plan"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown factory command: ${options.subcommand}`);
-  if (command === "work" && options.subcommand && !["list", "show", "retry", "approve", "cancel", "take", "return"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown work command: ${options.subcommand}`);
+  if (command === "factory" && options.subcommand && !["list", "show", "validate", "sync", "mcp", "new", "plan", "init", "check"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown factory command: ${options.subcommand}`);
+  if (command === "work" && options.subcommand && !["list", "show", "retry", "approve", "cancel", "take", "return", "new"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown work command: ${options.subcommand}`);
   if (command === "run" && options.subcommand && !["show", "logs"].includes(options.subcommand) && !options.local) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown run command: ${options.subcommand}`);
   if (command === "eval" && options.subcommand && !["init", "add", "run", "compare", "baseline", "export"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown eval command: ${options.subcommand}`);
-  if (command === "cell" && options.subcommand && !["list", "show"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown cell command: ${options.subcommand}`);
+  if (command === "cell" && options.subcommand && !["list", "show", "check"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown cell command: ${options.subcommand}`);
   if (command === "product" && options.subcommand && !["list", "show"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown product command: ${options.subcommand}`);
   if (command === "skill" && options.subcommand && !["list", "show"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown skill command: ${options.subcommand}`);
   if (command === "evolution" && options.subcommand && !["list", "show", "approve"].includes(options.subcommand)) throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, `Unknown evolution command: ${options.subcommand}`);
@@ -447,7 +449,8 @@ export function createReport(run: RunOptions = {}): PrProofReport {
   const verdictConfig = (baseline?.newCount && config.baseline.fail_on_new) || policyRequestsBlocking || (policyApply.unknownHandling === "fail" && finalLimitations.length)
     ? { ...config, test_integrity: { ...config.test_integrity, mode: "blocking" as const } }
     : config;
-  const verdict = calculateVerdict(baselineFindings, verdictConfig, finalLimitations);
+  const combined = combineVerification({ findings: baselineFindings, config: verdictConfig, unknowns: finalLimitations });
+  const verdict = combined.verificationVerdict;
   return finalizeReport({ ...preliminary, verdict, findings: baselineFindings, testIntegrity: baselineTestIntegrity, impact: baselineImpact, fixtures: baselineFixtures, baseline, limitations: finalLimitations });
 }
 
@@ -462,9 +465,9 @@ function help(command?: string): string {
   if (command === "agents") return "Usage: tb agents\n\nList local agent CLIs on PATH. OAuth stays in the child CLI. Tinkerbot does not store vendor tokens.\n";
   if (command === "dashboard") return "Usage: tb dashboard [--local] [--port 4174]\n\nOpen the authenticated Tinkerbot dashboard, or serve a local SQLite adapter on 127.0.0.1 with --local (not `tb serve`).\n";
   if (command === "login") return "Usage: tb login --token SESSION [--url https://control.example]\n\nStore a short-lived control-plane session. Browser login opens the public website.\n";
-  if (command === "factory") return "Usage: tb factory list|show|validate|sync|mcp|new|plan\n\n`tb factory new` writes a local .tinkerbot starter tree. `tb factory plan` prints a dry-run ExecutionPlan. Then `tb factory sync` for hosted upload.\n";
-  if (command === "work") return "Usage: tb work list|show|retry|approve|cancel|take|return [id]\n";
-  if (command === "cell") return "Usage: tb cell list\n";
+  if (command === "factory") return "Usage: tb factory list|show|validate|check|sync|mcp|new|init|plan\n\n`tb factory init` inspects the repo and writes a conservative .tinkerbot tree (no LLM). `tb factory check` compiles an immutable FactoryPlan. `tb factory validate` parses only.\n";
+  if (command === "work") return "Usage: tb work list|show|new|retry|approve|cancel|take|return [id]\n\n`tb work new` creates a local WorkOrder without an LLM.\n";
+  if (command === "cell") return "Usage: tb cell list|show|check\n\n`tb cell check` reproduces lease/branch/credential scope. It is not tb check.\n";
   if (command === "product") return "Usage: tb product list|show [id]\n";
   if (command === "skill") return "Usage: tb skill list|show [id]\n";
   if (command === "evolution") return "Usage: tb evolution list|show|approve [id]\n";
@@ -478,7 +481,7 @@ function help(command?: string): string {
   if (["proof", "repo", "change", "change-set", "release", "outcome", "evidence"].includes(command ?? "")) return `Usage: tb ${command} ...\n\nAssurance commands emit machine-readable JSON with --format json.\n`;
   if (["check", "test-integrity", "impact", "contracts", "fixtures", "select-tests"].includes(command ?? "")) return `Usage: tb ${command} [options]\n\nOptions:\n  --base REF              base revision\n  --head REF              head revision (default: HEAD)\n  --format FORMAT         terminal, json, markdown, or sarif\n  --output FILE           write rendered output\n  --config FILE           configuration path\n  --policy PACK           policy pack\n  --mode MODE             advisory or blocking\n  --fail-on RULES         comma-separated impact rules\n  --timeout SECONDS       analysis timeout\n  --max-files N           bound files analyzed\n  --max-findings N        bound findings emitted\n  --mutation-enabled BOOL enable/disable mutation testing\n  --mutation-max N        maximum mutants\n  --no-base-tests         skip base/head execution\n  --verbose               include additional diagnostics\n`;
   if (command === "artifacts") return "Usage: tb artifacts --input FILE [--type TYPE] [--format json|terminal]\n";
-  return `Tinkerbot — factory operating system and deterministic verification\n\nCommands:\n  tb --version\n  tb login --token SESSION\n  tb tui\n  tb dashboard [--local]\n  tb factory validate|list|show|sync|mcp|new|plan
+  return `Tinkerbot — factory operating system and deterministic verification\n\nCommands:\n  tb --version\n  tb login --token SESSION\n  tb tui\n  tb dashboard [--local]\n  tb factory validate|check|list|show|sync|mcp|new|init|plan
   tb run --local [--profile solo]\n  tb eval init|add|run|compare|baseline|export\n  tb agents\n  tb work list|show|take|return|approve\n  tb cell list\n  tb product list\n  tb skill list\n  tb evolution list|approve\n  tb run show <id>\n  tb check --base origin/main --head HEAD\n  tb doctor\n`;
 }
 
@@ -908,12 +911,45 @@ export function runCli(argv = process.argv.slice(2)): number {
     if (options.command === "tui") return tuiCommand(options);
     if (options.command === "login") return loginCommand(options);
     if (options.command === "factory" && options.subcommand === "validate") return factoryValidateCommand();
+    if (options.command === "factory" && options.subcommand === "check") {
+      try {
+        process.stdout.write(`${JSON.stringify(factoryCheckPayload(getRepoRoot(process.cwd())), null, 2)}\n`);
+        return EXIT_CODES.PASS;
+      } catch (error) {
+        throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (options.command === "factory" && options.subcommand === "init") {
+      try {
+        process.stdout.write(`${JSON.stringify(factoryInitPayload(getRepoRoot(process.cwd()), options.positional), null, 2)}\n`);
+        return EXIT_CODES.PASS;
+      } catch (error) {
+        throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error));
+      }
+    }
     if (options.command === "factory" && options.subcommand === "plan") {
       process.stdout.write(`${JSON.stringify(factoryPlanPayload(getRepoRoot(process.cwd()), options.profile, options.positional), null, 2)}\n`);
       return EXIT_CODES.PASS;
     }
     if (options.command === "factory" && options.subcommand === "mcp") return factoryMcpCommand();
     if (options.command === "factory" && options.subcommand === "new") return factoryNewCommand(options);
+    if (options.command === "work" && options.subcommand === "new") {
+      try {
+        process.stdout.write(`${JSON.stringify(localWorkNewPayload(getRepoRoot(process.cwd()), options.positional), null, 2)}\n`);
+        return EXIT_CODES.PASS;
+      } catch (error) {
+        throw new CliFailure(EXIT_CODES.CONFIGURATION_ERROR, error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (options.command === "cell" && options.subcommand === "check") {
+      const root = getRepoRoot(process.cwd());
+      process.stdout.write(`${JSON.stringify(cellCheckPayload({ repository: options.repository ?? path.basename(root), branch: options.head === "HEAD" ? "tinkerbot/local" : options.head }), null, 2)}\n`);
+      return EXIT_CODES.PASS;
+    }
+    if (options.command === "outcome" && options.subcommand === "check") {
+      process.stdout.write(`${JSON.stringify(outcomeCheckPayload(options.positional ?? "pending"), null, 2)}\n`);
+      return EXIT_CODES.PASS;
+    }
     if (options.command === "eval") {
       process.stdout.write(`${JSON.stringify(evalCli(getRepoRoot(process.cwd()), options.subcommand ?? "run", options.positional), null, 2)}\n`);
       return EXIT_CODES.PASS;
@@ -1190,7 +1226,7 @@ async function hostedRequest(pathname: string, method = "GET", payload?: Record<
 async function runHostedCli(argv: string[]): Promise<number | undefined> {
   const command = argv[0];
   if (!command) return undefined;
-    if (command === "factory" && argv[1] && argv[1] !== "validate" && argv[1] !== "mcp" && argv[1] !== "new" && argv[1] !== "plan") {
+    if (command === "factory" && argv[1] && argv[1] !== "validate" && argv[1] !== "mcp" && argv[1] !== "new" && argv[1] !== "plan" && argv[1] !== "init" && argv[1] !== "check") {
     const subcommand = argv[1];
     const id = argv[2];
     const pathname = subcommand === "list" || !id ? "/factories" : `/factories/${id}`;
@@ -1207,8 +1243,9 @@ async function runHostedCli(argv: string[]): Promise<number | undefined> {
     process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
     return EXIT_CODES.PASS;
   }
-  if (command === "work") {
+    if (command === "work") {
     const subcommand = argv[1] ?? "list";
+    if (subcommand === "new") return undefined;
     const id = argv[2];
     const method = ["retry", "approve", "cancel", "take", "return"].includes(subcommand) ? "POST" : "GET";
     const pathname = !id && subcommand === "list" ? "/work-orders" : id ? `/work-orders/${id}${method === "POST" ? `/${subcommand}` : ""}` : `/work-orders/${subcommand}`;
@@ -1220,8 +1257,9 @@ async function runHostedCli(argv: string[]): Promise<number | undefined> {
     process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
     return EXIT_CODES.PASS;
   }
-  if (command === "cell" || command === "product" || command === "skill" || command === "evolution") {
+    if (command === "cell" || command === "product" || command === "skill" || command === "evolution") {
     const subcommand = argv[1] ?? "list";
+    if (command === "cell" && subcommand === "check") return undefined;
     const id = argv[2];
     const collection = command === "cell" ? "cells" : command === "product" ? "products" : command === "skill" ? "skills" : "evolution";
     const method = command === "evolution" && subcommand === "approve" ? "POST" : "GET";
@@ -1330,6 +1368,10 @@ export async function mainAsync(argv = process.argv.slice(2)): Promise<number> {
         postSync,
       });
       process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+      return EXIT_CODES.PASS;
+    }
+    if (argv[0] === "eval" && (argv[1] === "run" || argv[1] === undefined)) {
+      process.stdout.write(`${JSON.stringify(await evalCliAsync(getRepoRoot(process.cwd()), "run", parseArgs(argv).positional), null, 2)}\n`);
       return EXIT_CODES.PASS;
     }
     if (argv[0] === "tui") {

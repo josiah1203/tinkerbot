@@ -10,3 +10,4 @@
 - [0006 BYOK credential boundary](./0006-byok-credential-boundary.md)
 - [0007 Adaptive pipeline and inline self-review](./0007-adaptive-pipeline-inline-self-review.md)
 - [0008 Portable personal evals](./0008-portable-evals.md)
+- [0009 Factory authority planes](./0009-factory-authority-planes.md)

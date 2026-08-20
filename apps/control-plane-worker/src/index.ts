@@ -24,7 +24,7 @@ import { admitWebhook, githubEventKind, githubInstallationAccount, inlineReviewC
 import { admitGitlabWebhook } from "../../../packages/gitlab/src";
 import { D1FactoryStore } from "./factory-store";
 import { ForemanDurableObject, Sandbox, handleFactoryMcpRequest, intakeFromIntegration, runFactoryTurn, classifyWorkOrderGroup, githubSecurityIntake, sweepFactoryOs } from "./factory-runtime";
-import { createWorkOrder, verifyOidcJwt, oidcReplayKey, containsRawCredentials, customerProviderLabel } from "../../../packages/factory/src";
+import { createWorkOrder, verifyOidcJwt, oidcReplayKey, containsRawCredentials, customerProviderLabel, dispatchTinkerGateway, githubTinkerMention } from "../../../packages/factory/src";
 import { createChangeSet, assessChangeSet, assessReleaseSafety, createReleaseManifest } from "../../../packages/assurance/src";
 import { calculateEntitlements, type EntitlementKey } from "../../../packages/control-plane/src";
 import {
@@ -942,6 +942,25 @@ export default {
         if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
         return handleFactoryMcpRequest(request, env, access.current.session.user.id, access.membership.organizationId);
       }
+      if (url.pathname === "/tinker/commands" && request.method === "POST") {
+        const store = sessionStore(env, config);
+        if (!store || !env.DB) return json({ error: "The @tinker gateway requires a hosted session.", code: "session_store_not_configured" }, 501);
+        const access = await authorizeTenantSession(await currentSession(request, store, env), new D1TenantStore(env.DB), "factory:write");
+        if (!access.ok) return json({ error: access.error, code: access.code }, access.status);
+        const body = await jsonBody(request) ?? {};
+        const sourceSystem = body.sourceSystem === "github" || body.sourceSystem === "slack" || body.sourceSystem === "jira" || body.sourceSystem === "linear" || body.sourceSystem === "manual" ? body.sourceSystem : "manual";
+        const result = dispatchTinkerGateway({
+          text: typeof body.text === "string" ? body.text : "",
+          organizationId: access.membership.organizationId,
+          sourceSystem,
+          sourceObjectId: typeof body.sourceObjectId === "string" ? body.sourceObjectId : crypto.randomUUID(),
+          actorId: access.current.session.user.id,
+          authorized: true,
+          workOrderId: typeof body.workOrderId === "string" ? body.workOrderId : undefined,
+        });
+        await new D1FactoryStore(env.DB).insertFactoryCommand(result.command);
+        return json({ ...result, projection: "WorkOrder traveler. Not a verification verdict." });
+      }
       if ((url.pathname === "/integrations/slack/webhook" || url.pathname === "/integrations/linear/webhook" || url.pathname === "/integrations/jira/webhook" || url.pathname === "/integrations/incident/webhook" || url.pathname === "/integrations/support/webhook") && request.method === "POST") {
         const body = await jsonBody(request) ?? {};
         if (url.pathname.includes("slack") && body.type === "url_verification") return json({ challenge: body.challenge });
@@ -1245,6 +1264,19 @@ export default {
             const message: Parameters<typeof handleFactoryQueueMessage>[1] = { deliveryId: admission.idempotencyKey, installationId: persisted.installationId, repository: persisted.repository, sourceType: security.sourceType, sourceId: security.sourceId, issueOrPullRequest: security.title, actor: "github-webhook" };
             if (env.FACTORY_EVENTS) await env.FACTORY_EVENTS.send(message);
             else await handleFactoryQueueMessage(env, message);
+          }
+          const mention = githubTinkerMention(eventName ?? "", admission.payload as Record<string, unknown>);
+          if (mention) {
+            const dispatched = dispatchTinkerGateway({
+              text: mention,
+              organizationId: "github",
+              sourceSystem: "github",
+              sourceObjectId: admission.idempotencyKey,
+              actorId: "github-webhook",
+              authorized: true,
+            });
+            await new D1FactoryStore(env.DB).insertFactoryCommand(dispatched.command);
+            await new D1JsonMetadataStore(env.DB).put(`tinker:${admission.idempotencyKey}`, dispatched);
           }
           return json({ received: true, duplicate: false });
         } catch (error) {

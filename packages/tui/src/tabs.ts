@@ -123,6 +123,9 @@ export function parseMasterIntent(line: string): MasterIntent {
   }
   if (/^(check|verify)$/i.test(trimmed)) return { type: "check" };
   if (/^(exit|quit)$/i.test(trimmed)) return { type: "exit" };
+  if (/^@tinker\b/i.test(trimmed)) {
+    return { type: "reject", command: trimmed, reason: "@tinker is the GitHub/Slack/Jira/Linear handle, not this terminal. Use /check or /help." };
+  }
   return { type: "reject", command: trimmed, reason: "Master session. Try /check, /claude, or /help. Nested agents are tabs, not this prompt." };
 }
 

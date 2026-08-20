@@ -15,8 +15,8 @@ import {
   mergeRuntimeProfile,
 } from "../packages/factory/src";
 import { publicCapabilities } from "../packages/control-plane/src/entitlements";
-import { anthropicProvider, assertNoSecretInPayload, LOCAL_DB_SCHEMA_VERSION, replayOutbox, resolveCredentialRef, runLocalFactory, selectLocalSandbox, SQLITE_MAGIC, SqliteFactoryStore, stubInferenceProvider, stubSandboxPort } from "../packages/local-runtime/src";
-import { evalCli, factoryPlanPayload } from "../packages/cli/src/runtime-cli";
+import { anthropicProvider, assertNoSecretInPayload, LOCAL_DB_SCHEMA_VERSION, replayOutbox, resolveCredentialRef, runLocalFactory, selectInferenceProvider, selectLocalSandbox, SQLITE_MAGIC, SqliteFactoryStore, stubInferenceProvider, stubSandboxPort } from "../packages/local-runtime/src";
+import { evalCli, evalCliAsync, factoryPlanPayload } from "../packages/cli/src/runtime-cli";
 import { localDashboardApi } from "../packages/cli/src/local-dashboard";
 import fs from "node:fs";
 import os from "node:os";
@@ -100,7 +100,7 @@ describe("local runtime", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tb-migrate-"));
     const db = path.join(dir, "local.db");
     fs.writeFileSync(db, `${JSON.stringify({
-      schemaVersion: 13,
+      schemaVersion: 14,
       orders: [],
       runs: [],
       stages: [],
@@ -149,6 +149,18 @@ describe("local runtime", () => {
     expect(session?.body).toMatchObject({ organizationId: "local", local: true });
     const runtime = localDashboardApi(store, new URL("http://127.0.0.1/local/runtime"), "GET");
     expect(runtime?.body).toMatchObject({ billing: "seats_only", upgradesVerdict: false });
+    const exceptions = localDashboardApi(store, new URL("http://127.0.0.1/exceptions"), "GET");
+    expect(exceptions?.body).toMatchObject({ kanban: false, attentionFirst: true });
+  });
+
+  test("OpenRouter is an OpenAI-compatible customer baseUrl", () => {
+    const provider = selectInferenceProvider({
+      mode: "byok",
+      provider: "openrouter",
+      credentialRef: "env:OPENROUTER_API_KEY",
+      env: { OPENROUTER_API_KEY: "sk-or-test", TINKERBOT_STUB_INFERENCE: "0" },
+    });
+    expect(provider.id).toBe("openai");
   });
 
   test("evals stay advisory", () => {
@@ -185,5 +197,15 @@ describe("cli helpers", () => {
     const result = evalCli(dir, "init");
     expect(result.initialized).toBe(true);
     expect(fs.existsSync(path.join(dir, ".tinkerbot/evals/personal-suite.yaml"))).toBe(true);
+  });
+
+  test("eval run stays advisory even with a customer provider path", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tb-eval-run-"));
+    fs.mkdirSync(path.join(dir, ".git"));
+    evalCli(dir, "init");
+    evalCli(dir, "add", "hello");
+    const payload = await evalCliAsync(dir, "run");
+    expect(payload.upgradesVerdict).toBe(false);
+    expect(payload.customerProvider).toBe(true);
   });
 });

@@ -51,12 +51,14 @@ const previousCwd = process.cwd();
 const previousCredential = process.env.TINKERBOT_CREDENTIAL_FILE;
 const previousUrl = process.env.TINKERBOT_CONTROL_PLANE_URL;
 const previousToken = process.env.TINKERBOT_SESSION_TOKEN;
+const previousLocalDb = process.env.TINKERBOT_LOCAL_DB;
 
 afterEach(() => {
   process.chdir(previousCwd);
   if (previousCredential === undefined) delete process.env.TINKERBOT_CREDENTIAL_FILE; else process.env.TINKERBOT_CREDENTIAL_FILE = previousCredential;
   if (previousUrl === undefined) delete process.env.TINKERBOT_CONTROL_PLANE_URL; else process.env.TINKERBOT_CONTROL_PLANE_URL = previousUrl;
   if (previousToken === undefined) delete process.env.TINKERBOT_SESSION_TOKEN; else process.env.TINKERBOT_SESSION_TOKEN = previousToken;
+  if (previousLocalDb === undefined) delete process.env.TINKERBOT_LOCAL_DB; else process.env.TINKERBOT_LOCAL_DB = previousLocalDb;
 });
 
 function factoryRepo(): string {
@@ -260,4 +262,32 @@ test("tb factory new writes a local starter and refuses to overwrite", () => {
   expect(created.stdout).toContain(".tinkerbot/factory.yaml");
   expect(fs.readFileSync(path.join(root, ".tinkerbot/factory.yaml"), "utf8")).toContain("name: payments");
   expect(capture(() => runCli(["factory", "new"])).code).toBe(3);
+});
+
+test("tb factory init, factory check, work new, and cell check do not require AI", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tinkerbot-factory-init-"));
+  git(root, ["init", "-q"]);
+  git(root, ["config", "user.email", "dev@example.test"]);
+  git(root, ["config", "user.name", "Dev"]);
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "demo", scripts: { test: "vitest" } }));
+  git(root, ["add", "."]);
+  git(root, ["commit", "-qm", "seed"]);
+  process.chdir(root);
+  process.env.TINKERBOT_LOCAL_DB = path.join(root, "state.sqlite");
+  const initialized = capture(() => runCli(["factory", "init", "demo-factory"]));
+  expect(initialized.code).toBe(0);
+  expect(initialized.stdout).toContain('"requiresAi": false');
+  expect(fs.existsSync(path.join(root, ".tinkerbot", "lines", "maintenance.yaml"))).toBe(true);
+  expect(capture(() => runCli(["factory", "init"])).code).toBe(3);
+  const checked = capture(() => runCli(["factory", "check"]));
+  expect(checked.code).toBe(0);
+  expect(checked.stdout).toContain('"compiled": true');
+  const work = capture(() => runCli(["work", "new", "fix flaky test"]));
+  expect(work.code).toBe(0);
+  expect(work.stdout).toContain('"requiresAi": false');
+  expect(work.stdout).toContain('"verificationVerdict": "UNKNOWN"');
+  const cell = capture(() => runCli(["cell", "check"]));
+  expect(cell.code).toBe(0);
+  expect(cell.stdout).toContain('"inspection": "cell"');
+  expect(capture(() => runCli(["outcome", "check", "pending"])).stdout).toContain('"upgradesVerdict": false');
 });

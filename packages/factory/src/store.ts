@@ -1,3 +1,4 @@
+import type { AftercareRecord, FactoryCommand } from "./authority";
 import type { WorkOrder, WorkOrderEvent, WorkOrderState } from "./index";
 import type { CostEstimate, ExecutionPlan, ProviderUsage } from "./runtime";
 import type { EvalAttempt, EvalSuite } from "./evals";
@@ -65,6 +66,8 @@ export class MemoryFactoryStore implements FactoryStore {
   readonly suites = new Map<string, EvalSuite>();
   readonly attempts: EvalAttempt[] = [];
   readonly outbox: OutboxEvent[] = [];
+  readonly commands: FactoryCommand[] = [];
+  readonly aftercare: AftercareRecord[] = [];
 
   async insertWorkOrder(order: WorkOrder): Promise<void> {
     this.orders.set(order.workOrderId, order);
@@ -174,5 +177,13 @@ export class MemoryFactoryStore implements FactoryStore {
   async markOutboxSynced(eventId: string, now: string): Promise<void> {
     const event = this.outbox.find((item) => item.eventId === eventId);
     if (event) event.syncedAt = now;
+  }
+
+  async insertFactoryCommand(command: FactoryCommand): Promise<void> {
+    this.commands.push(command);
+  }
+
+  async insertAftercare(record: AftercareRecord): Promise<void> {
+    this.aftercare.push(record);
   }
 }

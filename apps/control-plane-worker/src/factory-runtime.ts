@@ -21,6 +21,7 @@ import {
   workersAiGatewayOptions,
   applyWorkOrderRouting,
   acquireWorkCellLease,
+  dispatchTinkerGateway,
   draftImprovementProposal,
   factoryAnalystReport,
   incidentIntake,
@@ -32,6 +33,7 @@ import {
   evaluateMergeReadiness,
   workersAiInferenceProvider,
   factoryAiFromProvider,
+  defaultAftercare,
   type ConversationMessage,
   type FactoryAi,
   type FactoryDefinition,
@@ -207,6 +209,7 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
     if (readiness.ready) {
       const candidate = createReleaseCandidate({ releaseId: `rc_${order.workOrderId.slice(0, 8)}`, commitSha: message.pullRequestSha ?? message.sha ?? "unknown", receiptIds: [`receipt:${runId}`], rollbackRefs: ["docs/rollback"] });
       await factories.insertReleaseCandidate({ releaseId: candidate.releaseId, workOrderId: order.workOrderId, factoryId: factory.factoryId, commitSha: candidate.commitSha, receiptIds: candidate.receiptIds, rollbackRefs: candidate.rollbackRefs, status: candidate.status, blocking: candidate.blocking, now });
+      await factories.insertAftercare(defaultAftercare(candidate.releaseId, order.owner ?? "unassigned"));
     }
   }
   if (env.EVIDENCE_BUCKET) {
@@ -333,7 +336,21 @@ export async function handleFactoryMcpRequest(request: Request, env: FactoryEnv,
 }
 
 export function intakeFromIntegration(kind: "slack" | "linear" | "jira" | "incident" | "support", payload: Record<string, unknown>): FactoryQueueMessage {
-  if (kind === "slack") return slackIntake(payload);
+  if (kind === "slack") {
+    const message = slackIntake(payload);
+    const text = String(message.issueOrPullRequest ?? "");
+    if (/@tinker(?:bot)?\b/i.test(text)) {
+      dispatchTinkerGateway({
+        text,
+        organizationId: message.organizationId ?? "unknown",
+        sourceSystem: "slack",
+        sourceObjectId: message.sourceId,
+        actorId: message.actor,
+        authorized: true,
+      });
+    }
+    return message;
+  }
   if (kind === "linear") return linearIntake(payload);
   if (kind === "incident") {
     const incident = incidentIntake(payload);

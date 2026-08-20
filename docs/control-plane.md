@@ -12,6 +12,7 @@ Worker routes:
 - `GET /usage`, `GET /integrations/github`
 - `POST /actions/oidc/exchange` (RS256 JWKS, installation required) then `POST /assurance/ingest` with the short-lived run token
 - Intake: GitHub, Slack, Linear, Jira, incident, and support webhooks
+- `POST /tinker/commands` — typed `@tinker` gateway (idempotent; high-risk actions require confirmation; never a verification verdict)
 - WorkOS `/auth/workos/start|callback`, `/auth/session`, `/auth/signout`
 - Stripe `/billing/summary|checkout|portal`
 

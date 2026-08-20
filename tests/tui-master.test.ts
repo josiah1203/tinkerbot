@@ -4,6 +4,7 @@ import { applyLeaderChord, applyMasterIntent, createMasterState, parseMasterInte
 import { detectAgents, resolveAgentBin, spawnSpec } from "../packages/tui/src/agents";
 import { attachAgentPty } from "../packages/tui/src/pty";
 import { processMasterCommand, runMasterTui, runMasterTuiInteractive, listAgentsJson } from "../packages/tui/src";
+import { CLAUDE_CODE_KIT_FORBIDDEN, tuiRejectsTinkerMention } from "../packages/tui/src/kit";
 
 function deps() {
   return {
@@ -34,6 +35,7 @@ test("master slash rejects merge and pass and opens agent tabs", () => {
   expect(parseMasterIntent("/work")).toMatchObject({ type: "reject" });
   expect(parseMasterIntent("check")).toEqual({ type: "check" });
   expect(parseMasterIntent("hello")).toMatchObject({ type: "reject" });
+  expect(parseMasterIntent("@tinker status")).toMatchObject({ type: "reject", reason: expect.stringMatching(/GitHub|Slack/) });
   const withWork = applyMasterIntent(state, { type: "work", id: "wo_1" });
   expect(withWork.tabs.some((tab) => tab.kind === "work")).toBe(true);
   expect(applyMasterIntent(withWork, { type: "work", id: "wo_1" }).active).toBe(withWork.active);
@@ -52,6 +54,8 @@ test("master slash rejects merge and pass and opens agent tabs", () => {
   expect(renderTabBody(withWork)).toContain("Work wo_1");
   expect(renderTabBody(withAgent)).toContain("nested agentic terminal");
   expect(MASTER_HELP).toContain("pnpm tb tui");
+  expect(tuiRejectsTinkerMention("@tinker hi")).toBe(true);
+  expect(CLAUDE_CODE_KIT_FORBIDDEN).toEqual(["@claude-code-kit/agent"]);
 });
 
 test("PATH detection uses env overrides and never claims vendor tokens", () => {

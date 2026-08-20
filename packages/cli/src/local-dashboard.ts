@@ -37,6 +37,10 @@ export function localDashboardApi(store: SqliteFactoryStore, url: URL, method: s
   if (url.pathname === "/work-orders") {
     return { status: 200, body: { workOrders: localRuntimeView(store).workOrders } };
   }
+  if (url.pathname === "/exceptions" || url.pathname === "/local/exceptions") {
+    const view = localRuntimeView(store);
+    return { status: 200, body: { ...view.exceptions, kanban: false, attentionFirst: true } };
+  }
   return undefined;
 }
 

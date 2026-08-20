@@ -11,7 +11,7 @@ export function renderMasterChrome(state: MasterState, body?: string): string {
     text,
     bar,
     ` ${renderStatusBar(state)}`,
-    " ctrl-g n/p/w · /claude /gemini /codex /cursor /shell · nested OAuth stays in the child",
+    " ctrl-g n/p/w · /check /claude · @tinker is Slack/GitHub, not this prompt",
     "",
   ].join("\n");
 }

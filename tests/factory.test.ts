@@ -304,6 +304,17 @@ describe("factory domain", () => {
     });
     expect(listed.result).toMatchObject({ tools: expect.any(Array) });
     expect(JSON.stringify(listed.result)).toContain("create_factory");
+    const cellAttach = await handleFactoryMcpTool("get_task", { workOrderId: "wo_mcp", startWorking: true }, {
+      organizationId: "org_1",
+      actor: "dev",
+      sendTask: async () => ({ workOrderId: "wo_mcp" }),
+      getTask: async () => ({ workOrder: undefined, git: { branch: "tinkerbot/wo_mcp", commands: ["git fetch"] } }),
+      messageForeman: async () => ({ accepted: true as const }),
+    });
+    expect(cellAttach.ok).toBe(true);
+    if (cellAttach.ok) {
+      expect(cellAttach.result).toMatchObject({ verificationVerdictForbidden: true, workerEnvelope: expect.objectContaining({ role: "implementer" }) });
+    }
     const created = await handleFactoryMcpTool("create_factory", { name: "payments" }, {
       organizationId: "org_1",
       actor: "dev",

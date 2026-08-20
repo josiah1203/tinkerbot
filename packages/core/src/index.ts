@@ -5,3 +5,4 @@ export * from "./types";
 export * from "./assurance-types";
 export * from "./version";
 export * from "./verdict";
+export * from "./inspection";

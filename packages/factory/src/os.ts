@@ -216,6 +216,9 @@ export interface WorkCell {
   kind: WorkCellKind;
   repository: string;
   branch: string;
+  pinSha?: string;
+  allowedTools?: string[];
+  secretRefs?: string[];
   status: "free" | "leased" | "held" | "abandoned";
   leasedBy?: string;
   heldBy?: string;
@@ -353,6 +356,9 @@ export function acquireWorkCellLease(input: {
   repository: string;
   branch: string;
   kind?: WorkCellKind;
+  pinSha?: string;
+  allowedTools?: string[];
+  secretRefs?: string[];
   actor: string;
   now: string;
   ttlMs?: number;
@@ -371,6 +377,9 @@ export function acquireWorkCellLease(input: {
     kind: input.kind ?? "sandbox",
     repository: input.repository,
     branch: input.branch,
+    pinSha: input.pinSha ?? existing?.pinSha,
+    allowedTools: input.allowedTools ?? existing?.allowedTools ?? ["git", "test"],
+    secretRefs: input.secretRefs ?? existing?.secretRefs ?? [],
     status: "leased",
     leasedBy: input.actor,
     credentialScope: `repo:${input.repository}:contents:write:tinkerbot/*`,
@@ -395,6 +404,28 @@ export function releaseExpiredCells(cells: WorkCell[], now: string): WorkCell[] 
 export function cellCredentialScope(cell: Pick<WorkCell, "repository" | "branch">): { ok: true; scope: string } | { ok: false; reason: string } {
   if (!cell.branch.startsWith("tinkerbot/")) return { ok: false, reason: "Work-cell credentials cannot target protected branches." };
   return { ok: true, scope: `repo:${cell.repository}:contents:write:${cell.branch}` };
+}
+
+export function checkWorkCell(cell: Pick<WorkCell, "repository" | "branch" | "status" | "cleanupAt" | "credentialScope">, now: string): { ok: boolean; issues: string[] } {
+  const issues: string[] = [];
+  const scope = cellCredentialScope(cell);
+  if (!scope.ok) issues.push(scope.reason);
+  if (cell.status === "abandoned") issues.push("Cell lease expired.");
+  if (Date.parse(cell.cleanupAt) <= Date.parse(now) && cell.status !== "free") issues.push("Cell cleanup is due.");
+  if (!cell.credentialScope.includes("tinkerbot/") && !cell.branch.startsWith("tinkerbot/")) issues.push("Cell is not scoped to a tinkerbot/* branch.");
+  return { ok: issues.length === 0, issues };
+}
+
+export function resumeWorkCell(cell: WorkCell, actor: string, now: string): WorkCell {
+  return { ...cell, status: "leased", leasedBy: actor, cleanupAt: new Date(Date.parse(now) + 3_600_000).toISOString() };
+}
+
+export function cleanupWorkCell(cell: WorkCell, now: string): WorkCell {
+  return { ...cell, status: "free", leasedBy: undefined, heldBy: undefined, cleanupAt: now };
+}
+
+export function reproduceWorkCell(cell: Pick<WorkCell, "repository" | "branch" | "pinSha" | "kind">): { inspection: "cell"; command: "tb cell check"; repository: string; branch: string; pinSha?: string; kind: WorkCellKind; upgradesVerdict: false } {
+  return { inspection: "cell", command: "tb cell check", repository: cell.repository, branch: cell.branch, pinSha: cell.pinSha, kind: cell.kind, upgradesVerdict: false };
 }
 
 export function parseSkillDocument(input: unknown): SkillDefinition {

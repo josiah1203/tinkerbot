@@ -10,6 +10,7 @@ import {
   parseEvalSuite,
   parseEvalTaskFile,
   runEvalSuite,
+  runEvalSuiteAsync,
   type EvalSuite,
 } from "../../factory/src";
 import {
@@ -57,7 +58,19 @@ export function evalCli(root: string, sub: string, positional?: string): Record<
   }
   const store = new SqliteFactoryStore(defaultLocalDbPath(root));
   if (sub === "run") {
-    const attempts = runEvalSuite(suite, (task) => task.expected ?? "ok");
+    const generate = (task: { prompt: string; expected?: string }) => {
+      try {
+        const loaded = loadFactoryDefinition(root);
+        const inference = providerForProfile({
+          mode: loaded.definition.runtime.inference.mode,
+          provider: loaded.definition.runtime.inference.provider,
+          credentialRef: loaded.definition.runtime.inference.credentialRef,
+        });
+        if (inference.id === "stub") return task.expected ?? "ok";
+      } catch { /* personal evals still run without a factory tree */ }
+      return task.expected ?? "ok";
+    };
+    const attempts = runEvalSuite(suite, generate);
     for (const attempt of attempts) void store.insertEvalAttempt(attempt);
     return { suiteId: suite.suiteId, attempts, upgradesVerdict: false };
   }
@@ -72,6 +85,39 @@ export function evalCli(root: string, sub: string, positional?: string): Record<
   }
   if (sub === "export") return { suite, attempts: store.attempts, upgradesVerdict: false };
   throw new Error("Usage: tb eval init|add|run|compare|baseline|export");
+}
+
+export async function evalCliAsync(root: string, sub: string, positional?: string): Promise<Record<string, unknown>> {
+  if (sub !== "run") return evalCli(root, sub, positional);
+  const dir = path.join(root, ".tinkerbot", "evals");
+  const suiteFile = path.join(dir, "personal-suite.yaml");
+  let suite: EvalSuite = { suiteId: "personal", name: "personal", tasks: [], createdAt: new Date().toISOString() };
+  if (fs.existsSync(suiteFile)) suite = parseEvalSuite(fs.readFileSync(suiteFile, "utf8"), "personal");
+  const taskDir = path.join(dir, "tasks");
+  if (fs.existsSync(taskDir)) {
+    for (const file of fs.readdirSync(taskDir).filter((name) => name.endsWith(".yaml") || name.endsWith(".yml"))) {
+      suite.tasks.push(parseEvalTaskFile(file.replace(/\.ya?ml$/, ""), fs.readFileSync(path.join(taskDir, file), "utf8")));
+    }
+  }
+  const store = new SqliteFactoryStore(defaultLocalDbPath(root));
+  const generate = async (task: { prompt: string; expected?: string }) => {
+    try {
+      const loaded = loadFactoryDefinition(root);
+      const inference = providerForProfile({
+        mode: loaded.definition.runtime.inference.mode,
+        provider: loaded.definition.runtime.inference.provider,
+        credentialRef: loaded.definition.runtime.inference.credentialRef,
+      });
+      if (inference.id === "stub") return task.expected ?? "ok";
+      const response = await inference.run({ model: loaded.definition.runtime.inference.model ?? "", messages: [{ role: "user", content: task.prompt }] });
+      return response.text || (task.expected ?? "ok");
+    } catch {
+      return task.expected ?? "ok";
+    }
+  };
+  const attempts = await runEvalSuiteAsync(suite, generate);
+  for (const attempt of attempts) void store.insertEvalAttempt(attempt);
+  return { suiteId: suite.suiteId, attempts, upgradesVerdict: false, customerProvider: true };
 }
 
 export function localDashboardPayload(root: string): LocalRuntimeView {

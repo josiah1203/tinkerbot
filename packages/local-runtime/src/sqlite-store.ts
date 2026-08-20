@@ -5,10 +5,10 @@ import crypto from "node:crypto";
 import { MemoryFactoryStore, type FactoryStore, type OutboxEvent, type InlineApprovalRecord } from "../../factory/src/store";
 import type { CostEstimate, ExecutionPlan, ProviderUsage } from "../../factory/src/runtime";
 import type { EvalAttempt, EvalSuite } from "../../factory/src/evals";
-import type { WorkOrder, WorkOrderState } from "../../factory/src";
+import type { AftercareRecord, FactoryCommand, WorkOrder, WorkOrderState } from "../../factory/src";
 import { openSqliteDatabase, SQLITE_MAGIC, type SqliteDatabase } from "./sqlite-engine";
 
-export const LOCAL_DB_SCHEMA_VERSION = 13;
+export const LOCAL_DB_SCHEMA_VERSION = 14;
 
 export function defaultLocalDbPath(root?: string): string {
   if (process.env.TINKERBOT_LOCAL_DB) return process.env.TINKERBOT_LOCAL_DB;
@@ -190,6 +190,27 @@ CREATE TABLE IF NOT EXISTS tinkerbot_inline_approvals (
   reviewed_ac TEXT,
   rationale TEXT,
   decision TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tinkerbot_factory_commands (
+  command_id TEXT PRIMARY KEY,
+  organization_id TEXT NOT NULL,
+  source_system TEXT NOT NULL,
+  source_object_id TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  authorized INTEGER NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  work_order_id TEXT,
+  action TEXT NOT NULL,
+  confirmation_required INTEGER NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tinkerbot_aftercare (
+  release_id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  environment TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
 `;
@@ -454,6 +475,20 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
   override async markOutboxSynced(eventId: string, now: string): Promise<void> {
     await super.markOutboxSynced(eventId, now);
     this.database.prepare("UPDATE tinkerbot_sync_outbox SET synced_at = ? WHERE event_id = ?").run(now, eventId);
+  }
+
+  override async insertFactoryCommand(command: FactoryCommand): Promise<void> {
+    await super.insertFactoryCommand(command);
+    this.database.prepare("INSERT INTO tinkerbot_factory_commands (command_id, organization_id, source_system, source_object_id, actor_id, authorized, idempotency_key, work_order_id, action, confirmation_required, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(command_id) DO NOTHING").run(
+      command.commandId, command.organizationId, command.sourceSystem, command.sourceObjectId, command.actorId, command.authorized ? 1 : 0, command.idempotencyKey, command.workOrderId ?? null, command.action, command.confirmationRequired ? 1 : 0, JSON.stringify(command), command.createdAt,
+    );
+  }
+
+  override async insertAftercare(record: AftercareRecord): Promise<void> {
+    await super.insertAftercare(record);
+    this.database.prepare("INSERT INTO tinkerbot_aftercare (release_id, owner, environment, payload_json, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(release_id) DO UPDATE SET payload_json = excluded.payload_json").run(
+      record.releaseId, record.owner, record.environment, JSON.stringify(record), new Date().toISOString(),
+    );
   }
 }
 

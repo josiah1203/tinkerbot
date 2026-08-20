@@ -73,6 +73,24 @@ export function scoreEvalOutput(task: EvalTask, output: string): EvalMetric[] {
   return [{ name: "advisory_match", score: overlap, upgradesVerdict: false }];
 }
 
+export async function runEvalSuiteAsync(suite: EvalSuite, generate: (task: EvalTask) => Promise<string> | string, now = new Date().toISOString()): Promise<EvalAttempt[]> {
+  const attempts: EvalAttempt[] = [];
+  for (const task of suite.tasks) {
+    const output = await generate(task);
+    const metrics = scoreEvalOutput(task, output);
+    attempts.push({
+      attemptId: `${suite.suiteId}:${task.taskId}:${now}`,
+      suiteId: suite.suiteId,
+      taskId: task.taskId,
+      output,
+      metrics,
+      passed: metrics.every((metric) => metric.score >= 1) || !task.expected,
+      createdAt: now,
+    });
+  }
+  return attempts;
+}
+
 export function runEvalSuite(suite: EvalSuite, generate: (task: EvalTask) => string, now = new Date().toISOString()): EvalAttempt[] {
   return suite.tasks.map((task) => {
     const output = generate(task);

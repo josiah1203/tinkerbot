@@ -66,6 +66,9 @@ export function parseIntent(line: string): Intent {
   if (/^(select-tests|select tests)$/i.test(trimmed)) return { type: "select-tests" };
   if (/^(help|\?)$/i.test(trimmed)) return { type: "help" };
   if (/^(exit|quit)$/i.test(trimmed)) return { type: "exit" };
+  if (/^@tinker\b/i.test(trimmed)) {
+    return { type: "reject", command: trimmed, reason: "@tinker is the GitHub/Slack/Jira/Linear handle, not this terminal. Use /check or /help." };
+  }
   return {
     type: "reject",
     command: trimmed,

@@ -78,13 +78,13 @@ function validateTimeClaims(claims: GitHubOidcClaims, nowSeconds: number, maxIat
   return { ok: true };
 }
 
-async function readJwks(url: string, fetchImpl: typeof fetch, forceRefresh: boolean): Promise<JsonWebKey[]> {
+async function readJwks(url: string, fetchImpl: typeof fetch, forceRefresh: boolean): Promise<Array<JsonWebKey & { kid?: string }>> {
   const cached = jwksCache.get(url);
   if (!forceRefresh && cached && Date.now() - cached.fetchedAt < JWKS_TTL_MS) return cached.keys;
   const response = await fetchImpl(url, { headers: { accept: "application/json" } });
   if (!response.ok) throw new Error("jwks_unavailable");
-  const body = await response.json() as { keys?: JsonWebKey[] };
-  const keys = Array.isArray(body.keys) ? body.keys.filter((key) => key && typeof key === "object") : [];
+  const body = await response.json() as { keys?: Array<JsonWebKey & { kid?: string }> };
+  const keys = Array.isArray(body.keys) ? body.keys.filter((key): key is JsonWebKey & { kid?: string } => Boolean(key && typeof key === "object")) : [];
   jwksCache.set(url, { fetchedAt: Date.now(), keys });
   return keys;
 }

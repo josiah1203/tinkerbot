@@ -1,6 +1,6 @@
 # TUI session
 
-`tb tui` is two surfaces. Interactive TTY is a tabbed **OpenTUI-style master terminal** in `packages/tui` (isolated from the Node verification engine, Action, and hosted inference). Non-TTY and CI use the Node transcript in `packages/cli/src/tui/` (`tb tui --once`).
+`tb tui` is two surfaces. Interactive TTY is a tabbed master terminal in `packages/tui` (claude-code-kit chrome contract; isolated from the Node verification engine, Action, and hosted inference). `@tinker` is **not** a TUI mention — it is the factory’s GitHub/Slack/Jira/Linear command handle. Non-TTY and CI use the Node transcript in `packages/cli/src/tui/` (`tb tui --once`).
 
 Launch interactive mode from a real Cursor/IDE TTY: `pnpm tui` or `pnpm tb tui`. There is no AppleScript or PID-kill launcher.
 
@@ -36,7 +36,7 @@ Always Tinkerbot, never the child: `/tab`, `/check`, `/work <id>`, `/claude`, `/
 | SelectTests | never |
 | Subset | never (locked when `requiresFullSuite`) |
 | Bash(configured command) | yes |
-| Verdict | `calculateVerdict` only |
+| Verdict | `combineVerification` over required modules; reported worker claims ignored |
 
 `--no-base-tests` remains UNKNOWN.
 

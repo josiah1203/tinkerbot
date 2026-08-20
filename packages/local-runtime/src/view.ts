@@ -12,6 +12,7 @@ export interface LocalRuntimeView {
   evals: Array<{ taskId: string; suiteId: string; passed: boolean; upgradesVerdict: false }>;
   evalCompare: { improved: string[]; regressed: string[]; unchanged: string[]; upgradesVerdict: false };
   workOrders: Array<{ workOrderId: string; status: string; currentStage: string }>;
+  exceptions: { needsAttention: number; blocked: number; unknownEvidence: number; waitingCell: number; missingApproval: number };
 }
 
 export function localRuntimeView(store: SqliteFactoryStore): LocalRuntimeView {
@@ -30,6 +31,7 @@ export function localRuntimeView(store: SqliteFactoryStore): LocalRuntimeView {
   }));
   const evals = store.attempts.map((attempt) => ({ taskId: attempt.taskId, suiteId: attempt.suiteId, passed: attempt.passed, upgradesVerdict: false as const }));
   const compare = compareEvalAttempts(store.attempts, store.attempts);
+  const workOrders = [...store.orders.values()].map((order) => ({ workOrderId: order.workOrderId, status: order.status, currentStage: String(order.currentStage) }));
   return {
     local: true,
     organizationId: "local",
@@ -39,7 +41,14 @@ export function localRuntimeView(store: SqliteFactoryStore): LocalRuntimeView {
     costs,
     evals,
     evalCompare: { ...compare, upgradesVerdict: false },
-    workOrders: [...store.orders.values()].map((order) => ({ workOrderId: order.workOrderId, status: order.status, currentStage: String(order.currentStage) })),
+    workOrders,
+    exceptions: {
+      needsAttention: workOrders.filter((order) => order.status === "blocked" || order.status === "failed").length,
+      blocked: workOrders.filter((order) => order.status === "blocked").length,
+      unknownEvidence: workOrders.filter((order) => order.status === "unknown").length,
+      waitingCell: workOrders.filter((order) => order.currentStage === "implementation" && order.status === "intake").length,
+      missingApproval: workOrders.filter((order) => order.status === "approval" || order.status === "ready").length,
+    },
   };
 }
 

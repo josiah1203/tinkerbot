@@ -52,9 +52,12 @@ export * from "./store";
 export * from "./inference";
 export * from "./approval";
 export * from "./evals";
+export * from "./authority";
+export * from "./init";
 export * from "./oidc";
 export { executeFactoryRun } from "./execute";
 import { assertCredentialRef, hostedRuntimeDefaults, parseRuntimeProfile, type RuntimeProfile } from "./runtime";
+import type { AcceptanceCriterionLink, Waiver } from "./authority";
 
 export const WORK_ORDER_STATES = [
   "intake",
@@ -198,6 +201,17 @@ export interface WorkOrder {
   heldBy?: string;
   origin?: "local" | "hosted";
   executionPlanId?: string;
+  verificationVerdict?: "PASS" | "FAIL" | "UNKNOWN";
+  reviewAssessment?: "CLEAR" | "NEEDS_HUMAN_REVIEW" | "REVISE";
+  releaseDecision?: "READY" | "BLOCKED";
+  scope?: string;
+  requiredChecks?: string[];
+  releaseConditions?: string[];
+  outcomeExpectations?: string;
+  waiver?: Waiver;
+  acceptanceCriteriaChain?: AcceptanceCriterionLink[];
+  lineVersion?: string;
+  recipeVersion?: string;
 }
 
 export interface WorkOrderEvent {
@@ -484,6 +498,17 @@ export function createWorkOrder(input: Omit<WorkOrder, "workOrderId" | "createdA
     heldBy: input.heldBy,
     origin: input.origin,
     executionPlanId: input.executionPlanId,
+    verificationVerdict: input.verificationVerdict ?? "UNKNOWN",
+    reviewAssessment: input.reviewAssessment ?? "NEEDS_HUMAN_REVIEW",
+    releaseDecision: input.releaseDecision ?? "BLOCKED",
+    scope: input.scope,
+    requiredChecks: input.requiredChecks,
+    releaseConditions: input.releaseConditions,
+    outcomeExpectations: input.outcomeExpectations,
+    waiver: input.waiver,
+    acceptanceCriteriaChain: input.acceptanceCriteriaChain,
+    lineVersion: input.lineVersion,
+    recipeVersion: input.recipeVersion,
   };
 }
 
