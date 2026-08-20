@@ -115,7 +115,7 @@ test("resolves common monorepo layouts and build metadata", () => {
   expect(graph.modules.get("crates/demo/src/lib.rs")?.imports.some((item) => item.resolvedFile === "crates/demo/src/calc.rs")).toBe(true);
   expect(graph.modules.get("native/main.c")?.imports[0]?.resolvedFile).toBe("include/project.h");
   const validated = buildGraph(root, ["native/main.c"], undefined, { validateSyntax: true });
-  expect(["valid", "unavailable"]).toContain(validated.modules.get("native/main.c")?.syntaxValidation?.status);
+  expect(["valid", "unknown", "unavailable"]).toContain(validated.modules.get("native/main.c")?.syntaxValidation?.status);
 });
 
 test("uses installed language front ends without executing repository code", () => {

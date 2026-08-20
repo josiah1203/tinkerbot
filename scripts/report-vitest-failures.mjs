@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const resultFile = process.argv[2] ?? ".pr-proof/vitest-results.json";
+const resultFile = process.argv[2] ?? "vitest-results.json";
 if (!fs.existsSync(resultFile)) process.exit(0);
 
 function escapeCommand(value) {
@@ -42,4 +42,8 @@ for (const suite of report.testResults ?? []) {
 
 for (const failure of failures) {
   process.stdout.write(`::error file=${escapeCommand(failure.file)},title=${escapeCommand(failure.title)}::${escapeCommand(failure.detail)}\n`);
+}
+
+if (!failures.length && report.success !== false) {
+  try { fs.rmSync(resultFile, { force: true }); } catch { /* diagnostics cleanup is best effort */ }
 }

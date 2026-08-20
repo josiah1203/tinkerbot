@@ -33,9 +33,9 @@ jobs:
           node-version: 22
       - run: corepack enable
       - run: pnpm install --frozen-lockfile
-      - run: pnpm test -- --reporter=default --reporter=json --outputFile=.pr-proof/vitest-results.json
+      - run: pnpm test -- --reporter=default --reporter=json --outputFile=vitest-results.json
       - if: always()
-        run: node scripts/report-vitest-failures.mjs .pr-proof/vitest-results.json
+        run: node scripts/report-vitest-failures.mjs vitest-results.json
       - uses: ./
         with:
           base: ${{ github.event.pull_request.base.sha || github.sha }}
@@ -52,4 +52,4 @@ jobs:
             .pr-proof/receipt.json
             .pr-proof/review-context.json
             .pr-proof/evidence-contract.json
-            .pr-proof/vitest-results.json
+            vitest-results.json

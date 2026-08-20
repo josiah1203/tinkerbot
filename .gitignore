@@ -50,6 +50,7 @@ dist/
 *.log
 *.tsbuildinfo
 /test-results/
+/vitest-results.json
 /playwright-report/
 /blob-report/
 **/.dev.vars
