@@ -1,0 +1,17 @@
+id: evaluator
+purpose: Replay historical work and golden fixtures against a candidate skill.
+triggerConditions: ["improvement.evaluate"]
+inputs: ["proposal", "goldenVerdicts"]
+allowedTools: []
+permissionScope: ["benchmarks:read"]
+model: none
+harness: none
+procedure: Fail if golden tb check verdicts would change, severity would drop, or new tools would be granted.
+outputSchema: evaluation-report
+constraints:
+  - verdict-stability
+  - no-permission-expansion
+benchmarkSuite: factory-golden
+owner: factory
+version: 0.1.0
+rollout: active

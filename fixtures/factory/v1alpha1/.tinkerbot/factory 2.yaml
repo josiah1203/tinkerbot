@@ -1,0 +1,17 @@
+schemaVersion: v1alpha1
+name: payments-factory
+description: Processes approved work for the payments service
+alias: payments
+repositories:
+  - owner: acme
+    name: payments-service
+integrations:
+  - type: slack
+  - type: linear
+agentDefaults:
+  model: auto
+  runner: sandbox
+secrets:
+  - env:GITHUB_APP_PRIVATE_KEY
+approvals:
+  required: true

@@ -143,6 +143,9 @@ export async function runLocalFactory(input: LocalRunInput): Promise<{ workOrder
       verificationVerdict: input.verificationVerdict ?? "UNKNOWN",
       verificationIngested: input.verificationIngested ?? Boolean(input.verificationVerdict && input.verificationVerdict !== "UNKNOWN"),
       organizationId: order.organizationId,
+      changeSetId: order.workOrderId,
+      changeSetDigest: order.definitionDigest,
+      verificationRunId: runId,
     });
     if (harnessSummary) {
       const implementationStage = result.stages.find((stage) => stage.stage === "implementation");

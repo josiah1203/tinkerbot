@@ -131,7 +131,7 @@ describe("local runtime", () => {
     expect(store.schemaVersion()).toBe(LOCAL_DB_SCHEMA_VERSION);
     expect(fs.readFileSync(db).subarray(0, 15).toString("utf8")).toBe(SQLITE_MAGIC);
     const graphEvents = await store.listFactoryEvents(result.workOrderId);
-    expect(graphEvents.map((event) => event.type)).toEqual(expect.arrayContaining(["work_order.created", "worker.session_started", "worker.claim_emitted", "change.proposed", "evidence.receipt_created", "worker.session_completed", "task.decomposed", "verification.completed"]));
+    expect(graphEvents.map((event) => event.type)).toEqual(expect.arrayContaining(["work_order.created", "worker.session_started", "worker.claim_emitted", "change.proposed", "evidence.receipt_created", "worker.session_completed", "task.decomposed", "verification.recorded"]));
     expect((await store.reconstructFactoryGraph(result.workOrderId)).verificationVerdict).toBe("PASS");
   });
 

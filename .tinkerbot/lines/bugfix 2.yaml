@@ -1,0 +1,6 @@
+id: bugfix
+stages: [foreman, triage, implementation, review, verification, release]
+agents: [foreman, implementer, reviewer, verification]
+autonomy: approval_gated
+requiredEvidence: [verification-receipt]
+approvalRoles: [maintainer, admin, owner]

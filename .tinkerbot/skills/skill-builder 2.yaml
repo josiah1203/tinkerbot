@@ -1,0 +1,17 @@
+id: skill-builder
+purpose: Draft candidate skills, checklists, and tool definitions.
+triggerConditions: ["improvement.draft"]
+inputs: ["analyst-report"]
+allowedTools: []
+permissionScope: ["factory-definition:propose"]
+model: "@cf/openai/gpt-oss-120b"
+harness: default
+procedure: Draft an ImprovementProposal and a skill YAML. Cannot activate or merge.
+outputSchema: improvement-proposal
+constraints:
+  - cannot-activate
+  - cannot-grant-credentials
+benchmarkSuite: factory-golden
+owner: factory
+version: 0.1.0
+rollout: active

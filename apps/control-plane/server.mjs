@@ -78,25 +78,30 @@ function previewGraphEvents(workOrderId) {
   const events = [
     { ...base, eventId: `evt_${order.workOrderId}`, type: "work_order.created", occurredAt: "2030-01-01T00:00:00.000Z", payload: { workOrderId: order.workOrderId, intent: order.intent ?? order.issueOrPullRequest } },
   ];
-  if (order.status === "failed") events.push({ ...base, eventId: `verify_${order.workOrderId}`, type: "verification.completed", actorId: "deterministic-verifier", provenance: "DETERMINISTICALLY_VERIFIED", occurredAt: "2030-01-01T00:03:00.000Z", payload: { verdict: "FAIL" } });
+  const changeSetId = `change_${order.workOrderId}`;
+  const changeSetDigest = `sha256:${order.workOrderId}`;
+  events.push({ ...base, eventId: `change_${order.workOrderId}`, type: "change.proposed", occurredAt: "2030-01-01T00:02:00.000Z", payload: { workOrderId: order.workOrderId, changeSetId, changeSetDigest } });
+  if (order.status === "failed") events.push({ ...base, eventId: `verify_${order.workOrderId}`, type: "verification.recorded", actorId: "deterministic-verifier", provenance: "DETERMINISTICALLY_VERIFIED", occurredAt: "2030-01-01T00:03:00.000Z", payload: { workOrderId: order.workOrderId, changeSetId, changeSetDigest, verificationRunId: `run_${order.workOrderId}`, verdict: "FAIL" } });
   if (order.status === "released") events.push(
-    { ...base, eventId: `verify_${order.workOrderId}`, type: "verification.completed", actorId: "deterministic-verifier", provenance: "DETERMINISTICALLY_VERIFIED", occurredAt: "2030-01-01T00:03:00.000Z", payload: { verdict: "PASS" } },
-    { ...base, eventId: `review_${order.workOrderId}`, type: "review.completed", actorId: "user_1", actorType: "human", provenance: "HUMAN_VERIFIED", occurredAt: "2030-01-01T00:04:00.000Z", payload: { decision: "APPROVE" } },
-    { ...base, eventId: `release_${order.workOrderId}`, type: "release.completed", actorId: "user_1", actorType: "human", provenance: "HUMAN_VERIFIED", occurredAt: "2030-01-01T00:05:00.000Z", payload: { decision: "RELEASE" } },
+    { ...base, eventId: `verify_${order.workOrderId}`, type: "verification.recorded", actorId: "deterministic-verifier", provenance: "DETERMINISTICALLY_VERIFIED", occurredAt: "2030-01-01T00:03:00.000Z", payload: { workOrderId: order.workOrderId, changeSetId, changeSetDigest, verificationRunId: `run_${order.workOrderId}`, verdict: "PASS" } },
+    { ...base, eventId: `review_${order.workOrderId}`, type: "review.recorded", actorId: "user_1", actorType: "human", provenance: "HUMAN_VERIFIED", occurredAt: "2030-01-01T00:04:00.000Z", payload: { workOrderId: order.workOrderId, changeSetId, changeSetDigest, reviewId: `review_${order.workOrderId}`, reviewerId: "user_1", outcome: "NO_FINDINGS", independence: "SECOND_HUMAN" } },
+    { ...base, eventId: `approval_${order.workOrderId}`, type: "approval.recorded", actorId: "user_1", actorType: "human", provenance: "HUMAN_VERIFIED", occurredAt: "2030-01-01T00:04:30.000Z", payload: { workOrderId: order.workOrderId, changeSetId, changeSetDigest, approvalEventId: `approval_${order.workOrderId}`, scope: "RELEASE", outcome: "GRANTED", approverId: "user_1" } },
+    { ...base, eventId: `release_decision_${order.workOrderId}`, type: "release.decided", actorId: "user_1", actorType: "human", provenance: "HUMAN_VERIFIED", occurredAt: "2030-01-01T00:04:45.000Z", payload: { workOrderId: order.workOrderId, releaseId: `release_${order.workOrderId}`, outcome: "RELEASE", changeSetId, changeSetDigest, approvalRef: { kind: "release_approval", eventId: `approval_${order.workOrderId}`, scope: "RELEASE", targetOutcome: "RELEASE", changeSetDigest } } },
+    { ...base, eventId: `release_${order.workOrderId}`, type: "release.executed", actorId: "system", actorType: "system", provenance: "ATTESTED", occurredAt: "2030-01-01T00:05:00.000Z", payload: { workOrderId: order.workOrderId, releaseId: `release_${order.workOrderId}`, changeSetDigest } },
   );
   return events;
 }
 
 function previewGraph(workOrderId) {
   const events = previewGraphEvents(workOrderId);
-  const verification = events.findLast?.((event) => event.type === "verification.completed") ?? events.slice().reverse().find((event) => event.type === "verification.completed");
-  const review = events.findLast?.((event) => event.type === "review.completed") ?? events.slice().reverse().find((event) => event.type === "review.completed");
-  const release = events.findLast?.((event) => event.type === "release.completed") ?? events.slice().reverse().find((event) => event.type === "release.completed");
+  const verification = events.findLast?.((event) => event.type === "verification.recorded") ?? events.slice().reverse().find((event) => event.type === "verification.recorded");
+  const review = events.findLast?.((event) => event.type === "review.recorded") ?? events.slice().reverse().find((event) => event.type === "review.recorded");
+  const release = events.findLast?.((event) => event.type === "release.decided") ?? events.slice().reverse().find((event) => event.type === "release.decided");
   return {
     aggregateId: events[0]?.aggregateId,
     verificationVerdict: verification?.payload?.verdict ?? "UNKNOWN",
-    reviewDecision: review?.payload?.decision ?? "NOT_REVIEWED",
-    releaseDecision: release ? "RELEASE" : "NOT_RELEASED",
+    reviewDecision: review?.payload?.outcome === "NO_FINDINGS" ? "APPROVE" : review?.payload?.outcome === "FINDINGS" ? "REQUEST_CHANGES" : review?.payload?.outcome === "ESCALATE" ? "ESCALATE" : "NOT_REVIEWED",
+    releaseDecision: release?.payload?.outcome ?? "NOT_RELEASED",
     outcomeStatus: "UNMEASURED",
     outcomeMaturity: "IMMATURE",
     eventCount: events.length,

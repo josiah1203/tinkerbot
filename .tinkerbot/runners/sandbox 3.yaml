@@ -1,0 +1,8 @@
+description: Linux Cloudflare sandbox for factory implement
+setupCommands:
+  - corepack enable
+platform:
+  os: linux
+  arch: x86_64
+  linux:
+    dockerImage: cloudflare/sandbox:next

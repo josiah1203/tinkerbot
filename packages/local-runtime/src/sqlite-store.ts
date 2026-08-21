@@ -5,11 +5,11 @@ import crypto from "node:crypto";
 import { MemoryFactoryStore, type FactoryStore, type OutboxEvent, type InlineApprovalRecord } from "../../factory/src/store";
 import type { CostEstimate, ExecutionPlan, ProviderUsage } from "../../factory/src/runtime";
 import type { EvalAttempt, EvalSuite } from "../../factory/src/evals";
-import { assertFactoryEventAuthority, graphEventForWorkOrderTransition, projectFactoryEvents, type AftercareRecord, type FactoryCommand, type FactoryEvent, type FactoryProjection, type WorkOrder, type WorkOrderState } from "../../factory/src";
+import { assertCanonicalFactoryEvent, assertFactoryEventAuthority, assertFactoryEventOrdering, commandPayloadFingerprint, graphEventForWorkOrderTransition, projectFactoryAuditEvents, projectFactoryEvents, shadowReadFactoryProjection, validateReleaseApprovalReference, type AftercareRecord, type FactoryCommand, type FactoryCommandInput, type FactoryCommandReceipt, type FactoryCommandResult, type FactoryEvent, type FactoryProjection, type WorkOrder, type WorkOrderState } from "../../factory/src";
 import { openSqliteDatabase, SQLITE_MAGIC, type SqliteDatabase } from "./sqlite-engine";
 import { assertNoSecretInPayload } from "./credentials";
 
-export const LOCAL_DB_SCHEMA_VERSION = 16;
+export const LOCAL_DB_SCHEMA_VERSION = 17;
 
 export function defaultLocalDbPath(root?: string): string {
   if (process.env.TINKERBOT_LOCAL_DB) return process.env.TINKERBOT_LOCAL_DB;
@@ -211,6 +211,17 @@ CREATE TABLE IF NOT EXISTS tinkerbot_factory_commands (
   payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tinkerbot_factory_command_receipts (
+  organization_id TEXT NOT NULL,
+  work_order_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  payload_fingerprint TEXT NOT NULL,
+  command_id TEXT NOT NULL,
+  event_ids_json TEXT NOT NULL,
+  result_json TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (organization_id, work_order_id, idempotency_key)
+);
 CREATE TABLE IF NOT EXISTS tinkerbot_aftercare (
   release_id TEXT PRIMARY KEY,
   owner TEXT NOT NULL,
@@ -230,12 +241,18 @@ CREATE TABLE IF NOT EXISTS tinkerbot_factory_graph_events (
   occurred_at TEXT NOT NULL,
   correlation_id TEXT NOT NULL,
   causation_id TEXT,
+  schema_version INTEGER NOT NULL DEFAULT 1,
+  aggregate_sequence INTEGER,
+  command_id TEXT,
+  idempotency_key TEXT,
+  payload_fingerprint TEXT,
   policy_version TEXT,
   provenance TEXT NOT NULL,
   external_references_json TEXT,
   payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tinkerbot_factory_graph_aggregate ON tinkerbot_factory_graph_events (aggregate_id, occurred_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tinkerbot_factory_graph_sequence ON tinkerbot_factory_graph_events (aggregate_id, aggregate_sequence);
 `;
 
 function isSqliteFile(filePath: string): boolean {
@@ -290,16 +307,69 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
    * prevents `tb work new`/`tb intent` from returning before their canonical
    * Factory Graph events are durable.
    */
-  appendFactoryEventSync(event: FactoryEvent): void {
+  appendFactoryEventSync(event: FactoryEvent, options: { migration?: boolean } = {}): void {
+    if (!options.migration && ["verification.recorded", "review.recorded", "approval.requested", "approval.recorded", "release.requested", "release.decided", "release.executed", "release.rolled_back"].includes(event.type)) throw new Error("factory_command_boundary_required");
     assertFactoryEventAuthority(event);
+    if (!options.migration) assertFactoryEventOrdering(event, this.readFactoryEvents(event.aggregateId));
     assertNoSecretInPayload({ payload: event.payload, externalReferences: event.externalReferences });
-    const result = this.database.prepare("INSERT OR IGNORE INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, policy_version, provenance, external_references_json, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
-      event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
+    const result = this.database.prepare("INSERT OR IGNORE INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, aggregate_sequence, command_id, idempotency_key, payload_fingerprint, policy_version, provenance, external_references_json, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+      event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.aggregateSequence ?? null, event.commandId ?? null, event.idempotencyKey ?? null, event.payloadFingerprint ?? null, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
     ) as { changes?: number };
     if (result.changes !== 1) return;
     const outbox: OutboxEvent = { eventId: event.eventId, kind: "factory-graph-event", payloadJson: JSON.stringify({ event }), createdAt: event.occurredAt };
     this.database.prepare("INSERT OR IGNORE INTO tinkerbot_sync_outbox (event_id, kind, payload_json, created_at, synced_at) VALUES (?, ?, ?, ?, NULL)").run(outbox.eventId, outbox.kind, outbox.payloadJson, outbox.createdAt);
     if (!this.outbox.some((item) => item.eventId === outbox.eventId)) this.outbox.push(outbox);
+    if (event.aggregateType === "work_order") this.refreshLifecycleProjectionSync(event.aggregateId);
+  }
+
+  dispatchFactoryCommandSync<T>(input: FactoryCommandInput<T>): FactoryCommandResult {
+    if (!input.organizationId || !input.factoryId || !input.workOrderId || !input.idempotencyKey) throw new Error("invalid_factory_command_identity");
+    const commandId = input.commandId ?? `cmd_${crypto.randomUUID().replace(/-/g, "")}`;
+    const payloadFingerprint = commandPayloadFingerprint(input.payload);
+    const receiptKey = `${input.organizationId}:${input.workOrderId}:${input.idempotencyKey}`;
+    const durable = this.readFactoryCommandReceiptSync(input.organizationId, input.workOrderId, input.idempotencyKey);
+    const known = durable ?? this.commandReceipts.get(receiptKey);
+    const priorEvents = this.readFactoryEvents(input.workOrderId);
+    if (known) {
+      if (known.payloadFingerprint !== payloadFingerprint) throw new Error("idempotency_conflict");
+      return { replayed: true, commandId: known.commandId, payloadFingerprint, eventIds: known.eventIds, events: priorEvents.filter((event) => known.eventIds.includes(event.eventId)), projection: projectFactoryEvents(priorEvents) };
+    }
+    const matching = priorEvents.filter((event) => event.idempotencyKey === input.idempotencyKey);
+    if (matching.length) {
+      if (matching.some((event) => event.payloadFingerprint !== payloadFingerprint)) throw new Error("idempotency_conflict");
+      const recovered: FactoryCommandReceipt = { organizationId: input.organizationId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, commandId: matching[0]!.commandId ?? commandId, eventIds: matching.map((event) => event.eventId), createdAt: input.now ?? new Date().toISOString() };
+      this.commandReceipts.set(receiptKey, recovered);
+      return { replayed: true, commandId: recovered.commandId, payloadFingerprint, eventIds: recovered.eventIds, events: matching, projection: projectFactoryEvents(priorEvents) };
+    }
+    const maxSequence = priorEvents.reduce((max, event) => Math.max(max, event.aggregateSequence ?? 0), 0);
+    const built = input.buildEvents({ priorEvents, nextSequence: maxSequence + 1, commandId, payloadFingerprint });
+    if (!built.length) throw new Error("factory_command_produced_no_events");
+    const events = built.map((builtEvent, index) => ({ ...builtEvent, aggregateId: input.workOrderId, organizationId: input.organizationId, factoryId: input.factoryId, actorId: input.actorId, actorType: input.actorType, aggregateSequence: maxSequence + index + 1, commandId, idempotencyKey: input.idempotencyKey, payloadFingerprint }) as FactoryEvent);
+    for (let index = 0; index < events.length; index += 1) {
+      const event = events[index]!;
+      if (event.type === "release.decided") validateReleaseApprovalReference(event, priorEvents, events.slice(0, index));
+      assertFactoryEventOrdering(event, [...priorEvents, ...events.slice(0, index)]);
+      assertCanonicalFactoryEvent(event);
+    }
+    const receipt: FactoryCommandReceipt = { organizationId: input.organizationId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, commandId, eventIds: events.map((event) => event.eventId), resultJson: JSON.stringify({ eventIds: events.map((event) => event.eventId) }), createdAt: input.now ?? new Date().toISOString() };
+    try {
+      this.database.exec("BEGIN");
+      for (const event of events) {
+        this.database.prepare("INSERT INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, aggregate_sequence, command_id, idempotency_key, payload_fingerprint, policy_version, provenance, external_references_json, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+          event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.aggregateSequence ?? null, event.commandId ?? null, event.idempotencyKey ?? null, event.payloadFingerprint ?? null, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
+        );
+        this.database.prepare("INSERT OR IGNORE INTO tinkerbot_sync_outbox (event_id, kind, payload_json, created_at, synced_at) VALUES (?, ?, ?, ?, NULL)").run(event.eventId, "factory-graph-event", JSON.stringify({ event }), event.occurredAt);
+      }
+      this.database.prepare("INSERT INTO tinkerbot_factory_command_receipts (organization_id, work_order_id, idempotency_key, payload_fingerprint, command_id, event_ids_json, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(receipt.organizationId, receipt.workOrderId, receipt.idempotencyKey, receipt.payloadFingerprint, receipt.commandId, JSON.stringify(receipt.eventIds), receipt.resultJson ?? null, receipt.createdAt);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch { /* preserve the original persistence failure */ }
+      throw error;
+    }
+    for (const event of events) this.factoryEvents.push(Object.freeze(event));
+    this.commandReceipts.set(receiptKey, receipt);
+    this.refreshLifecycleProjectionSync(input.workOrderId);
+    return { replayed: false, commandId, payloadFingerprint, eventIds: receipt.eventIds, events, projection: projectFactoryEvents([...priorEvents, ...events]) };
   }
 
   /** Persist a work order and its creation event atomically from the CLI. */
@@ -310,8 +380,7 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
       owner, risk, autonomy_mode, output_kind, policy_json, dependencies_json, held_by, origin, execution_plan_id,
       verification_verdict, review_assessment, release_decision, waiver_json
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(work_order_id) DO UPDATE SET status = excluded.status, current_stage = excluded.current_stage, updated_at = excluded.updated_at,
-      verification_verdict = excluded.verification_verdict, review_assessment = excluded.review_assessment, release_decision = excluded.release_decision`).run(
+    ON CONFLICT(work_order_id) DO UPDATE SET status = excluded.status, current_stage = excluded.current_stage, updated_at = excluded.updated_at`).run(
       order.workOrderId, order.factoryId, order.organizationId, order.sourceType, order.sourceId, order.repositoryId, order.issueOrPullRequest ?? null, order.intent ?? null, order.acceptanceCriteria ?? null,
       order.policyVersion, order.definitionVersion, order.definitionDigest, order.currentStage, order.status, order.actor, order.createdAt, order.updatedAt, order.productId ?? null, order.lineId ?? null, order.cellId ?? null,
       order.owner ?? null, order.risk ?? null, order.autonomyMode ?? null, order.outputKind ?? null, order.policyJson ?? null, order.dependenciesJson ?? null, order.heldBy ?? null, order.origin ?? "local", order.executionPlanId ?? null,
@@ -428,6 +497,10 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
         syncedAt: row.synced_at ? String(row.synced_at) : undefined,
       });
     }
+    for (const row of this.database.prepare("SELECT * FROM tinkerbot_factory_graph_events").all()) {
+      const event = rowToFactoryEvent(row);
+      if (!this.factoryEvents.some((item) => item.eventId === event.eventId)) this.factoryEvents.push(event);
+    }
     for (const row of this.database.prepare("SELECT payload_json FROM tinkerbot_agent_receipts").all()) {
       this.receipts.push(JSON.parse(String(row.payload_json)));
     }
@@ -447,7 +520,7 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
     const transitions = this.database.prepare("SELECT e.event_id, e.work_order_id, e.from_state, e.to_state, e.cause_id, e.actor, e.created_at, w.factory_id, w.organization_id, w.policy_version FROM tinkerbot_work_order_events e JOIN tinkerbot_work_orders w ON w.work_order_id = e.work_order_id ORDER BY e.created_at, e.event_id").all() as Array<Record<string, unknown>>;
     for (const row of transitions) {
       const event = graphEventForWorkOrderTransition({ workOrderId: String(row.work_order_id), factoryId: String(row.factory_id), organizationId: String(row.organization_id), actor: String(row.actor), policyVersion: String(row.policy_version), fromState: String(row.from_state), toState: String(row.to_state), causeId: String(row.cause_id), createdAt: String(row.created_at) });
-      if (event) this.appendFactoryEventSync(event);
+      if (event) this.appendFactoryEventSync(event, { migration: true });
     }
     const approvals = this.database.prepare("SELECT approval_id, work_order_id, requester, approver, actor_kind, decision, created_at FROM tinkerbot_inline_approvals WHERE actor_kind <> 'agent'").all() as Array<Record<string, unknown>>;
     for (const row of approvals) {
@@ -468,7 +541,7 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
       owner, risk, autonomy_mode, output_kind, policy_json, dependencies_json, held_by, origin, execution_plan_id,
       verification_verdict, review_assessment, release_decision, waiver_json
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(work_order_id) DO UPDATE SET status = excluded.status, current_stage = excluded.current_stage, updated_at = excluded.updated_at, verification_verdict = excluded.verification_verdict, review_assessment = excluded.review_assessment, release_decision = excluded.release_decision`).run(
+    ON CONFLICT(work_order_id) DO UPDATE SET status = excluded.status, current_stage = excluded.current_stage, updated_at = excluded.updated_at`).run(
       order.workOrderId, order.factoryId, order.organizationId, order.sourceType, order.sourceId, order.repositoryId, order.issueOrPullRequest ?? null, order.intent ?? null, order.acceptanceCriteria ?? null,
       order.policyVersion, order.definitionVersion, order.definitionDigest, order.currentStage, order.status, order.actor, order.createdAt, order.updatedAt, order.productId ?? null, order.lineId ?? null, order.cellId ?? null,
       order.owner ?? null, order.risk ?? null, order.autonomyMode ?? null, order.outputKind ?? null, order.policyJson ?? null, order.dependenciesJson ?? null, order.heldBy ?? null, order.origin ?? "local", order.executionPlanId ?? null,
@@ -579,6 +652,26 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
     );
   }
 
+  private readFactoryCommandReceiptSync(organizationId: string, workOrderId: string, idempotencyKey: string): FactoryCommandReceipt | null {
+    const row = this.database.prepare("SELECT organization_id, work_order_id, idempotency_key, payload_fingerprint, command_id, event_ids_json, result_json, created_at FROM tinkerbot_factory_command_receipts WHERE organization_id = ? AND work_order_id = ? AND idempotency_key = ?").get(organizationId, workOrderId, idempotencyKey) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    let eventIds: string[] = [];
+    try { const parsed = JSON.parse(String(row.event_ids_json)); if (Array.isArray(parsed)) eventIds = parsed.filter((item): item is string => typeof item === "string"); } catch { /* malformed receipt is treated as absent */ }
+    return { organizationId: String(row.organization_id), workOrderId: String(row.work_order_id), idempotencyKey: String(row.idempotency_key), payloadFingerprint: String(row.payload_fingerprint), commandId: String(row.command_id), eventIds, resultJson: row.result_json ? String(row.result_json) : undefined, createdAt: String(row.created_at) };
+  }
+
+  override async getFactoryCommandReceipt(organizationId: string, workOrderId: string, idempotencyKey: string): Promise<FactoryCommandReceipt | null> {
+    return this.readFactoryCommandReceiptSync(organizationId, workOrderId, idempotencyKey);
+  }
+
+  override async putFactoryCommandReceipt(receipt: FactoryCommandReceipt): Promise<void> {
+    const existing = await this.getFactoryCommandReceipt(receipt.organizationId, receipt.workOrderId, receipt.idempotencyKey);
+    if (existing && existing.payloadFingerprint !== receipt.payloadFingerprint) throw new Error("idempotency_conflict");
+    this.database.prepare("INSERT OR IGNORE INTO tinkerbot_factory_command_receipts (organization_id, work_order_id, idempotency_key, payload_fingerprint, command_id, event_ids_json, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(
+      receipt.organizationId, receipt.workOrderId, receipt.idempotencyKey, receipt.payloadFingerprint, receipt.commandId, JSON.stringify(receipt.eventIds), receipt.resultJson ?? null, receipt.createdAt,
+    );
+  }
+
   override async insertAftercare(record: AftercareRecord): Promise<void> {
     await super.insertAftercare(record);
     this.database.prepare("INSERT INTO tinkerbot_aftercare (release_id, owner, environment, payload_json, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(release_id) DO UPDATE SET payload_json = excluded.payload_json").run(
@@ -590,25 +683,70 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
     assertNoSecretInPayload({ payload: event.payload, externalReferences: event.externalReferences });
     await super.appendFactoryEvent(event);
     try {
-      this.database.prepare("INSERT INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, policy_version, provenance, external_references_json, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
-        event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
+      this.database.prepare("INSERT INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, aggregate_sequence, command_id, idempotency_key, payload_fingerprint, policy_version, provenance, external_references_json, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+        event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.aggregateSequence ?? null, event.commandId ?? null, event.idempotencyKey ?? null, event.payloadFingerprint ?? null, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
       );
       await this.enqueueOutbox({ eventId: event.eventId, kind: "factory-graph-event", payloadJson: JSON.stringify({ event }), createdAt: event.occurredAt });
+      if (event.aggregateType === "work_order") this.refreshLifecycleProjectionSync(event.aggregateId);
     } catch (error) {
       this.factoryEvents.splice(this.factoryEvents.findIndex((item) => item.eventId === event.eventId), 1);
       throw error;
     }
   }
 
+  override async appendFactoryEvents(events: readonly FactoryEvent[]): Promise<void> {
+    await super.appendFactoryEvents(events);
+    try {
+      this.database.exec("BEGIN");
+      for (const event of events) {
+        this.database.prepare("INSERT OR IGNORE INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, aggregate_sequence, command_id, idempotency_key, payload_fingerprint, policy_version, provenance, external_references_json, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+          event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.aggregateSequence ?? null, event.commandId ?? null, event.idempotencyKey ?? null, event.payloadFingerprint ?? null, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
+        );
+        this.database.prepare("INSERT OR IGNORE INTO tinkerbot_sync_outbox (event_id, kind, payload_json, created_at, synced_at) VALUES (?, ?, ?, ?, NULL)").run(event.eventId, "factory-graph-event", JSON.stringify({ event }), event.occurredAt);
+      }
+      this.database.exec("COMMIT");
+      for (const aggregateId of new Set(events.map((event) => event.aggregateId))) this.refreshLifecycleProjectionSync(aggregateId);
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch { /* preserve the original persistence failure */ }
+      const ids = new Set(events.map((event) => event.eventId));
+      for (let index = this.factoryEvents.length - 1; index >= 0; index -= 1) if (ids.has(this.factoryEvents[index]!.eventId)) this.factoryEvents.splice(index, 1);
+      throw error;
+    }
+  }
+
   readFactoryEvents(aggregateId: string): FactoryEvent[] {
-    const rows = this.database.prepare("SELECT * FROM tinkerbot_factory_graph_events WHERE aggregate_id = ? ORDER BY occurred_at, event_id").all(aggregateId) as Array<Record<string, unknown>>;
-    return rows.map(rowToFactoryEvent);
+    const rows = this.database.prepare("SELECT * FROM tinkerbot_factory_graph_events WHERE aggregate_id = ? ORDER BY COALESCE(aggregate_sequence, 9223372036854775807), occurred_at, event_id").all(aggregateId) as Array<Record<string, unknown>>;
+    return rows.map(rowToFactoryEvent).sort((left, right) => (left.aggregateSequence !== undefined && right.aggregateSequence !== undefined && left.aggregateSequence !== right.aggregateSequence ? left.aggregateSequence - right.aggregateSequence : left.occurredAt.localeCompare(right.occurredAt) || left.eventId.localeCompare(right.eventId)));
+  }
+
+  private refreshLifecycleProjectionSync(workOrderId: string): void {
+    const order = this.orders.get(workOrderId);
+    if (!order) return;
+    const projection = projectFactoryEvents(this.readFactoryEvents(workOrderId));
+    const reviewAssessment = projection.reviewAssessment === "CLEAR" || projection.reviewAssessment === "REVISE" ? projection.reviewAssessment : "NEEDS_HUMAN_REVIEW";
+    const releaseDecision = projection.releaseDecision === "RELEASE" ? "READY" : "BLOCKED";
+    this.orders.set(workOrderId, { ...order, verificationVerdict: projection.verificationVerdict, reviewAssessment, releaseDecision });
+    this.database.prepare("UPDATE tinkerbot_work_orders SET verification_verdict = ?, review_assessment = ?, release_decision = ? WHERE work_order_id = ?").run(projection.verificationVerdict, reviewAssessment, releaseDecision, workOrderId);
   }
 
   override async listFactoryEvents(aggregateId: string): Promise<FactoryEvent[]> { return this.readFactoryEvents(aggregateId); }
 
   override async reconstructFactoryGraph(aggregateId: string): Promise<FactoryProjection> {
     return projectFactoryEvents(this.readFactoryEvents(aggregateId));
+  }
+
+  shadowReadWorkOrder(workOrderId: string): ReturnType<typeof shadowReadFactoryProjection> | null {
+    const order = this.orders.get(workOrderId);
+    if (!order) return null;
+    return shadowReadFactoryProjection(this.reconstructFactoryGraphSync(workOrderId), { verificationVerdict: order.verificationVerdict, reviewAssessment: order.reviewAssessment, releaseDecision: order.releaseDecision });
+  }
+
+  listFactoryAuditEvents(workOrderId: string): ReturnType<typeof projectFactoryAuditEvents> {
+    return projectFactoryAuditEvents(this.readFactoryEvents(workOrderId));
+  }
+
+  private reconstructFactoryGraphSync(workOrderId: string): FactoryProjection {
+    return projectFactoryEvents(this.readFactoryEvents(workOrderId));
   }
 }
 
@@ -619,6 +757,14 @@ function ensureSqliteColumns(database: SqliteDatabase): void {
   if (!names.has("review_assessment")) database.exec("ALTER TABLE tinkerbot_work_orders ADD COLUMN review_assessment TEXT NOT NULL DEFAULT 'NEEDS_HUMAN_REVIEW'");
   if (!names.has("release_decision")) database.exec("ALTER TABLE tinkerbot_work_orders ADD COLUMN release_decision TEXT NOT NULL DEFAULT 'BLOCKED'");
   if (!names.has("waiver_json")) database.exec("ALTER TABLE tinkerbot_work_orders ADD COLUMN waiver_json TEXT");
+  const eventColumns = database.prepare("PRAGMA table_info(tinkerbot_factory_graph_events)").all() as Array<{ name: string }>;
+  const eventNames = new Set(eventColumns.map((column) => column.name));
+  if (!eventNames.has("aggregate_sequence")) database.exec("ALTER TABLE tinkerbot_factory_graph_events ADD COLUMN aggregate_sequence INTEGER");
+  if (!eventNames.has("schema_version")) database.exec("ALTER TABLE tinkerbot_factory_graph_events ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1");
+  if (!eventNames.has("command_id")) database.exec("ALTER TABLE tinkerbot_factory_graph_events ADD COLUMN command_id TEXT");
+  if (!eventNames.has("idempotency_key")) database.exec("ALTER TABLE tinkerbot_factory_graph_events ADD COLUMN idempotency_key TEXT");
+  if (!eventNames.has("payload_fingerprint")) database.exec("ALTER TABLE tinkerbot_factory_graph_events ADD COLUMN payload_fingerprint TEXT");
+  database.exec("CREATE TABLE IF NOT EXISTS tinkerbot_factory_command_receipts (organization_id TEXT NOT NULL, work_order_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_fingerprint TEXT NOT NULL, command_id TEXT NOT NULL, event_ids_json TEXT NOT NULL, result_json TEXT, created_at TEXT NOT NULL, PRIMARY KEY (organization_id, work_order_id, idempotency_key))");
 }
 
 function rowToWorkOrder(row: Record<string, unknown>): WorkOrder {
@@ -665,5 +811,5 @@ function rowToUsage(row: Record<string, unknown>): ProviderUsage {
 }
 
 function rowToFactoryEvent(row: Record<string, unknown>): FactoryEvent {
-  return { eventId: String(row.event_id), aggregateId: String(row.aggregate_id), aggregateType: String(row.aggregate_type), organizationId: String(row.organization_id), factoryId: String(row.factory_id), type: String(row.event_type) as FactoryEvent["type"], actorId: String(row.actor_id), actorType: String(row.actor_type) as FactoryEvent["actorType"], occurredAt: String(row.occurred_at), correlationId: String(row.correlation_id), causationId: row.causation_id ? String(row.causation_id) : undefined, schemaVersion: 1, policyVersion: row.policy_version ? String(row.policy_version) : undefined, provenance: String(row.provenance) as FactoryEvent["provenance"], externalReferences: row.external_references_json ? JSON.parse(String(row.external_references_json)) : undefined, payload: JSON.parse(String(row.payload_json)) };
+  return { eventId: String(row.event_id), aggregateId: String(row.aggregate_id), aggregateType: String(row.aggregate_type), organizationId: String(row.organization_id), factoryId: String(row.factory_id), type: String(row.event_type) as FactoryEvent["type"], actorId: String(row.actor_id), actorType: String(row.actor_type) as FactoryEvent["actorType"], occurredAt: String(row.occurred_at), correlationId: String(row.correlation_id), causationId: row.causation_id ? String(row.causation_id) : undefined, aggregateSequence: row.aggregate_sequence === null || row.aggregate_sequence === undefined ? undefined : Number(row.aggregate_sequence), commandId: row.command_id ? String(row.command_id) : undefined, idempotencyKey: row.idempotency_key ? String(row.idempotency_key) : undefined, payloadFingerprint: row.payload_fingerprint ? String(row.payload_fingerprint) : undefined, schemaVersion: Number(row.schema_version ?? 1) as 1, policyVersion: row.policy_version ? String(row.policy_version) : undefined, provenance: String(row.provenance) as FactoryEvent["provenance"], externalReferences: row.external_references_json ? JSON.parse(String(row.external_references_json)) : undefined, payload: JSON.parse(String(row.payload_json)) };
 }

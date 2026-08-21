@@ -8,13 +8,13 @@ describe("Factory Graph", () => {
     const ledger = new FactoryEventLedger();
     ledger.append({ ...envelope, type: "verification.completed", payload: { verdict: "PASS" } });
     ledger.append({ ...envelope, type: "review.completed", payload: { decision: "APPROVE" } });
-    ledger.append({ ...envelope, type: "release.completed", payload: {} });
+    ledger.append({ ...envelope, type: "release.completed", payload: { decision: "RELEASE" } });
     ledger.append({ ...envelope, type: "outcome.measurement_started", payload: {} });
     const state = ledger.reconstruct("wo_1");
     expect(state).toMatchObject({ verificationVerdict: "PASS", reviewDecision: "APPROVE", releaseDecision: "RELEASE", outcomeStatus: "PENDING" });
     expect(mayRecordRelease(state, "worker_1", ["worker_1"])).toEqual({ ok: false, reason: "worker_cannot_approve_or_release_own_work" });
     expect(mayRecordRelease(state, "release_owner", ["worker_1"])).toEqual({ ok: true });
-    expect(() => ledger.append({ ...envelope, eventId: ledger.all()[0]?.eventId, type: "release.requested", payload: {} })).toThrow("duplicate_event_id");
+    expect(() => ledger.append({ ...envelope, eventId: ledger.all()[0]?.eventId, type: "release.requested", payload: { workOrderId: "wo_1", requestId: "duplicate" } })).toThrow("duplicate_event_id");
   });
 
   test("does not treat immature outcomes as success and calculates the primary metric", () => {
