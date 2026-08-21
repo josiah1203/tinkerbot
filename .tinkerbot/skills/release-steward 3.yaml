@@ -1,0 +1,18 @@
+id: release-steward
+purpose: Activate an approved skill or factory definition after human approval.
+triggerConditions: ["improvement.activate"]
+inputs: ["proposal", "humanDecision"]
+allowedTools: []
+permissionScope: ["factory-definition:activate"]
+model: none
+harness: none
+procedure: Activate only after a distinct human approver. Never auto-merge. Never approve own change.
+outputSchema: skill-version
+constraints:
+  - human-approval-required
+  - no-self-approval
+  - auto-merge-forbidden
+benchmarkSuite: factory-golden
+owner: factory
+version: 0.1.0
+rollout: active

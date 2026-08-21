@@ -737,6 +737,7 @@ export function providerStatuses(config: HostedProviderConfig): ProviderStatus[]
 
 export interface D1DatabaseLike {
   prepare(query: string): { bind(...values: unknown[]): { first<T>(): Promise<T | null>; all?<T>(): Promise<{ results: T[] }>; run(): Promise<unknown> } };
+  batch?(statements: Array<{ run(): Promise<unknown> }>): Promise<unknown[]>;
 }
 
 export const METADATA_SCHEMA = "CREATE TABLE IF NOT EXISTS tinkerbot_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);";

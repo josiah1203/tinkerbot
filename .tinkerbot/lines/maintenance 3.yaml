@@ -1,0 +1,6 @@
+id: maintenance
+stages: [foreman, triage, implementation, verification, release]
+agents: [foreman, maintenance, verification]
+autonomy: assisted
+requiredEvidence: [verification-receipt]
+approvalRoles: [maintainer, admin, owner]

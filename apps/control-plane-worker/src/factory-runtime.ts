@@ -294,6 +294,9 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
     workOrderId: order.workOrderId,
     factoryId: factory.factoryId,
     organizationId,
+    changeSetId: message.sha ?? order.workOrderId,
+    changeSetDigest: message.sha ? `sha256:${message.sha}` : order.definitionDigest,
+    verificationRunId: runId,
     store: factories,
     priorStages,
     priorPlan: priorPlan ?? undefined,
@@ -474,6 +477,23 @@ export async function routeFactoryQueueMessage(env: FactoryEnv, message: Factory
   return runFactoryTurn(env, message);
 }
 
+export async function runForemanWorkDecision(env: FactoryEnv, input: { workOrderId: string; organizationId: string; actor: string; type: "review" | "release"; decision: "approved" | "rejected" | "changes_requested"; now: string }): Promise<{ workOrder: Awaited<ReturnType<D1FactoryStore["getWorkOrderView"]>>; availableActions: unknown[] }> {
+  if (!env.DB) throw new Error("foreman_database_not_configured");
+  const factories = new D1FactoryStore(env.DB);
+  const order = await factories.getWorkOrderForOrganization(input.workOrderId, input.organizationId);
+  if (!order) throw new Error("work_order_not_found");
+  if (input.type === "release" && input.decision !== "approved") throw new Error("invalid_release_decision");
+  await factories.recordTypedDecision({ workOrderId: order.workOrderId, organizationId: input.organizationId, actor: input.actor, type: input.type, decision: input.decision, now: input.now });
+  if (input.type === "release") {
+    const transition = order.status === "ready" ? await factories.applyTransition(order.workOrderId, "merged", `release-merge:${crypto.randomUUID()}`, input.actor) : { ok: true as const, order };
+    if (!transition.ok) throw new Error(`release_candidate_${transition.code}`);
+    const released = transition.order.status === "merged" ? await factories.applyTransition(order.workOrderId, "released", `release:${crypto.randomUUID()}`, input.actor) : transition;
+    if (!released.ok) throw new Error(`release_transition_${released.code}`);
+  }
+  const workOrder = await factories.getWorkOrderView(order.workOrderId, input.organizationId);
+  return { workOrder, availableActions: workOrder?.availableActions ?? [] };
+}
+
 async function dispatchSandboxIfBound(env: FactoryEnv, input: { workOrderId: string; repository: string; intent?: string; installationId?: number; organizationId: string; runId: string }): Promise<{ complete: boolean; sha?: string }> {
   const plan = sandboxImplementPlan({ repository: input.repository, workOrderId: input.workOrderId, intent: input.intent });
   if (!env.Sandbox || typeof env.Sandbox !== "object") return { complete: false };
@@ -565,6 +585,17 @@ export class ForemanDurableObject {
       && typeof body.sourceId === "string"
       && typeof body.actor === "string") {
       const result = await runFactoryTurn(this.env, body as unknown as Parameters<typeof runFactoryTurn>[1]);
+      return Response.json(result);
+    }
+    if (request.method === "POST"
+      && request.headers.get("x-tinkerbot-internal") === "foreman-v1"
+      && body.command === "work_decision"
+      && typeof body.workOrderId === "string"
+      && typeof body.organizationId === "string"
+      && typeof body.actor === "string"
+      && (body.type === "review" || body.type === "release")
+      && (body.decision === "approved" || body.decision === "rejected" || body.decision === "changes_requested")) {
+      const result = await runForemanWorkDecision(this.env, { workOrderId: body.workOrderId, organizationId: body.organizationId, actor: body.actor, type: body.type, decision: body.decision, now: typeof body.now === "string" ? body.now : new Date().toISOString() });
       return Response.json(result);
     }
     if (url.pathname.endsWith("/steer") || request.method === "POST") {

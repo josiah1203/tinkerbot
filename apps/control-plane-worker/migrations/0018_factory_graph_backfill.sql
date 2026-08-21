@@ -41,10 +41,10 @@ SELECT
     WHEN 'implementation' THEN 'task.started'
     WHEN 'review' THEN 'review.requested'
     WHEN 'verification' THEN 'verification.started'
-    WHEN 'approval' THEN 'review.completed'
+    WHEN 'approval' THEN 'approval.requested'
     WHEN 'ready' THEN 'release.requested'
     WHEN 'merged' THEN 'integration_candidate.assembled'
-    WHEN 'released' THEN 'release.completed'
+    WHEN 'released' THEN 'release.executed'
     WHEN 'blocked' THEN 'task.blocked'
     WHEN 'failed' THEN 'task.reworked'
     ELSE NULL
@@ -58,7 +58,11 @@ SELECT
   w.policy_version,
   'ATTESTED',
   NULL,
-  json_object('fromState', e.from_state, 'toState', e.to_state, 'legacyEventId', e.event_id)
+  json_object('fromState', e.from_state, 'toState', e.to_state, 'workOrderId', e.work_order_id,
+    'requestId', CASE WHEN e.to_state = 'approval' THEN e.cause_id ELSE NULL END,
+    'scope', CASE WHEN e.to_state = 'approval' THEN 'SPEC' ELSE NULL END,
+    'releaseId', CASE WHEN e.to_state = 'released' THEN e.cause_id ELSE NULL END,
+    'legacyEventId', e.event_id)
 FROM tinkerbot_work_order_events e
 JOIN tinkerbot_work_orders w ON w.work_order_id = e.work_order_id
 WHERE e.to_state IN ('triage', 'specification', 'implementation', 'review', 'verification', 'approval', 'ready', 'merged', 'released', 'blocked', 'failed');

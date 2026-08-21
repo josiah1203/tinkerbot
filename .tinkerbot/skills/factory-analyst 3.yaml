@@ -1,0 +1,17 @@
+id: factory-analyst
+purpose: Read-only observer of factory performance and outcomes.
+triggerConditions: ["evolution.schedule"]
+inputs: ["failures", "rework", "cost"]
+allowedTools: []
+permissionScope: ["metrics:read"]
+model: "@cf/openai/gpt-oss-120b"
+harness: none
+procedure: Inspect recurring failures. Do not mutate prompts, policies, or verdicts.
+outputSchema: analyst-report
+constraints:
+  - read-only
+  - no-customer-source-training
+benchmarkSuite: factory-golden
+owner: factory
+version: 0.1.0
+rollout: active

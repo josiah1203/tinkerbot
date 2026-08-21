@@ -5,6 +5,8 @@ import {
   WorkOrderState,
   applyFactoryTree,
   assertFactoryEventAuthority,
+  assertFactoryEventOrdering,
+  assertFactoryTreeIntegrity,
   classifyActivityColumn,
   classifyWorkOrderGroup,
   createWorkOrder,
@@ -15,6 +17,17 @@ import {
   parseFactoryDefinition,
   transitionWorkOrder,
   projectFactoryEvents,
+  projectFactoryAuditEvents,
+  shadowReadFactoryProjection,
+  FactoryCommandBoundary,
+  createApprovalRecordedEvent,
+  createReleaseDecisionEvent,
+  createReviewRecordedEvent,
+  createVerificationRecordedEvent,
+  asApprovalEventId,
+  type FactoryCommandInput,
+  type FactoryCommandReceipt,
+  type FactoryCommandResult,
   type FactoryEvent,
   type FactoryProjection,
   type FactoryDefinition,
@@ -35,7 +48,11 @@ type WorkspaceIntegration = { id: string; name: string; kind: string; status: st
 type WorkspaceSecretMetadata = { id: string; name: string; status: string; owner?: string; updatedAt: string; references?: string };
 
 export class D1FactoryStore {
-  constructor(private readonly database: D1DatabaseLike) {}
+  readonly commandBoundary: FactoryCommandBoundary;
+
+  constructor(private readonly database: D1DatabaseLike) {
+    this.commandBoundary = new FactoryCommandBoundary(this);
+  }
 
   async listFactories(organizationId: string): Promise<Array<{ factoryId: string; name: string; status: string; updatedAt: string }>> {
     const statement = this.database.prepare("SELECT factory_id, name, status, updated_at FROM tinkerbot_factories WHERE organization_id = ?1 ORDER BY updated_at DESC").bind(organizationId);
@@ -61,6 +78,7 @@ export class D1FactoryStore {
     const normalizedFiles = input.files?.map((file) => ({ ...file, path: file.path.replaceAll("\\", "/") }));
     if (normalizedFiles && (normalizedFiles.length > 128 || normalizedFiles.some((file) => !file || typeof file.path !== "string" || !file.path || file.path.length > 512 || bytes(file.path) > 2_048 || file.path.includes("\0") || file.path.startsWith("/") || file.path.split("/").includes("..") || typeof file.contents !== "string" || bytes(file.contents) > 512_000))) throw new Error("Factory files exceed the allowed count, path, or content limits.");
     if (normalizedFiles && new Set(normalizedFiles.map((file) => file.path)).size !== normalizedFiles.length) throw new Error("Factory file paths must be unique.");
+    if (normalizedFiles) assertFactoryTreeIntegrity(normalizedFiles);
     if (normalizedFiles && normalizedFiles.reduce((total, file) => total + bytes(file.contents), 0) > 4_000_000) throw new Error("Factory files exceed the 4 MB content limit.");
     if ((input.yaml !== undefined || normalizedFiles) && containsRawCredentials({ yaml: input.yaml, files: normalizedFiles })) throw new Error("Factory definitions must not contain raw credentials.");
     if (input.yaml) {
@@ -147,15 +165,18 @@ export class D1FactoryStore {
     const order = await this.getWorkOrder(workOrderId);
     if (!order || order.organizationId !== organizationId) return null;
     const events = await this.listFactoryEvents(workOrderId, organizationId);
+    const graph = projectFactoryEvents(events);
     const latest = <T extends { occurredAt: string }>(items: T[]): T | undefined => items.slice().sort((a, b) => a.occurredAt.localeCompare(b.occurredAt)).at(-1);
-    const verificationEvent = latest(events.filter((event) => event.type === "verification.completed"));
-    const reviewEvent = latest(events.filter((event) => ["review.completed", "approval.recorded"].includes(event.type) && event.actorType === "human"));
-    const releaseEvent = latest(events.filter((event) => ["release.completed", "release.authorized"].includes(event.type) && event.actorType === "human"));
-    const verification = normalizeVerificationVerdict(verificationEvent?.payload && typeof verificationEvent.payload === "object" ? (verificationEvent.payload as Record<string, unknown>).verdict : order.verificationVerdict, order.currentStage ? "not_run" : "unknown");
+    const verificationEvent = latest(events.filter((event) => ["verification.recorded", "verification.completed"].includes(event.type)));
+    const reviewEvent = latest(events.filter((event) => ["review.recorded", "review.completed", "approval.recorded"].includes(event.type) && event.actorType === "human"));
+    const releaseEvent = latest(events.filter((event) => ["release.decided", "release.executed", "release.completed", "release.authorized"].includes(event.type) && event.actorType === "human"));
+    const verification = normalizeVerificationVerdict(graph.verificationVerdict ?? (verificationEvent?.payload && typeof verificationEvent.payload === "object" ? (verificationEvent.payload as Record<string, unknown>).verdict : order.verificationVerdict), order.currentStage ? "not_run" : "unknown");
     const reviewPayload = reviewEvent?.payload && typeof reviewEvent.payload === "object" ? reviewEvent.payload as Record<string, unknown> : undefined;
-    const review = reviewEvent ? normalizeReviewDecision(reviewPayload?.decision, "awaiting_human") : normalizeReviewDecision(order.reviewAssessment, "awaiting_human");
+    const canonicalReview = graph.reviewAssessment === "CLEAR" ? "approved" : graph.reviewAssessment === "REVISE" ? "changes_requested" : graph.reviewAssessment === "NEEDS_HUMAN_REVIEW" ? "awaiting_human" : undefined;
+    const review = canonicalReview ? normalizeReviewDecision(canonicalReview, "awaiting_human") : reviewEvent ? normalizeReviewDecision(reviewPayload?.decision, "awaiting_human") : normalizeReviewDecision(order.reviewAssessment, "awaiting_human");
     const releasePayload = releaseEvent?.payload && typeof releaseEvent.payload === "object" ? releaseEvent.payload as Record<string, unknown> : undefined;
-    const release = normalizeReleaseDecision(releaseEvent ? releasePayload?.decision : order.releaseDecision, { verification, review, released: Boolean(releaseEvent) || order.status === "released" });
+    const canonicalRelease = graph.releaseExecuted ? "released" : graph.releaseDecision === "RELEASE" ? "approved" : graph.releaseDecision === "HOLD" ? "awaiting_authorization" : graph.releaseApprovalEventId ? "awaiting_authorization" : verification === "pass" && review === "approved" && ["approval", "ready", "merged"].includes(order.status) ? "awaiting_authorization" : undefined;
+    const release = canonicalRelease ? normalizeReleaseDecision(canonicalRelease, { verification, review, released: canonicalRelease === "released" }) : normalizeReleaseDecision(releaseEvent ? releasePayload?.decision : order.releaseDecision, { verification, review, released: Boolean(graph.releaseExecuted) });
     const outcome = normalizeOutcomeStatus(order.status === "released" ? "accepted" : order.status === "failed" ? "failed" : undefined, "pending");
     const run = await this.getRunByWorkOrder(order.workOrderId);
     const unresolvedUnknownCount = verification === "unknown" || verification === "not_run" && ["verification", "release"].includes(stageView(order.currentStage)) ? 1 : 0;
@@ -319,8 +340,6 @@ export class D1FactoryStore {
     if (!current) return { ok: false, code: "not_found" };
     const result = transitionWorkOrder(current, toState, causeId, actor);
     if ("error" in result) return { ok: false, code: result.error };
-    await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_work_order_events (event_id, work_order_id, from_state, to_state, cause_id, actor, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)").bind(result.event.eventId, result.event.workOrderId, result.event.fromState, result.event.toState, result.event.causeId, result.event.actor, result.event.createdAt).run();
-    await this.database.prepare("UPDATE tinkerbot_work_orders SET status = ?1, current_stage = ?2, actor = ?3, updated_at = ?4, product_id = COALESCE(?5, product_id), line_id = COALESCE(?6, line_id), cell_id = COALESCE(?7, cell_id), autonomy_mode = COALESCE(?8, autonomy_mode), output_kind = COALESCE(?9, output_kind), held_by = ?10 WHERE work_order_id = ?11").bind(result.order.status, result.order.currentStage, result.order.actor, result.order.updatedAt, result.order.productId ?? null, result.order.lineId ?? null, result.order.cellId ?? null, result.order.autonomyMode ?? null, result.order.outputKind ?? null, result.order.heldBy ?? null, workOrderId).run();
     const graphEvent = graphEventForWorkOrderTransition({
       workOrderId: result.order.workOrderId,
       factoryId: result.order.factoryId,
@@ -331,8 +350,13 @@ export class D1FactoryStore {
       toState: result.event.toState,
       causeId: result.event.causeId,
       createdAt: result.event.createdAt,
+      definitionDigest: result.order.definitionDigest,
+      changeSetId: result.order.workOrderId,
+      changeSetDigest: result.order.definitionDigest,
     });
-    if (graphEvent) await this.appendFactoryEvent(graphEvent);
+    if (graphEvent) await this.commandBoundary.dispatch({ organizationId: result.order.organizationId, factoryId: result.order.factoryId, workOrderId: result.order.workOrderId, actorId: graphEvent.actorId, actorType: graphEvent.actorType, idempotencyKey: `transition:${result.event.eventId}`, payload: graphEvent.payload, now: graphEvent.occurredAt, buildEvents: () => [graphEvent] });
+    await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_work_order_events (event_id, work_order_id, from_state, to_state, cause_id, actor, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)").bind(result.event.eventId, result.event.workOrderId, result.event.fromState, result.event.toState, result.event.causeId, result.event.actor, result.event.createdAt).run();
+    await this.database.prepare("UPDATE tinkerbot_work_orders SET status = ?1, current_stage = ?2, actor = ?3, updated_at = ?4, product_id = COALESCE(?5, product_id), line_id = COALESCE(?6, line_id), cell_id = COALESCE(?7, cell_id), autonomy_mode = COALESCE(?8, autonomy_mode), output_kind = COALESCE(?9, output_kind), held_by = ?10 WHERE work_order_id = ?11").bind(result.order.status, result.order.currentStage, result.order.actor, result.order.updatedAt, result.order.productId ?? null, result.order.lineId ?? null, result.order.cellId ?? null, result.order.autonomyMode ?? null, result.order.outputKind ?? null, result.order.heldBy ?? null, workOrderId).run();
     return { ok: true, order: result.order, event: result.event };
   }
 
@@ -438,21 +462,20 @@ export class D1FactoryStore {
   async insertApproval(workOrderId: string, actor: string, decision: "approved" | "rejected", signature: string, now: string): Promise<void> {
     await this.database.prepare("INSERT INTO tinkerbot_approvals (approval_id, work_order_id, actor, decision, signature, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(crypto.randomUUID(), workOrderId, actor, decision, signature, now).run();
     const order = await this.getWorkOrder(workOrderId);
-    if (order) await this.appendFactoryEvent({
-      eventId: `approval_${workOrderId}_${decision}_${signature}`,
-      type: "approval.recorded",
-      aggregateId: workOrderId,
-      aggregateType: "work_order",
+    if (!order) return;
+    const current = await this.reconstructFactoryGraph(workOrderId, order.organizationId);
+    const changeSetId = current.currentChangeSetId ?? workOrderId;
+    const changeSetDigest = current.currentChangeSetDigest ?? order.definitionDigest;
+    await this.commandBoundary.dispatch({
       organizationId: order.organizationId,
       factoryId: order.factoryId,
+      workOrderId,
       actorId: actor,
       actorType: "human",
-      occurredAt: now,
-      correlationId: workOrderId,
-      schemaVersion: 1,
-      policyVersion: order.policyVersion,
-      provenance: "HUMAN_VERIFIED",
-      payload: { decision, workOrderId, signature },
+      idempotencyKey: `spec-approval:${signature}:${decision}`,
+      payload: { changeSetId, changeSetDigest, decision },
+      now,
+      buildEvents: ({ commandId }) => [createApprovalRecordedEvent({ eventId: `approval_${workOrderId}_${commandId}`, aggregateId: workOrderId, aggregateType: "work_order", organizationId: order.organizationId, factoryId: order.factoryId, actorId: actor, actorType: "human", occurredAt: now, correlationId: workOrderId, policyVersion: order.policyVersion, workOrderId, changeSetId, changeSetDigest, scope: "SPEC", outcome: decision === "approved" ? "GRANTED" : "DENIED", approverId: actor, rationale: signature })],
     });
   }
 
@@ -497,52 +520,66 @@ export class D1FactoryStore {
     return false;
   }
 
-  async patchWorkOrder(workOrderId: string, patch: Partial<Pick<WorkOrder, "productId" | "lineId" | "cellId" | "owner" | "risk" | "autonomyMode" | "outputKind" | "heldBy" | "intent" | "acceptanceCriteria" | "verificationVerdict" | "reviewAssessment" | "releaseDecision">> & { now: string }): Promise<void> {
+  async patchWorkOrder(workOrderId: string, patch: Partial<Pick<WorkOrder, "productId" | "lineId" | "cellId" | "owner" | "risk" | "autonomyMode" | "outputKind" | "heldBy" | "intent" | "acceptanceCriteria">> & { now: string }): Promise<void> {
     const current = await this.getWorkOrder(workOrderId);
     if (!current) return;
-    await this.database.prepare("UPDATE tinkerbot_work_orders SET product_id = ?1, line_id = ?2, cell_id = ?3, owner = ?4, risk = ?5, autonomy_mode = ?6, output_kind = ?7, held_by = ?8, intent = ?9, acceptance_criteria = ?10, updated_at = ?11, verification_verdict = ?12, review_assessment = ?13, release_decision = ?14 WHERE work_order_id = ?15").bind(patch.productId ?? current.productId ?? null, patch.lineId ?? current.lineId ?? null, patch.cellId ?? current.cellId ?? null, patch.owner ?? current.owner ?? null, patch.risk ?? current.risk ?? null, patch.autonomyMode ?? current.autonomyMode ?? null, patch.outputKind ?? current.outputKind ?? null, patch.heldBy === undefined ? current.heldBy ?? null : patch.heldBy, patch.intent ?? current.intent ?? null, patch.acceptanceCriteria ?? current.acceptanceCriteria ?? null, patch.now, patch.verificationVerdict ?? current.verificationVerdict ?? "UNKNOWN", patch.reviewAssessment ?? current.reviewAssessment ?? "NEEDS_HUMAN_REVIEW", patch.releaseDecision ?? current.releaseDecision ?? "BLOCKED", workOrderId).run();
+    await this.database.prepare("UPDATE tinkerbot_work_orders SET product_id = ?1, line_id = ?2, cell_id = ?3, owner = ?4, risk = ?5, autonomy_mode = ?6, output_kind = ?7, held_by = ?8, intent = ?9, acceptance_criteria = ?10, updated_at = ?11 WHERE work_order_id = ?12").bind(patch.productId ?? current.productId ?? null, patch.lineId ?? current.lineId ?? null, patch.cellId ?? current.cellId ?? null, patch.owner ?? current.owner ?? null, patch.risk ?? current.risk ?? null, patch.autonomyMode ?? current.autonomyMode ?? null, patch.outputKind ?? current.outputKind ?? null, patch.heldBy === undefined ? current.heldBy ?? null : patch.heldBy, patch.intent ?? current.intent ?? null, patch.acceptanceCriteria ?? current.acceptanceCriteria ?? null, patch.now, workOrderId).run();
+  }
+
+  private async refreshLifecycleProjection(workOrderId: string, organizationId: string): Promise<FactoryProjection> {
+    const projection = await this.reconstructFactoryGraph(workOrderId, organizationId);
+    const reviewAssessment = projection.reviewAssessment === "CLEAR" || projection.reviewAssessment === "REVISE" ? projection.reviewAssessment : "NEEDS_HUMAN_REVIEW";
+    const releaseDecision = projection.releaseDecision === "RELEASE" ? "READY" : "BLOCKED";
+    await this.database.prepare("UPDATE tinkerbot_work_orders SET verification_verdict = ?1, review_assessment = ?2, release_decision = ?3 WHERE work_order_id = ?4").bind(projection.verificationVerdict, reviewAssessment, releaseDecision, workOrderId).run();
+    return projection;
+  }
+
+  async recordVerification(input: { workOrderId: string; organizationId: string; actorId?: string; changeSetId?: string; changeSetDigest?: string; verificationRunId: string; verdict: "PASS" | "FAIL" | "UNKNOWN"; now: string }): Promise<FactoryProjection | null> {
+    const order = await this.getWorkOrder(input.workOrderId);
+    if (!order || order.organizationId !== input.organizationId) return null;
+    const current = await this.reconstructFactoryGraph(input.workOrderId, input.organizationId);
+    const changeSetId = input.changeSetId ?? current.currentChangeSetId ?? input.workOrderId;
+    const changeSetDigest = input.changeSetDigest ?? current.currentChangeSetDigest ?? order.definitionDigest;
+    await this.commandBoundary.dispatch({
+      organizationId: input.organizationId,
+      factoryId: order.factoryId,
+      workOrderId: input.workOrderId,
+      actorId: input.actorId ?? "deterministic-verifier",
+      actorType: "system",
+      idempotencyKey: `verification:${input.verificationRunId}:${changeSetDigest}`,
+      payload: { changeSetId, changeSetDigest, verificationRunId: input.verificationRunId, verdict: input.verdict },
+      now: input.now,
+      buildEvents: ({ commandId }) => [createVerificationRecordedEvent({ eventId: `verification_${input.workOrderId}_${commandId}`, aggregateId: input.workOrderId, aggregateType: "work_order", organizationId: input.organizationId, factoryId: order.factoryId, actorId: input.actorId ?? "deterministic-verifier", actorType: "system", occurredAt: input.now, correlationId: input.verificationRunId, policyVersion: order.policyVersion, workOrderId: input.workOrderId, changeSetId, changeSetDigest, verificationRunId: input.verificationRunId, verdict: input.verdict })],
+    });
+    return this.refreshLifecycleProjection(input.workOrderId, input.organizationId);
   }
 
   async recordTypedDecision(input: { workOrderId: string; organizationId: string; actor: string; type: "review" | "release"; decision: "approved" | "rejected" | "changes_requested"; now: string }): Promise<void> {
     const order = await this.getWorkOrder(input.workOrderId);
     if (!order || order.organizationId !== input.organizationId) return;
+    const current = await this.reconstructFactoryGraph(input.workOrderId, input.organizationId);
+    const changeSetId = current.currentChangeSetId ?? input.workOrderId;
+    const changeSetDigest = current.currentChangeSetDigest ?? order.definitionDigest;
     if (input.type === "review") {
-      await this.patchWorkOrder(input.workOrderId, { reviewAssessment: input.decision === "approved" ? "CLEAR" : input.decision === "changes_requested" ? "REVISE" : "NEEDS_HUMAN_REVIEW", now: input.now });
-      await this.appendFactoryEvent({
-        eventId: `review_${input.workOrderId}_${crypto.randomUUID()}`,
-        type: "review.completed",
-        aggregateId: input.workOrderId,
-        aggregateType: "work_order",
-        organizationId: input.organizationId,
-        factoryId: order.factoryId,
-        actorId: input.actor,
-        actorType: "human",
-        occurredAt: input.now,
-        correlationId: input.workOrderId,
-        schemaVersion: 1,
-        policyVersion: order.policyVersion,
-        provenance: "HUMAN_VERIFIED",
-        payload: { workOrderId: input.workOrderId, decision: input.decision === "approved" ? "APPROVE" : input.decision === "changes_requested" ? "REQUEST_CHANGES" : "ESCALATE" },
+      const outcome = input.decision === "approved" ? "NO_FINDINGS" : input.decision === "changes_requested" ? "FINDINGS" : "ESCALATE";
+      await this.commandBoundary.dispatch({
+        organizationId: input.organizationId, factoryId: order.factoryId, workOrderId: input.workOrderId, actorId: input.actor, actorType: "human", idempotencyKey: `review:${changeSetDigest}:${input.decision}`, payload: { changeSetId, changeSetDigest, outcome }, now: input.now,
+        buildEvents: ({ commandId }) => [createReviewRecordedEvent({ eventId: `review_${input.workOrderId}_${commandId}`, aggregateId: input.workOrderId, aggregateType: "work_order", organizationId: input.organizationId, factoryId: order.factoryId, actorId: input.actor, actorType: "human", occurredAt: input.now, correlationId: input.workOrderId, policyVersion: order.policyVersion, workOrderId: input.workOrderId, changeSetId, changeSetDigest, reviewId: `review_${input.workOrderId}_${commandId}`, outcome, reviewerId: input.actor, independence: "SECOND_HUMAN" })],
       });
+      await this.refreshLifecycleProjection(input.workOrderId, input.organizationId);
       return;
     }
-    await this.patchWorkOrder(input.workOrderId, { releaseDecision: input.decision === "approved" ? "READY" : "BLOCKED", now: input.now });
-    await this.appendFactoryEvent({
-      eventId: `release_${input.workOrderId}_${crypto.randomUUID()}`,
-      type: "release.completed",
-      aggregateId: input.workOrderId,
-      aggregateType: "work_order",
-      organizationId: input.organizationId,
-      factoryId: order.factoryId,
-      actorId: input.actor,
-      actorType: "human",
-      occurredAt: input.now,
-      correlationId: input.workOrderId,
-      schemaVersion: 1,
-      policyVersion: order.policyVersion,
-      provenance: "HUMAN_VERIFIED",
-      payload: { workOrderId: input.workOrderId, decision: input.decision === "approved" ? "RELEASE" : "HOLD" },
+    const approvalOutcome = input.decision === "rejected" ? "DENIED" : "GRANTED";
+    await this.commandBoundary.dispatch({
+      organizationId: input.organizationId, factoryId: order.factoryId, workOrderId: input.workOrderId, actorId: input.actor, actorType: "human", idempotencyKey: `release:${changeSetDigest}:${input.decision}`, payload: { changeSetId, changeSetDigest, decision: input.decision }, now: input.now,
+      buildEvents: ({ commandId }) => {
+        const approvalEventId = `approval_${input.workOrderId}_${commandId}`;
+        const approval = createApprovalRecordedEvent({ eventId: approvalEventId, aggregateId: input.workOrderId, aggregateType: "work_order", organizationId: input.organizationId, factoryId: order.factoryId, actorId: input.actor, actorType: "human", occurredAt: input.now, correlationId: input.workOrderId, policyVersion: order.policyVersion, workOrderId: input.workOrderId, changeSetId, changeSetDigest, scope: "RELEASE", outcome: approvalOutcome, approverId: input.actor, rationale: input.decision });
+        if (approvalOutcome === "DENIED") return [approval];
+        return [approval, createReleaseDecisionEvent({ eventId: `release_decision_${input.workOrderId}_${commandId}`, aggregateId: input.workOrderId, aggregateType: "work_order", organizationId: input.organizationId, factoryId: order.factoryId, actorId: input.actor, actorType: "human", occurredAt: input.now, correlationId: input.workOrderId, policyVersion: order.policyVersion, workOrderId: input.workOrderId, releaseId: `release_${input.workOrderId}`, outcome: "RELEASE", approvalRef: { kind: "release_approval", eventId: asApprovalEventId(approvalEventId), scope: "RELEASE", targetOutcome: "RELEASE", changeSetDigest }, changeSetId, changeSetDigest })];
+      },
     });
+    await this.refreshLifecycleProjection(input.workOrderId, input.organizationId);
   }
 
   async upsertWorkCell(cell: { cellId: string; factoryId: string; workOrderId?: string; kind: string; repository: string; branch: string; status: string; leasedBy?: string; heldBy?: string; credentialScope: string; cleanupAt: string; now: string; productionAccess?: string; observability?: string; allowedTools?: string[] }): Promise<void> {
@@ -675,7 +712,12 @@ export class D1FactoryStore {
       if (!factory || factory.organizationId !== input.organizationId) throw new Error("factory_not_found_for_organization");
       if (event.aggregateType === "work_order" && !await this.getWorkOrderForOrganization(event.aggregateId, input.organizationId)) throw new Error("work_order_not_found_for_organization");
       assertFactoryEventAuthority(event);
-      await this.appendFactoryEvent(event);
+      const bindingEvent = ["verification.recorded", "review.recorded", "approval.requested", "approval.recorded", "release.requested", "release.decided", "release.executed", "release.rolled_back"].includes(event.type);
+      if (bindingEvent) {
+        await this.commandBoundary.dispatch({ organizationId: input.organizationId, factoryId: event.factoryId, workOrderId: event.aggregateId, actorId: event.actorId, actorType: event.actorType, commandId: event.commandId, idempotencyKey: event.idempotencyKey ?? `runtime-sync:${event.eventId}`, payload: event.payload, now: event.occurredAt, buildEvents: () => [event] });
+      } else {
+        await this.appendFactoryEvent(event);
+      }
     }
     if (kind === "execution-plan" || payload.plan) {
       const plan = (payload.plan ?? payload) as import("../../../packages/factory/src/runtime").ExecutionPlan;
@@ -712,33 +754,96 @@ export class D1FactoryStore {
     return result.results ?? [];
   }
 
-  private async persistFactoryEvent(event: FactoryEvent): Promise<boolean> {
+  private async persistFactoryEvent(event: FactoryEvent, options: { commandBoundary?: boolean } = {}): Promise<boolean> {
+    if (!options.commandBoundary && ["verification.recorded", "review.recorded", "approval.requested", "approval.recorded", "release.requested", "release.decided", "release.executed", "release.rolled_back"].includes(event.type)) throw new Error("factory_command_boundary_required");
     assertFactoryEventAuthority(event);
+    if (["release.decided", "release.executed", "release.rolled_back"].includes(event.type)) assertFactoryEventOrdering(event, await this.listFactoryEvents(event.aggregateId, event.organizationId));
     if (containsRawCredentials({ payload: event.payload, externalReferences: event.externalReferences })) throw new Error("Factory graph events must not contain raw credentials.");
     const result = await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, schema_version, policy_version, provenance, external_references_json, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)").bind(
       event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.schemaVersion, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
     ).run() as { meta?: { changes?: number } };
+    if (result.meta?.changes !== 0 && (event.aggregateSequence !== undefined || event.commandId || event.idempotencyKey || event.payloadFingerprint)) {
+      await this.database.prepare("UPDATE tinkerbot_factory_graph_events SET aggregate_sequence = ?1, command_id = ?2, idempotency_key = ?3, payload_fingerprint = ?4 WHERE event_id = ?5").bind(event.aggregateSequence ?? null, event.commandId ?? null, event.idempotencyKey ?? null, event.payloadFingerprint ?? null, event.eventId).run();
+    }
     return result.meta?.changes !== 0;
   }
 
+  async appendFactoryEvents(events: readonly FactoryEvent[]): Promise<void> {
+    if (!events.length) return;
+    const priorByAggregate = new Map<string, FactoryEvent[]>();
+    for (const event of events) {
+      const prior = priorByAggregate.get(event.aggregateId) ?? await this.listFactoryEvents(event.aggregateId, event.organizationId);
+      assertFactoryEventAuthority(event);
+      if (containsRawCredentials({ payload: event.payload, externalReferences: event.externalReferences })) throw new Error("Factory graph events must not contain raw credentials.");
+      assertFactoryEventOrdering(event, prior);
+      priorByAggregate.set(event.aggregateId, [...prior, event]);
+    }
+    if (!this.database.batch) {
+      for (const event of events) await this.persistFactoryEvent(event, { commandBoundary: true });
+    } else {
+      const statements = events.map((event) => this.database.prepare("INSERT OR IGNORE INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, schema_version, aggregate_sequence, command_id, idempotency_key, payload_fingerprint, policy_version, provenance, external_references_json, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)").bind(
+        event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.schemaVersion, event.aggregateSequence ?? null, event.commandId ?? null, event.idempotencyKey ?? null, event.payloadFingerprint ?? null, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
+      ));
+      await this.database.batch(statements);
+    }
+    for (const aggregateId of new Set(events.map((event) => event.aggregateId))) {
+      const organizationId = events.find((event) => event.aggregateId === aggregateId)?.organizationId;
+      if (organizationId) await this.refreshLifecycleProjection(aggregateId, organizationId);
+    }
+  }
+
+  async getFactoryCommandReceipt(organizationId: string, workOrderId: string, idempotencyKey: string): Promise<FactoryCommandReceipt | null> {
+    const row = await this.database.prepare("SELECT organization_id, work_order_id, idempotency_key, payload_fingerprint, command_id, event_ids_json, result_json, created_at FROM tinkerbot_factory_command_receipts WHERE organization_id = ?1 AND work_order_id = ?2 AND idempotency_key = ?3").bind(organizationId, workOrderId, idempotencyKey).first<Record<string, unknown>>();
+    if (!row) return null;
+    let eventIds: string[] = [];
+    try { const parsed = JSON.parse(String(row.event_ids_json)); if (Array.isArray(parsed)) eventIds = parsed.filter((item): item is string => typeof item === "string"); } catch { /* malformed receipt is treated as absent and will be rebuilt from events */ }
+    return { organizationId: String(row.organization_id), workOrderId: String(row.work_order_id), idempotencyKey: String(row.idempotency_key), payloadFingerprint: String(row.payload_fingerprint), commandId: String(row.command_id), eventIds, resultJson: row.result_json ? String(row.result_json) : undefined, createdAt: String(row.created_at) };
+  }
+
+  async putFactoryCommandReceipt(receipt: FactoryCommandReceipt): Promise<void> {
+    const existing = await this.getFactoryCommandReceipt(receipt.organizationId, receipt.workOrderId, receipt.idempotencyKey);
+    if (existing && existing.payloadFingerprint !== receipt.payloadFingerprint) throw new Error("idempotency_conflict");
+    await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_factory_command_receipts (organization_id, work_order_id, idempotency_key, payload_fingerprint, command_id, event_ids_json, result_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)").bind(receipt.organizationId, receipt.workOrderId, receipt.idempotencyKey, receipt.payloadFingerprint, receipt.commandId, JSON.stringify(receipt.eventIds), receipt.resultJson ?? null, receipt.createdAt).run();
+  }
+
+  async dispatchFactoryCommand<T>(input: FactoryCommandInput<T>): Promise<FactoryCommandResult> {
+    return this.commandBoundary.dispatch(input);
+  }
+
   async appendFactoryEvent(event: FactoryEvent): Promise<void> {
-    await this.persistFactoryEvent(event);
+    const inserted = await this.persistFactoryEvent(event);
+    if (inserted && event.aggregateType === "work_order") await this.refreshLifecycleProjection(event.aggregateId, event.organizationId);
   }
 
   /** Insert an event and report whether this request won the idempotency race. */
   async appendFactoryEventOnce(event: FactoryEvent): Promise<boolean> {
-    return this.persistFactoryEvent(event);
+    const inserted = await this.persistFactoryEvent(event);
+    if (inserted && event.aggregateType === "work_order") await this.refreshLifecycleProjection(event.aggregateId, event.organizationId);
+    return inserted;
   }
 
-  async listFactoryEvents(aggregateId: string, organizationId: string): Promise<FactoryEvent[]> {
-    const statement = this.database.prepare("SELECT * FROM tinkerbot_factory_graph_events WHERE aggregate_id = ?1 AND organization_id = ?2 ORDER BY occurred_at, event_id").bind(aggregateId, organizationId);
+  async listFactoryEvents(aggregateId: string, organizationId?: string): Promise<FactoryEvent[]> {
+    const statement = organizationId
+      ? this.database.prepare("SELECT * FROM tinkerbot_factory_graph_events WHERE aggregate_id = ?1 AND organization_id = ?2 ORDER BY COALESCE(aggregate_sequence, 9223372036854775807), occurred_at, event_id").bind(aggregateId, organizationId)
+      : this.database.prepare("SELECT * FROM tinkerbot_factory_graph_events WHERE aggregate_id = ?1 ORDER BY COALESCE(aggregate_sequence, 9223372036854775807), occurred_at, event_id").bind(aggregateId);
     if (typeof statement.all !== "function") return [];
     const result = await statement.all<Record<string, unknown>>();
-    return (result.results ?? []).map((row) => ({ eventId: String(row.event_id), aggregateId: String(row.aggregate_id), aggregateType: String(row.aggregate_type), organizationId: String(row.organization_id), factoryId: String(row.factory_id), type: String(row.event_type) as FactoryEvent["type"], actorId: String(row.actor_id), actorType: String(row.actor_type) as FactoryEvent["actorType"], occurredAt: String(row.occurred_at), correlationId: String(row.correlation_id), causationId: row.causation_id ? String(row.causation_id) : undefined, schemaVersion: 1, policyVersion: row.policy_version ? String(row.policy_version) : undefined, provenance: String(row.provenance) as FactoryEvent["provenance"], externalReferences: row.external_references_json ? JSON.parse(String(row.external_references_json)) : undefined, payload: JSON.parse(String(row.payload_json)) }));
+    return (result.results ?? []).map((row) => ({ eventId: String(row.event_id), aggregateId: String(row.aggregate_id), aggregateType: String(row.aggregate_type), organizationId: String(row.organization_id), factoryId: String(row.factory_id), type: String(row.event_type) as FactoryEvent["type"], actorId: String(row.actor_id), actorType: String(row.actor_type) as FactoryEvent["actorType"], occurredAt: String(row.occurred_at), correlationId: String(row.correlation_id), causationId: row.causation_id ? String(row.causation_id) : undefined, aggregateSequence: row.aggregate_sequence === null || row.aggregate_sequence === undefined ? undefined : Number(row.aggregate_sequence), commandId: row.command_id ? String(row.command_id) : undefined, idempotencyKey: row.idempotency_key ? String(row.idempotency_key) : undefined, payloadFingerprint: row.payload_fingerprint ? String(row.payload_fingerprint) : undefined, schemaVersion: Number(row.schema_version ?? 1) as 1, policyVersion: row.policy_version ? String(row.policy_version) : undefined, provenance: String(row.provenance) as FactoryEvent["provenance"], externalReferences: row.external_references_json ? JSON.parse(String(row.external_references_json)) : undefined, payload: JSON.parse(String(row.payload_json)) })).sort((left, right) => (left.aggregateSequence !== undefined && right.aggregateSequence !== undefined && left.aggregateSequence !== right.aggregateSequence ? left.aggregateSequence - right.aggregateSequence : left.occurredAt.localeCompare(right.occurredAt) || left.eventId.localeCompare(right.eventId)));
   }
 
   async reconstructFactoryGraph(aggregateId: string, organizationId: string): Promise<FactoryProjection> {
     return projectFactoryEvents(await this.listFactoryEvents(aggregateId, organizationId));
+  }
+
+  async shadowReadWorkOrder(workOrderId: string, organizationId: string): Promise<ReturnType<typeof shadowReadFactoryProjection> | null> {
+    const order = await this.getWorkOrder(workOrderId);
+    if (!order || order.organizationId !== organizationId) return null;
+    const projection = await this.reconstructFactoryGraph(workOrderId, organizationId);
+    return shadowReadFactoryProjection(projection, { verificationVerdict: order.verificationVerdict, reviewAssessment: order.reviewAssessment, releaseDecision: order.releaseDecision });
+  }
+
+  async listFactoryAuditEvents(workOrderId: string, organizationId: string): Promise<ReturnType<typeof projectFactoryAuditEvents>> {
+    return projectFactoryAuditEvents(await this.listFactoryEvents(workOrderId, organizationId));
   }
 }
 

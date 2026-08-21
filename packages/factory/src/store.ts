@@ -2,7 +2,8 @@ import type { AftercareRecord, FactoryCommand } from "./authority";
 import type { WorkOrder, WorkOrderEvent, WorkOrderState } from "./index";
 import type { CostEstimate, ExecutionPlan, ProviderUsage } from "./runtime";
 import type { EvalAttempt, EvalSuite } from "./evals";
-import { assertFactoryEventAuthority, graphEventForWorkOrderTransition, projectFactoryEvents, type FactoryEvent, type FactoryProjection } from "./graph";
+import { assertFactoryEventAuthority, assertFactoryEventOrdering, graphEventForWorkOrderTransition, projectFactoryEvents, type FactoryEvent, type FactoryProjection } from "./graph";
+import { FactoryCommandBoundary, type FactoryCommandInput, type FactoryCommandReceipt, type FactoryCommandResult } from "./spine";
 
 export interface FactoryStore {
   insertWorkOrder(order: WorkOrder): Promise<void>;
@@ -30,6 +31,7 @@ export interface FactoryStore {
   listOutbox(limit?: number): Promise<OutboxEvent[]>;
   markOutboxSynced(eventId: string, now: string): Promise<void>;
   appendFactoryEvent(event: FactoryEvent): Promise<void>;
+  dispatchFactoryCommand?<T>(input: FactoryCommandInput<T>): Promise<FactoryCommandResult>;
   listFactoryEvents(aggregateId: string): Promise<FactoryEvent[]>;
   reconstructFactoryGraph(aggregateId: string): Promise<FactoryProjection>;
 }
@@ -73,6 +75,8 @@ export class MemoryFactoryStore implements FactoryStore {
   readonly factoryEvents: FactoryEvent[] = [];
   readonly commands: FactoryCommand[] = [];
   readonly aftercare: AftercareRecord[] = [];
+  readonly commandReceipts = new Map<string, FactoryCommandReceipt>();
+  readonly commandBoundary = new FactoryCommandBoundary(this);
 
   async insertWorkOrder(order: WorkOrder): Promise<void> {
     this.orders.set(order.workOrderId, order);
@@ -92,10 +96,10 @@ export class MemoryFactoryStore implements FactoryStore {
     if (!current) return { ok: false, code: "not_found" };
     const result = transitionWorkOrder(current, toState, causeId, actor);
     if ("error" in result) return { ok: false, code: result.error };
+    const graphEvent = graphEventForWorkOrderTransition({ ...result.order, fromState: result.event.fromState, toState: result.event.toState, causeId: result.event.causeId, createdAt: result.event.createdAt });
+    if (graphEvent) await this.commandBoundary.dispatch({ organizationId: result.order.organizationId, factoryId: result.order.factoryId, workOrderId: result.order.workOrderId, actorId: graphEvent.actorId, actorType: graphEvent.actorType, idempotencyKey: `transition:${result.event.eventId}`, payload: graphEvent.payload, now: graphEvent.occurredAt, buildEvents: () => [graphEvent] });
     this.orders.set(workOrderId, result.order);
     this.events.push(result.event);
-    const graphEvent = graphEventForWorkOrderTransition({ ...result.order, fromState: result.event.fromState, toState: result.event.toState, causeId: result.event.causeId, createdAt: result.event.createdAt });
-    if (graphEvent) await this.appendFactoryEvent(graphEvent);
     return { ok: true, order: result.order, event: result.event };
   }
 
@@ -187,13 +191,56 @@ export class MemoryFactoryStore implements FactoryStore {
   }
 
   async appendFactoryEvent(event: FactoryEvent): Promise<void> {
+    if (["verification.recorded", "review.recorded", "approval.requested", "approval.recorded", "release.requested", "release.decided", "release.executed", "release.rolled_back"].includes(event.type)) throw new Error("factory_command_boundary_required");
     assertFactoryEventAuthority(event);
+    assertFactoryEventOrdering(event, this.factoryEvents.filter((item) => item.aggregateId === event.aggregateId));
     if (this.factoryEvents.some((item) => item.eventId === event.eventId)) throw new Error("duplicate_event_id");
     this.factoryEvents.push(Object.freeze(event));
+    const order = this.orders.get(event.aggregateId);
+    if (order && event.aggregateType === "work_order") {
+      const projection = projectFactoryEvents(this.factoryEvents.filter((item) => item.aggregateId === event.aggregateId));
+      this.orders.set(event.aggregateId, {
+        ...order,
+        verificationVerdict: projection.verificationVerdict,
+        reviewAssessment: projection.reviewAssessment === "CLEAR" || projection.reviewAssessment === "REVISE" ? projection.reviewAssessment : "NEEDS_HUMAN_REVIEW",
+        releaseDecision: projection.releaseDecision === "RELEASE" ? "READY" : "BLOCKED",
+      });
+    }
   }
 
-  async listFactoryEvents(aggregateId: string): Promise<FactoryEvent[]> {
-    return this.factoryEvents.filter((event) => event.aggregateId === aggregateId);
+  async appendFactoryEvents(events: readonly FactoryEvent[]): Promise<void> {
+    const pending: FactoryEvent[] = [];
+    const ids = new Set(this.factoryEvents.map((event) => event.eventId));
+    for (const event of events) {
+      assertFactoryEventAuthority(event);
+      if (ids.has(event.eventId)) throw new Error("duplicate_event_id");
+      assertFactoryEventOrdering(event, [...this.factoryEvents.filter((item) => item.aggregateId === event.aggregateId), ...pending.filter((item) => item.aggregateId === event.aggregateId)]);
+      ids.add(event.eventId);
+      pending.push(event);
+    }
+    for (const event of pending) this.factoryEvents.push(Object.freeze(event));
+    for (const aggregateId of new Set(pending.map((event) => event.aggregateId))) {
+      const order = this.orders.get(aggregateId);
+      if (!order) continue;
+      const projection = projectFactoryEvents(this.factoryEvents.filter((item) => item.aggregateId === aggregateId));
+      this.orders.set(aggregateId, { ...order, verificationVerdict: projection.verificationVerdict, reviewAssessment: projection.reviewAssessment === "CLEAR" || projection.reviewAssessment === "REVISE" ? projection.reviewAssessment : "NEEDS_HUMAN_REVIEW", releaseDecision: projection.releaseDecision === "RELEASE" ? "READY" : "BLOCKED" });
+    }
+  }
+
+  async listFactoryEvents(aggregateId: string, organizationId?: string): Promise<FactoryEvent[]> {
+    return this.factoryEvents.filter((event) => event.aggregateId === aggregateId && (!organizationId || event.organizationId === organizationId));
+  }
+
+  async getFactoryCommandReceipt(organizationId: string, workOrderId: string, idempotencyKey: string): Promise<FactoryCommandReceipt | null> {
+    return this.commandReceipts.get(`${organizationId}:${workOrderId}:${idempotencyKey}`) ?? null;
+  }
+
+  async putFactoryCommandReceipt(receipt: FactoryCommandReceipt): Promise<void> {
+    this.commandReceipts.set(`${receipt.organizationId}:${receipt.workOrderId}:${receipt.idempotencyKey}`, receipt);
+  }
+
+  async dispatchFactoryCommand<T>(input: FactoryCommandInput<T>): Promise<FactoryCommandResult> {
+    return this.commandBoundary.dispatch(input);
   }
 
   async reconstructFactoryGraph(aggregateId: string): Promise<FactoryProjection> {

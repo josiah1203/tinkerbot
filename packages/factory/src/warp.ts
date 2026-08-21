@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { buildFactoryStarter } from "./starter";
 import { createWorkerEnvelope } from "./authority";
+import { assertFactoryTreeIntegrity, factoryTreeDigestFromFiles, semanticFactoryTreePath } from "./tree-integrity";
 
 type FactoryStageId = "foreman" | "triage" | "specification" | "architecture" | "implementation" | "review" | "verification" | "release" | "test" | "security" | "outcome";
 type WorkOrderState = "intake" | "triage" | "specification" | "implementation" | "review" | "verification" | "approval" | "ready" | "merged" | "released" | "blocked" | "failed" | "cancelled" | "unknown";
@@ -382,14 +383,25 @@ export function collectFactoryTreeFiles(root: string): FactoryTreeFile[] {
     }
   };
   walk(base, "");
-  return files.sort((left, right) => left.path.localeCompare(right.path));
+  const strictTree = process.env.CI === "1" || process.env.CI === "true" || process.env.TINKERBOT_ENFORCE_TREE_INTEGRITY === "1";
+  const sorted = files.sort((left, right) => left.path.localeCompare(right.path));
+  const exactPaths = new Set(sorted.map((file) => file.path));
+  const seenSemantic = new Set<string>();
+  const selected = strictTree ? sorted : sorted.filter((file) => {
+    const canonicalPath = semanticFactoryTreePath(file.path);
+    if (exactPaths.has(canonicalPath)) return file.path === canonicalPath;
+    if (seenSemantic.has(canonicalPath)) return false;
+    seenSemantic.add(canonicalPath);
+    return true;
+  });
+  assertFactoryTreeIntegrity(selected, { root, requireTracked: strictTree, enforceSemanticUniqueness: strictTree });
+  return selected;
 }
 
 export function factoryTreeDigest(files: FactoryTreeFile[]): string {
   // Upload order is not semantic. Canonical sorting prevents two clients from
   // producing different definition digests for the same file tree.
-  const canonical = [...files].sort((left, right) => left.path.localeCompare(right.path)).map((file) => `${file.path}\n${file.contents}`).join("\n---\n");
-  return `sha256:${crypto.createHash("sha256").update(canonical).digest("hex")}`;
+  return factoryTreeDigestFromFiles(files);
 }
 
 export function parseSandboxRunner(contents: string): { image: string; timeoutSeconds: number; networkAllowlist: string[] } {

@@ -11,7 +11,9 @@ import { hostedRuntimeDefaults, type ExecutionPlan } from "./runtime";
 import { buildExecutionPlan } from "./planner";
 import { mayUseInlineSelfReview } from "./approval";
 import type { FactoryStore } from "./store";
+import type { FactoryCommandInput, FactoryCommandResult } from "./spine";
 import type { FactoryEvent } from "./graph";
+import { createVerificationRecordedEvent } from "./graph";
 import type { InferenceProvider } from "./inference";
 import { factoryAiFromProvider } from "./inference";
 import type { FactoryAi, FactoryDefinition, FactoryRunStepResult, FactoryStageId, WorkOrder, WorkOrderState } from "./index";
@@ -46,12 +48,15 @@ export async function executeFactoryRun(input: {
   workOrderId?: string;
   factoryId?: string;
   organizationId?: string;
+  changeSetId?: string;
+  changeSetDigest?: string;
+  verificationRunId?: string;
   paths?: string[];
   diffs?: { paths: string[]; changedFileCount: number; changedLines: number };
   impactUnknown?: boolean;
   testIntegrityUnknown?: boolean;
   priorFailures?: number;
-  store?: Pick<FactoryStore, "putExecutionPlan" | "putCostEstimate" | "putCostActual"> & Partial<Pick<FactoryStore, "appendFactoryEvent">>;
+  store?: Pick<FactoryStore, "putExecutionPlan" | "putCostEstimate" | "putCostActual"> & Partial<Pick<FactoryStore, "appendFactoryEvent">> & { dispatchFactoryCommand?: <T>(command: FactoryCommandInput<T>) => Promise<FactoryCommandResult> };
   actorKind?: "human" | "agent";
 }): Promise<{ stages: FactoryRunStepResult[]; terminal: WorkOrderState; wait?: FactoryWait; lineId?: ProductionLineId; autonomyMode?: AutonomyMode; plan?: ExecutionPlan; escalated?: boolean }> {
   const { runForeman, runTriageAgent, runSpecificationAgent, runReviewAgent, verificationAuthority, sanitizeUntrustedPromptInput } = await import("./index");
@@ -88,7 +93,19 @@ export async function executeFactoryRun(input: {
     // redelivery or self-hosted completion retry cannot create a second copy
     // merely because the in-process event ordering changed.
     const eventId = `${plan.planId}:${type}`;
-    await input.store.appendFactoryEvent({
+    if (type === "verification.recorded") {
+      const changeSetId = typeof payload.changeSetId === "string" ? payload.changeSetId : input.changeSetId ?? input.workOrderId;
+      const changeSetDigest = typeof payload.changeSetDigest === "string" ? payload.changeSetDigest : input.changeSetDigest ?? `sha256:${plan.planId}`;
+      const verificationRunId = typeof payload.verificationRunId === "string" ? payload.verificationRunId : input.verificationRunId ?? plan.planId;
+      const verificationEvent = createVerificationRecordedEvent({ eventId: `${eventId}:${verificationRunId}`, aggregateId: input.workOrderId, aggregateType: "work_order", organizationId: input.organizationId ?? "local", factoryId: input.factoryId ?? "local-factory", actorId: overrides.actorId ?? "deterministic-verifier", actorType: "system", occurredAt: new Date().toISOString(), correlationId: plan.planId, policyVersion: "default", workOrderId: input.workOrderId, changeSetId: changeSetId ?? input.workOrderId, changeSetDigest, verificationRunId, verdict: payload.verdict === "PASS" || payload.verdict === "FAIL" ? payload.verdict : "UNKNOWN" });
+      if (input.store.dispatchFactoryCommand) {
+        await input.store.dispatchFactoryCommand({ organizationId: input.organizationId ?? "local", factoryId: input.factoryId ?? "local-factory", workOrderId: input.workOrderId, actorId: overrides.actorId ?? "deterministic-verifier", actorType: "system", idempotencyKey: `verification:${verificationRunId}:${changeSetDigest}`, payload: { changeSetId: changeSetId ?? input.workOrderId, changeSetDigest, verificationRunId, verdict: verificationEvent.payload.verdict }, now: verificationEvent.occurredAt, buildEvents: () => [verificationEvent] });
+      } else {
+        throw new Error("factory_command_boundary_required");
+      }
+      return;
+    }
+    const event: FactoryEvent = {
       eventId,
       type,
       aggregateId: input.workOrderId,
@@ -103,7 +120,14 @@ export async function executeFactoryRun(input: {
       policyVersion: "default",
       provenance: overrides.provenance ?? "ATTESTED",
       payload: { ...payload, planId: plan.planId },
-    });
+    };
+    const bindingEvent = ["verification.recorded", "review.recorded", "approval.requested", "approval.recorded", "release.requested", "release.decided", "release.executed", "release.rolled_back"].includes(type);
+    if (bindingEvent) {
+      if (!input.store.dispatchFactoryCommand) throw new Error("factory_command_boundary_required");
+      await input.store.dispatchFactoryCommand({ organizationId: input.organizationId ?? "local", factoryId: input.factoryId ?? "local-factory", workOrderId: input.workOrderId, actorId: event.actorId, actorType: event.actorType, idempotencyKey: `run:${plan.planId}:${type}`, payload, now: event.occurredAt, buildEvents: () => [event] });
+      return;
+    }
+    await input.store.appendFactoryEvent(event);
   };
   const overBudget = input.definition.budgets.tokens <= 0
     || input.definition.budgets.usdCents <= 0
@@ -116,6 +140,7 @@ export async function executeFactoryRun(input: {
   if (!input.priorPlan) {
     await appendGraph("task.decomposed", { planId: plan.planId, selectedPipeline: plan.selectedPipeline, stages: plan.stages.map((stage) => stage.id), skip: plan.skip });
     if (estimatedCents > 0) await appendGraph("cost.recorded", { costCents: estimatedCents, category: "cogs", planId: plan.planId });
+    await appendGraph("change.proposed", { changeSetId: input.changeSetId ?? input.workOrderId ?? plan.planId, changeSetDigest: input.changeSetDigest ?? `sha256:${plan.planId}`, planId: plan.planId });
   }
   const product = resolveProduct(input.definition, input.definition.repositories[0] ?? "unknown/unknown");
   const skip = plan.skip.filter((stage) => stage !== "verification" && autonomyAllowsSkip(autonomyMode ?? "approval_gated", stage as FactoryStageId));
@@ -125,11 +150,11 @@ export async function executeFactoryRun(input: {
   if (planned.includes("verification")) {
     await appendGraph("verification.started", { verdict: input.verificationVerdict ?? "UNKNOWN" });
     if ((input.verificationVerdict === "PASS" || input.verificationVerdict === "FAIL") && (input.verificationIngested ?? true)) {
-      await appendGraph("verification.completed", { verdict: input.verificationVerdict }, { actorId: "deterministic-verifier", actorType: "system", provenance: "DETERMINISTICALLY_VERIFIED" });
+      await appendGraph("verification.recorded", { verdict: input.verificationVerdict, changeSetId: input.changeSetId ?? input.workOrderId, changeSetDigest: input.changeSetDigest ?? `sha256:${plan.planId}`, verificationRunId: input.verificationRunId ?? plan.planId }, { actorId: "deterministic-verifier", actorType: "system", provenance: "DETERMINISTICALLY_VERIFIED" });
     }
   }
   if (planned.includes("review")) await appendGraph("review.requested", { requiredReviewer: "independent-human-or-agent" });
-  if (planned.includes("release")) await appendGraph("release.requested", { authority: "human" });
+  if (planned.includes("release")) await appendGraph("release.requested", { authority: "human", workOrderId: input.workOrderId, requestId: `${plan.planId}:release`, changeSetId: input.changeSetId ?? input.workOrderId ?? plan.planId, changeSetDigest: input.changeSetDigest ?? `sha256:${plan.planId}` });
   if (planned.includes("outcome")) await appendGraph("outcome.measurement_started", { maturity: "IMMATURE" });
   const ai = input.inference ? factoryAiFromProvider(input.inference) : input.ai;
   const inline = mayUseInlineSelfReview({ approval: profile.approval, autonomyMode, lineId, actorKind: input.actorKind ?? "agent" });

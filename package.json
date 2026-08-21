@@ -48,6 +48,7 @@
     "test": "pnpm build && vitest run",
     "test:coverage": "pnpm build && vitest run --coverage && node scripts/verify-coverage.mjs",
     "coverage:check": "node scripts/verify-coverage.mjs",
+    "verify:factory-tree": "node scripts/verify-factory-tree.mjs",
     "test:watch": "vitest",
     "test:e2e": "playwright install chromium && playwright test",
     "test:all": "pnpm test && pnpm test:e2e",

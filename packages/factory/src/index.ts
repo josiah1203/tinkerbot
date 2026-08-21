@@ -56,6 +56,9 @@ import {
   type RiskLevel,
 } from "./os";
 export * from "./warp";
+export * from "./tree-integrity";
+export * from "./projection-shadow";
+export * from "./audit-projection";
 export * from "./os";
 export * from "./starter";
 export * from "./runtime";
@@ -74,6 +77,7 @@ export * from "./production";
 export * from "./assurance";
 export * from "./outcomes";
 export * from "./lifecycle";
+export * from "./spine";
 export * from "./control-plane-view";
 export * from "./harness";
 export * from "./self-hosted";

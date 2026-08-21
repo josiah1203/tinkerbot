@@ -21,6 +21,7 @@ import {
   STARTER_FACTORY_PACKS,
   type FactoryCommand,
   type OutcomeStatus,
+  createApprovalRecordedEvent,
 } from "../../factory/src";
 import { defaultLocalDbPath, providerForProfile, SqliteFactoryStore } from "../../local-runtime/src";
 import { evalCli, factoryPlanPayload } from "./runtime-cli";
@@ -120,10 +121,19 @@ export function localWorkApprovalPayload(root: string, workOrderId?: string, dec
   const order = store.orders.get(workOrderId);
   if (!order) throw new Error("work order not found");
   const now = new Date().toISOString();
-  store.appendFactoryEventSync({
-    eventId: `approval_${workOrderId}_${decision}_local-human`, type: "approval.recorded", aggregateId: workOrderId, aggregateType: "work_order",
-    organizationId: order.organizationId, factoryId: order.factoryId, actorId: "local-human", actorType: "human", occurredAt: now,
-    correlationId: workOrderId, schemaVersion: 1, policyVersion: order.policyVersion, provenance: "HUMAN_VERIFIED", payload: { decision, workOrderId, signature: "local-human" },
+  const payload = { changeSetId: workOrderId, changeSetDigest: order.definitionDigest, scope: "SPEC" as const, outcome: decision === "approved" ? "GRANTED" as const : "DENIED" as const, approverId: "local-human", rationale: decision, workOrderId };
+  const eventId = `approval_${workOrderId}_${decision}_local-human`;
+  const event = createApprovalRecordedEvent({ eventId, aggregateId: workOrderId, aggregateType: "work_order", organizationId: order.organizationId, factoryId: order.factoryId, actorId: "local-human", actorType: "human", occurredAt: now, correlationId: workOrderId, policyVersion: order.policyVersion, provenance: "HUMAN_VERIFIED", workOrderId, changeSetId: payload.changeSetId, changeSetDigest: payload.changeSetDigest, scope: payload.scope, outcome: payload.outcome, approverId: payload.approverId, rationale: payload.rationale });
+  store.dispatchFactoryCommandSync({
+    organizationId: order.organizationId,
+    factoryId: order.factoryId,
+    workOrderId,
+    actorId: "local-human",
+    actorType: "human",
+    idempotencyKey: `cli:${eventId}`,
+    payload,
+    now,
+    buildEvents: () => [event],
   });
   const events = store.readFactoryEvents(workOrderId);
   return { workOrderId, decision, state: projectFactoryEvents(events), events, sourceOfTruth: "append_only_factory_graph" };
