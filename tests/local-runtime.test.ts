@@ -442,8 +442,11 @@ describe("local runtime", () => {
     };
     const first = new SqliteFactoryStore(db);
     await first.insertWorkOrder(order);
+    await first.insertApprovalRecord({ approvalId: "legacy-approval", workOrderId: order.workOrderId, requester: "local-human", approver: "second-human", actorKind: "human", decision: "approved", createdAt: "2026-08-20T00:00:01.000Z" });
     const reopened = new SqliteFactoryStore(db);
-    expect(await reopened.listFactoryEvents(order.workOrderId)).toMatchObject([{ type: "work_order.created", aggregateId: order.workOrderId }]);
+    const events = await reopened.listFactoryEvents(order.workOrderId);
+    expect(events).toMatchObject([{ type: "work_order.created", aggregateId: order.workOrderId }, { type: "approval.recorded", aggregateId: order.workOrderId, payload: { scope: "SPEC", outcome: "GRANTED" } }]);
+    expect(events.find((event) => event.type === "approval.recorded")?.payload).not.toHaveProperty("decision");
   });
 
   test("local dashboard exposes the append-only work-order graph projection", async () => {

@@ -23,8 +23,8 @@ import {
 import { admitWebhook, githubEventKind, githubInstallationAccount, inlineReviewComments, mintInstallationToken, publishCheckRun, publishInlineComments, mapCheckAnnotations } from "../../../packages/github/src";
 import { admitGitlabWebhook } from "../../../packages/gitlab/src";
 import { D1FactoryStore } from "./factory-store";
-import { ForemanDurableObject, Sandbox, handleFactoryMcpRequest, intakeFromIntegration, runFactoryTurn, routeFactoryQueueMessage, runForemanWorkDecision, classifyWorkOrderGroup, githubSecurityIntake, sweepFactoryOs } from "./factory-runtime";
-import { assertCredentialRef, calculateFactoryEconomics, createWorkOrder, projectFactoryEvents, verifyOidcJwt, oidcReplayKey, containsRawCredentials, customerProviderLabel, dispatchTinkerGateway, githubTinkerMention, sameActorApprovalBlocked, selfHostedSecretReady, verifySelfHostedCompletion, canonicalize, implementBranchName } from "../../../packages/factory/src";
+import { ForemanDurableObject, Sandbox, handleFactoryMcpRequest, intakeFromIntegration, runFactoryTurn, routeFactoryCellHold, routeFactoryGraphCommand, routeFactoryQueueMessage, routeFactorySpecApproval, routeFactoryTransition, routeFactoryVerification, factoryWorkOrderCoordinationName, runForemanWorkDecision, classifyWorkOrderGroup, githubSecurityIntake, sweepFactoryOs } from "./factory-runtime";
+import { assertCredentialRef, calculateFactoryEconomics, projectFactoryEvents, verifyOidcJwt, oidcReplayKey, containsRawCredentials, customerProviderLabel, dispatchTinkerGateway, githubTinkerMention, sameActorApprovalBlocked, selfHostedSecretReady, verifySelfHostedCompletion, canonicalize, implementBranchName, type FactoryEvent, type WorkOrderState } from "../../../packages/factory/src";
 import { translateLegacyVerdict } from "../../../packages/core/src/verdict";
 import { createChangeSet, assessChangeSet, assessReleaseSafety, createReleaseManifest } from "../../../packages/assurance/src";
 import { calculateEntitlements, type EntitlementKey } from "../../../packages/control-plane/src";
@@ -760,33 +760,67 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     if (!["implementation", "review", "verification", "unknown"].includes(order.status)) return json({ error: "Self-hosted completion arrived outside the implementation boundary.", code: "invalid_work_order_state" }, 409);
     const now = new Date().toISOString();
     if (completion.status === "failed") {
-      const command = await factories.commandBoundary.dispatch({
+      const payload = { dispatchId: completion.dispatchId, status: completion.status, summary: completion.summary ?? "Self-hosted worker reported failure." };
+      const event: FactoryEvent = {
+        eventId: `selfhost-failed:${completion.dispatchId}`,
+        type: "task.blocked",
+        aggregateId: order.workOrderId,
+        aggregateType: "work_order",
+        organizationId: order.organizationId,
+        factoryId: order.factoryId,
+        actorId: "self-hosted-worker",
+        actorType: "agent",
+        occurredAt: now,
+        correlationId: completion.runId,
+        schemaVersion: 1,
+        policyVersion: order.policyVersion,
+        provenance: "ATTESTED",
+        payload: { dispatchId: completion.dispatchId, reason: completion.summary ?? "Self-hosted worker reported failure." },
+      };
+      const command = await routeFactoryGraphCommand(env, {
         organizationId: order.organizationId,
         factoryId: order.factoryId,
         workOrderId: order.workOrderId,
         actorId: "self-hosted-worker",
         actorType: "agent",
         idempotencyKey: `self-hosted:${completion.dispatchId}:failed`,
-        payload: { dispatchId: completion.dispatchId, status: completion.status, summary: completion.summary ?? "Self-hosted worker reported failure." },
+        payload,
         now,
-        buildEvents: ({ commandId }) => [{ eventId: `selfhost-failed:${completion.dispatchId}`, type: "task.blocked", aggregateId: order.workOrderId, aggregateType: "work_order", organizationId: order.organizationId, factoryId: order.factoryId, actorId: "self-hosted-worker", actorType: "agent", occurredAt: now, correlationId: completion.runId, commandId, schemaVersion: 1, policyVersion: order.policyVersion, provenance: "ATTESTED", payload: { dispatchId: completion.dispatchId, reason: completion.summary ?? "Self-hosted worker reported failure." } }],
+        event,
       });
       if (command.replayed || priorCompletion) return json({ accepted: true, replayed: true, workOrderId: order.workOrderId, runId: completion.runId });
-      const failed = await factories.applyTransition(order.workOrderId, "failed", `self-hosted-complete:${completion.dispatchId}`, "self-hosted-worker");
+      const failed = await routeFactoryTransition(env, { organizationId: order.organizationId, workOrderId: order.workOrderId, toState: "failed", causeId: `self-hosted-complete:${completion.dispatchId}`, actor: "self-hosted-worker", now });
       if (!failed.ok && failed.code !== "idempotent") return json({ error: "The failed completion could not advance the work order.", code: failed.code }, 409);
       await factories.updateRun(completion.runId, "failed", now);
       return json({ accepted: true, terminal: "failed", workOrderId: order.workOrderId, runId: completion.runId });
     }
-    const command = await factories.commandBoundary.dispatch({
+    const payload = { dispatchId: completion.dispatchId, status: completion.status, branch: completion.branch, headSha: completion.headSha, pullRequestNumber: completion.pullRequestNumber, summary: completion.summary };
+    const event: FactoryEvent = {
+      eventId: `selfhost-completed:${completion.dispatchId}`,
+      type: "task.completed",
+      aggregateId: order.workOrderId,
+      aggregateType: "work_order",
+      organizationId: order.organizationId,
+      factoryId: order.factoryId,
+      actorId: "self-hosted-worker",
+      actorType: "agent",
+      occurredAt: now,
+      correlationId: completion.runId,
+      schemaVersion: 1,
+      policyVersion: order.policyVersion,
+      provenance: "ATTESTED",
+      payload: { dispatchId: completion.dispatchId, branch: completion.branch, headSha: completion.headSha, pullRequestNumber: completion.pullRequestNumber, summary: completion.summary },
+    };
+    const command = await routeFactoryGraphCommand(env, {
       organizationId: order.organizationId,
       factoryId: order.factoryId,
       workOrderId: order.workOrderId,
       actorId: "self-hosted-worker",
       actorType: "agent",
       idempotencyKey: `self-hosted:${completion.dispatchId}:completed`,
-      payload: { dispatchId: completion.dispatchId, status: completion.status, branch: completion.branch, headSha: completion.headSha, pullRequestNumber: completion.pullRequestNumber, summary: completion.summary },
+      payload,
       now,
-      buildEvents: ({ commandId }) => [{ eventId: `selfhost-completed:${completion.dispatchId}`, type: "task.completed", aggregateId: order.workOrderId, aggregateType: "work_order", organizationId: order.organizationId, factoryId: order.factoryId, actorId: "self-hosted-worker", actorType: "agent", occurredAt: now, correlationId: completion.runId, commandId, schemaVersion: 1, policyVersion: order.policyVersion, provenance: "ATTESTED", payload: { dispatchId: completion.dispatchId, branch: completion.branch, headSha: completion.headSha, pullRequestNumber: completion.pullRequestNumber, summary: completion.summary } }],
+      event,
     });
     if (command.replayed || priorCompletion) return json({ accepted: true, replayed: true, workOrderId: order.workOrderId, runId: completion.runId });
     const resumed = await handleFactoryQueueMessage(env, { deliveryId: `self-hosted-complete:${completion.dispatchId}`, organizationId: order.organizationId, factoryId: order.factoryId, repository: completion.repository, sourceType: order.sourceType, sourceId: order.sourceId, workOrderId: order.workOrderId, actor: "self-hosted-worker", sandboxComplete: true, pullRequestSha: completion.headSha, specApproved: true });
@@ -853,9 +887,10 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     if (!order || order.organizationId !== access.membership.organizationId) return json({ error: "Work order not found.", code: "not_found" }, 404);
     const events = await factories.listFactoryEvents(workOrderId, access.membership.organizationId);
     const view = await factories.getWorkOrderView(workOrderId, access.membership.organizationId);
+    const graph = projectFactoryEvents(events);
     return json({
-      workOrder: { ...order, ...view, group: view?.group ?? classifyWorkOrderGroup(order.status) },
-      graph: projectFactoryEvents(events),
+      workOrder: { ...order, ...view, status: graph.workOrderState ?? order.status, currentStage: graph.currentStage ?? order.currentStage, actor: graph.currentActorId ?? order.actor, group: view?.group ?? classifyWorkOrderGroup(graph.workOrderState ?? order.status) },
+      graph,
       economics: calculateFactoryEconomics(events),
       events,
       sourceOfTruth: "append_only_factory_graph",
@@ -871,13 +906,13 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
     if (!view) return json({ error: "Work order not found.", code: "not_found" }, 404);
     const body = await jsonBody(request) ?? {};
     const type = body?.type === "review" ? "review" : body?.type === "release_authorization" ? "release" : undefined;
-    const decision = body?.decision === "approved" || body?.decision === "rejected" || body?.decision === "changes_requested" ? body.decision : undefined;
+    const decision = body?.decision === "approved" || body?.decision === "rejected" || body?.decision === "changes_requested" || body?.decision === "hold" ? body.decision : undefined;
     if (!type || !decision) return json({ error: "type and decision must be a supported typed decision.", code: "invalid_decision" }, 400);
     const actor = access.current.session.user.id;
     const dispatchDecision = async (): Promise<Response> => {
       const now = new Date().toISOString();
       if (env.FOREMAN) {
-        const id = env.FOREMAN.idFromName(`${access.membership.organizationId}:${order.workOrderId}`);
+        const id = env.FOREMAN.idFromName(factoryWorkOrderCoordinationName(access.membership.organizationId, order.workOrderId));
         const response = await env.FOREMAN.get(id).fetch(new Request("https://tinkerbot.internal/foreman/decision", {
           method: "POST",
           headers: { "content-type": "application/json", "x-tinkerbot-internal": "foreman-v1" },
@@ -891,14 +926,15 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
       return json(result);
     };
     if (type === "review") {
+      if (decision === "hold") return json({ error: "Review decisions cannot use a release hold; record a review outcome instead.", code: "invalid_review_decision" }, 400);
       if (view.reviewDecision !== "awaiting_human") return json({ error: "This work order is not awaiting human review.", code: "review_not_available" }, 409);
       const independence = sameActorApprovalBlocked({ actorId: actor, cellHolderId: order.heldBy, lineId: order.lineId, autonomyMode: order.autonomyMode });
       if (independence.blocked) return json({ error: "The producer cannot approve this restricted work order.", code: independence.reason }, 403);
       return dispatchDecision();
     }
-    if (decision !== "approved") return json({ error: "Release authorization must be approved or omitted; use review for a rejected change.", code: "invalid_release_decision" }, 400);
+    if (decision !== "approved" && decision !== "hold") return json({ error: "Release authorization must be approved, held, or omitted; use review for a rejected change.", code: "invalid_release_decision" }, 400);
     if (body?.evidenceAcknowledged !== true) return json({ error: "Evidence acknowledgement is required before release authorization.", code: "evidence_acknowledgement_required" }, 409);
-    if (view.verificationVerdict !== "pass" || view.reviewDecision !== "approved" || view.releaseDecision !== "awaiting_authorization") return json({ error: "Release authorization requires a passing deterministic verdict, human review, and release policy eligibility.", code: "release_gate_blocked" }, 409);
+    if (view.verificationVerdict !== "pass" || view.reviewDecision !== "approved" || !["awaiting_authorization", "hold"].includes(view.releaseDecision)) return json({ error: "Release authorization requires a passing deterministic verdict, human review, and release policy eligibility.", code: "release_gate_blocked" }, 409);
     return dispatchDecision();
   }
   if (factoryMatch && (request.method === "GET" || request.method === "POST" || request.method === "PATCH")) {
@@ -1037,7 +1073,8 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
       const run = await factories.getRunByWorkOrder(order.workOrderId);
       const stages = run ? await factories.listRunStages(run.run_id) : [];
       const events = await factories.listFactoryEvents(order.workOrderId, access.membership.organizationId);
-      return json({ workOrder: { ...order, ...view, group: view?.group ?? classifyWorkOrderGroup(order.status) }, run, stages, events, availableActions: view?.availableActions ?? [] });
+      const graph = projectFactoryEvents(events);
+      return json({ workOrder: { ...order, ...view, status: graph.workOrderState ?? order.status, currentStage: graph.currentStage ?? order.currentStage, actor: graph.currentActorId ?? order.actor, group: view?.group ?? classifyWorkOrderGroup(graph.workOrderState ?? order.status) }, run, stages, events, availableActions: view?.availableActions ?? [], graph });
     }
     if (request.method === "POST" && !workMatch[1]) {
       if (!originAllowed(request, env)) return json({ error: "Cross-origin work-order mutation rejected.", code: "csrf_origin_rejected" }, 403);
@@ -1047,9 +1084,10 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
       if (!factoryId || !repositoryId) return json({ error: "factoryId and repositoryId are required.", code: "invalid_request" }, 400);
       const factory = await factories.getFactory(factoryId);
       if (!factory || factory.organizationId !== access.membership.organizationId) return json({ error: "Factory not found.", code: "not_found" }, 404);
-      const order = createWorkOrder({ factoryId, organizationId: access.membership.organizationId, sourceType: "manual", sourceId: `manual:${crypto.randomUUID()}`, repositoryId, intent: typeof body?.intent === "string" ? body.intent : undefined, policyVersion: "default", definitionVersion: factory.definitionDigest ?? "unknown", definitionDigest: factory.definitionDigest ?? "unknown", actor: access.current.session.user.id });
-      await factories.insertWorkOrder(order);
-      await handleFactoryQueueMessage(env, { deliveryId: `manual:${order.workOrderId}`, organizationId: order.organizationId, factoryId, repository: repositoryId, sourceType: "manual", sourceId: order.sourceId, actor: order.actor });
+      const sourceId = `manual:${crypto.randomUUID()}`;
+      const result = await handleFactoryQueueMessage(env, { deliveryId: sourceId, organizationId: access.membership.organizationId, factoryId, repository: repositoryId, sourceType: "manual", sourceId, issueOrPullRequest: typeof body?.intent === "string" ? body.intent : undefined, actor: access.current.session.user.id });
+      const order = await factories.getWorkOrderForOrganization(result.workOrderId, access.membership.organizationId);
+      if (!order) return json({ error: "The Foreman did not persist the WorkOrder.", code: "work_order_persistence_failed" }, 500);
       const view = await factories.getWorkOrderView(order.workOrderId, access.membership.organizationId);
       return json({ workOrder: view ?? order, availableActions: view?.availableActions ?? [] }, 201);
     }
@@ -1070,9 +1108,9 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
         if (!current || current.organizationId !== access.membership.organizationId) return json({ error: "Work order not found.", code: "not_found" }, 404);
         const actor = access.current.session.user.id;
         const now = new Date().toISOString();
-        await factories.patchWorkOrder(current.workOrderId, { heldBy: workMatch[2] === "take" ? actor : undefined, now });
-        await env.DB.prepare("INSERT INTO tinkerbot_human_decisions (decision_id, work_order_id, subject_id, actor, role, decision, reason, created_at) VALUES (?1, ?2, ?3, ?4, 'operator', ?5, ?6, ?7)").bind(crypto.randomUUID(), current.workOrderId, current.cellId ?? current.workOrderId, actor, workMatch[2] === "take" ? "take_cell" : "return_cell", "Human/agent parity", now).run();
-        return json({ workOrder: await factories.getWorkOrder(current.workOrderId), held: workMatch[2] === "take" });
+        const result = await routeFactoryCellHold(env, { workOrderId: current.workOrderId, organizationId: current.organizationId, actor, action: workMatch[2], now });
+        if (!result.ok) return json({ error: "Work order not found.", code: result.code }, 404);
+        return json({ workOrder: result.workOrder, held: result.held });
       }
       if (workMatch[2] === "approve") {
         const current = await factories.getWorkOrder(workMatch[1]);
@@ -1085,7 +1123,7 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
         });
         if (sod.blocked) return json({ error: "The producer cannot approve this restricted work order.", code: sod.reason }, 403);
         const spec = current.status === "specification" || current.currentStage === "specification";
-        await factories.insertApproval(current.workOrderId, access.current.session.user.id, "approved", "session", new Date().toISOString());
+        await routeFactorySpecApproval(env, { workOrderId: current.workOrderId, organizationId: current.organizationId, actor: access.current.session.user.id, decision: "approved", signature: "session", now: new Date().toISOString() });
         if (spec) {
           await handleFactoryQueueMessage(env, { deliveryId: `spec-approve:${crypto.randomUUID()}`, organizationId: current.organizationId, factoryId: current.factoryId, repository: current.repositoryId, sourceType: current.sourceType, sourceId: current.sourceId, workOrderId: current.workOrderId, issueOrPullRequest: current.issueOrPullRequest, actor: access.current.session.user.id, specApproved: true });
           const updated = await factories.getWorkOrder(current.workOrderId);
@@ -1094,8 +1132,8 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
       }
       const current = await factories.getWorkOrder(workMatch[1]);
       if (!current || current.organizationId !== access.membership.organizationId) return json({ error: "Work order not found.", code: "not_found" }, 404);
-      const toState = workMatch[2] === "approve" ? "ready" : workMatch[2] === "cancel" ? "cancelled" : "intake";
-      const result = await factories.applyTransition(current.workOrderId, toState, `${workMatch[2]}:${crypto.randomUUID()}`, access.current.session.user.id);
+      const toState: WorkOrderState = workMatch[2] === "approve" ? "ready" : workMatch[2] === "cancel" ? "cancelled" : "intake";
+      const result = await routeFactoryTransition(env, { organizationId: current.organizationId, workOrderId: current.workOrderId, toState, causeId: `${workMatch[2]}:${crypto.randomUUID()}`, actor: access.current.session.user.id, now: new Date().toISOString() });
       if (!result.ok) return json({ error: "Work-order transition was rejected.", code: result.code }, result.code === "not_found" ? 404 : 409);
       return json({ workOrder: result.order });
     }
@@ -1198,13 +1236,49 @@ async function handleFactoryHttp(request: Request, env: Env, url: URL, config: A
       const changeSet = createChangeSet({ name, repositories, now: new Date().toISOString() });
       const assessment = assessChangeSet(changeSet);
       const workOrderId = typeof body?.workOrderId === "string" ? body.workOrderId : undefined;
+      const suppliedChangeSetId = typeof body?.changeSetId === "string" && /^[A-Za-z0-9._:-]{1,200}$/.test(body.changeSetId) ? body.changeSetId : undefined;
       if (workOrderId) {
         const linkedOrder = await factories.getWorkOrderForOrganization(workOrderId, access.membership.organizationId);
         if (!linkedOrder) return json({ error: "Work order not found.", code: "not_found" }, 404);
       }
-      const changeSetId = crypto.randomUUID();
-      await env.DB.prepare("INSERT INTO tinkerbot_change_sets (change_set_id, work_order_id, payload_json, updated_at) VALUES (?1, ?2, ?3, ?4)").bind(changeSetId, workOrderId ?? "unassigned", JSON.stringify({ changeSet, assessment }), new Date().toISOString()).run();
-      return json({ changeSetId, changeSet, assessment }, 201);
+      const changeSetId = suppliedChangeSetId ?? crypto.randomUUID();
+      const changeSetDigest = `sha256:${await sha256Text(JSON.stringify(canonicalize(changeSet)))}`;
+      if (workOrderId) {
+        const linkedOrder = await factories.getWorkOrderForOrganization(workOrderId, access.membership.organizationId);
+        if (!linkedOrder) return json({ error: "Work order not found.", code: "not_found" }, 404);
+        const prior = await factories.reconstructFactoryGraph(workOrderId, access.membership.organizationId);
+        const eventType: FactoryEvent["type"] = prior.currentChangeSetDigest ? "change.updated" : "change.proposed";
+        const event: FactoryEvent = {
+          eventId: `change:${changeSetId}`,
+          type: eventType,
+          aggregateId: workOrderId,
+          aggregateType: "work_order",
+          organizationId: access.membership.organizationId,
+          factoryId: linkedOrder.factoryId,
+          actorId: access.current.session.user.id,
+          actorType: "human",
+          occurredAt: new Date().toISOString(),
+          correlationId: changeSetId,
+          schemaVersion: 1,
+          policyVersion: linkedOrder.policyVersion,
+          provenance: "HUMAN_VERIFIED",
+          payload: { workOrderId, changeSetId, changeSetDigest },
+        };
+        const idempotencyKey = request.headers.get("x-idempotency-key") ?? (typeof body?.idempotencyKey === "string" ? body.idempotencyKey : `change-set:${changeSetId}`);
+        await routeFactoryGraphCommand(env, {
+          organizationId: access.membership.organizationId,
+          factoryId: linkedOrder.factoryId,
+          workOrderId,
+          actorId: access.current.session.user.id,
+          actorType: "human",
+          idempotencyKey,
+          payload: { changeSetId, changeSetDigest },
+          now: event.occurredAt,
+          event,
+        });
+      }
+      await env.DB.prepare("INSERT OR IGNORE INTO tinkerbot_change_sets (change_set_id, work_order_id, payload_json, updated_at) VALUES (?1, ?2, ?3, ?4)").bind(changeSetId, workOrderId ?? "unassigned", JSON.stringify({ changeSet, changeSetDigest, assessment }), new Date().toISOString()).run();
+      return json({ changeSetId, changeSet, changeSetDigest, assessment }, 201);
     } catch {
       return json({ error: "Invalid change set payload.", code: "invalid_request" }, 400);
     }
@@ -1558,7 +1632,7 @@ export default {
             if (order) {
               const changeSetId = runToken.sha ?? order.workOrderId;
               const changeSetDigest = runToken.sha ? `sha256:${runToken.sha}` : order.definitionDigest;
-              await factories.recordVerification({ workOrderId: order.workOrderId, organizationId: order.organizationId, actorId: "deterministic-verifier", changeSetId, changeSetDigest, verificationRunId: runToken.runId, verdict, now: new Date().toISOString() });
+              await routeFactoryVerification(env, { workOrderId: order.workOrderId, organizationId: order.organizationId, actorId: "deterministic-verifier", changeSetId, changeSetDigest, verificationRunId: runToken.runId, verdict, now: new Date().toISOString() });
               await handleFactoryQueueMessage(env, { deliveryId: `oidc:${runToken.runId}`, organizationId: order.organizationId, factoryId: order.factoryId, repository, sourceType: order.sourceType, sourceId: order.sourceId, workOrderId: order.workOrderId, actor: "oidc-ingest", sha: runToken.sha, verificationVerdict: verdict, verificationIngested: true, specApproved: true, sandboxComplete: true });
             }
           }

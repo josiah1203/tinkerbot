@@ -13,7 +13,7 @@ import { mayUseInlineSelfReview } from "./approval";
 import type { FactoryStore } from "./store";
 import type { FactoryCommandInput, FactoryCommandResult } from "./spine";
 import type { FactoryEvent } from "./graph";
-import { createVerificationRecordedEvent } from "./graph";
+import { createVerificationRecordedEvent, isFactoryCommandBoundaryEventType } from "./graph";
 import type { InferenceProvider } from "./inference";
 import { factoryAiFromProvider } from "./inference";
 import type { FactoryAi, FactoryDefinition, FactoryRunStepResult, FactoryStageId, WorkOrder, WorkOrderState } from "./index";
@@ -121,7 +121,7 @@ export async function executeFactoryRun(input: {
       provenance: overrides.provenance ?? "ATTESTED",
       payload: { ...payload, planId: plan.planId },
     };
-    const bindingEvent = ["verification.recorded", "review.recorded", "approval.requested", "approval.recorded", "release.requested", "release.decided", "release.executed", "release.rolled_back"].includes(type);
+    const bindingEvent = isFactoryCommandBoundaryEventType(type);
     if (bindingEvent) {
       if (!input.store.dispatchFactoryCommand) throw new Error("factory_command_boundary_required");
       await input.store.dispatchFactoryCommand({ organizationId: input.organizationId ?? "local", factoryId: input.factoryId ?? "local-factory", workOrderId: input.workOrderId, actorId: event.actorId, actorType: event.actorType, idempotencyKey: `run:${plan.planId}:${type}`, payload, now: event.occurredAt, buildEvents: () => [event] });
@@ -140,7 +140,7 @@ export async function executeFactoryRun(input: {
   if (!input.priorPlan) {
     await appendGraph("task.decomposed", { planId: plan.planId, selectedPipeline: plan.selectedPipeline, stages: plan.stages.map((stage) => stage.id), skip: plan.skip });
     if (estimatedCents > 0) await appendGraph("cost.recorded", { costCents: estimatedCents, category: "cogs", planId: plan.planId });
-    await appendGraph("change.proposed", { changeSetId: input.changeSetId ?? input.workOrderId ?? plan.planId, changeSetDigest: input.changeSetDigest ?? `sha256:${plan.planId}`, planId: plan.planId });
+    await appendGraph("change.proposed", { workOrderId: input.workOrderId, changeSetId: input.changeSetId ?? input.workOrderId ?? plan.planId, changeSetDigest: input.changeSetDigest ?? `sha256:${plan.planId}`, planId: plan.planId });
   }
   const product = resolveProduct(input.definition, input.definition.repositories[0] ?? "unknown/unknown");
   const skip = plan.skip.filter((stage) => stage !== "verification" && autonomyAllowsSkip(autonomyMode ?? "approval_gated", stage as FactoryStageId));

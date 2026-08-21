@@ -13,7 +13,7 @@ const DECISION_LABELS = {
   pass: "Pass", blocked: "Blocked", fail: "Fail", unknown: "Unknown", not_run: "Not run",
   not_required: "Not required", awaiting_human: "Awaiting human", approved: "Approved", rejected: "Rejected",
   changes_requested: "Changes requested", not_eligible: "Not eligible", awaiting_authorization: "Awaiting authorization",
-  released: "Released", rolled_back: "Rolled back", cancelled: "Cancelled", pending: "Pending", accepted: "Accepted",
+  hold: "On hold", released: "Released", rolled_back: "Rolled back", cancelled: "Cancelled", pending: "Pending", accepted: "Accepted",
   reworked: "Reworked", failed: "Failed",
 };
 
@@ -135,7 +135,7 @@ function normalizeGroup(raw, decisions, status) {
   if (["blocked", "needs_attention", "failed"].includes(group) || ["blocked", "fail"].includes(decisions.verification)) return "blocked";
   if (["released", "completed", "done"].includes(group) || decisions.release === "released") return "released";
   if (["unknown"].includes(group) || decisions.verification === "unknown") return "unknown";
-  if (["ready"].includes(group) || decisions.release === "approved") return "ready";
+  if (["ready"].includes(group) || decisions.release === "approved" || decisions.release === "hold") return "ready";
   if (["awaiting_review", "waiting_for_approval", "approval"].includes(group) || decisions.review === "awaiting_human") return "awaiting_review";
   if (["in_progress", "implementation", "building"].includes(group)) return "in_progress";
   if (["failed", "blocked"].includes(String(status).toLowerCase())) return "blocked";
@@ -149,17 +149,19 @@ function defaultActions(order) {
     { id: "steer", label: "Add operator note", allowed: true },
     { id: "retry", label: "Retry run", allowed: blocked, reason: blocked ? undefined : "Retry is available after a failed or blocked run." },
     { id: "review", label: "Record review", allowed: order.reviewDecision === "awaiting_human", reason: order.reviewDecision === "awaiting_human" ? undefined : "Review is not currently required." },
-    { id: "authorize_release", label: "Authorize release", allowed: order.releaseDecision === "awaiting_authorization", reason: order.releaseDecision === "awaiting_authorization" ? undefined : "Deterministic verification and review must be resolved first." },
+    { id: "authorize_release", label: "Authorize release", allowed: order.releaseDecision === "awaiting_authorization" || order.releaseDecision === "hold", reason: order.releaseDecision === "awaiting_authorization" || order.releaseDecision === "hold" ? undefined : "Deterministic verification and review must be resolved first." },
   ];
 }
 
 function normalizeOrder(raw, fallbackFactoryId = factoryId()) {
   const status = String(raw.status ?? "").toLowerCase(); const graph = raw.graph || raw.projection || {};
-  const verification = normalizeDecision(raw.verificationVerdict ?? graph.verificationVerdict, raw.currentStage ? "not_run" : "unknown");
-  const reviewSource = raw.reviewDecision ?? graph.reviewDecision ?? (raw.reviewAssessment === "REVISE" ? "changes_requested" : raw.reviewAssessment === "NEEDS_HUMAN_REVIEW" ? "awaiting_human" : raw.reviewAssessment === "CLEAR" ? "not_required" : undefined);
+  const verification = normalizeDecision(graph.verificationVerdict ?? raw.verificationVerdict, raw.currentStage ? "not_run" : "unknown");
+  const graphReviewSource = graph.reviewAssessment === "REVISE" ? "changes_requested" : graph.reviewAssessment === "NEEDS_HUMAN_REVIEW" ? "awaiting_human" : graph.reviewAssessment === "CLEAR" ? "not_required" : undefined;
+  const legacyReviewSource = raw.reviewAssessment === "REVISE" ? "changes_requested" : raw.reviewAssessment === "NEEDS_HUMAN_REVIEW" ? "awaiting_human" : raw.reviewAssessment === "CLEAR" ? "not_required" : undefined;
+  const reviewSource = graphReviewSource ?? graph.reviewDecision ?? raw.reviewDecision ?? legacyReviewSource;
   const review = normalizeDecision(reviewSource, "awaiting_human");
-  const release = normalizeDecision(raw.releaseDecision ?? graph.releaseDecision, status === "released" ? "released" : verification === "pass" && review === "approved" ? "awaiting_authorization" : "not_eligible");
-  const outcome = normalizeDecision(raw.outcomeStatus ?? graph.outcomeStatus, status === "released" ? "accepted" : "pending");
+  const release = normalizeDecision(graph.releaseDecision ?? raw.releaseDecision, status === "released" ? "released" : verification === "pass" && review === "approved" ? "awaiting_authorization" : "not_eligible");
+  const outcome = normalizeDecision(graph.outcomeStatus ?? raw.outcomeStatus, status === "released" ? "accepted" : "pending");
   const decisions = { verification, review, release, outcome }; const id = raw.workOrderId || raw.id || raw.work_order_id || "unknown-work-order";
   const actor = normalizedActor(raw.actor || raw.owner || raw.heldBy, raw.owner ? "Assigned operator" : "System");
   const order = { ...raw, id, workOrderId: id, factoryId: raw.factoryId || raw.factory_id || fallbackFactoryId, title: raw.title || raw.issueOrPullRequest || raw.intent || id, repository: raw.repository || (raw.repositoryId ? { id: raw.repositoryId, name: raw.repositoryId } : undefined), stage: stageKey(raw), actor, risk: String(raw.risk || (status === "failed" || status === "blocked" ? "high" : "unknown")).toLowerCase(), decisions, verificationVerdict: verification, reviewDecision: review, releaseDecision: release, outcomeStatus: outcome, unresolvedUnknownCount: Number(raw.unresolvedUnknownCount ?? raw.unresolved_unknown_count ?? (verification === "unknown" ? 1 : 0)), updatedAt: raw.updatedAt || raw.updated_at || raw.updated || "Recently" };
@@ -256,7 +258,7 @@ function collectionPage(route, items) {
 
 function detailData(resource, id) { if (resource === "work-orders") return state.entity?.workOrder || state.entity || state.workOrders.find((item) => item.id === id); return state.entity?.item || state.entity || state.routeItems.find((item) => String(item.id || item.run_id || item.runId || item.evidenceId || item.release_id || item.agentId || item.automationId) === String(id)); }
 function decisionRow(label, value, tone = "neutral") { return `<tr><th scope="row">${esc(label)}</th><td>${statusBadge(decisionLabel(value), tone)}</td></tr>`; }
-function decisionTone(value) { const v = normalizeDecision(value); return ["fail", "blocked", "rejected", "not_eligible", "rolled_back"].includes(v) ? "error" : ["awaiting_human", "awaiting_authorization", "changes_requested"].includes(v) ? "warning" : ["pass", "approved", "released", "accepted"].includes(v) ? "success" : "neutral"; }
+function decisionTone(value) { const v = normalizeDecision(value); return ["fail", "blocked", "rejected", "not_eligible", "rolled_back"].includes(v) ? "error" : ["awaiting_human", "awaiting_authorization", "hold", "changes_requested"].includes(v) ? "warning" : ["pass", "approved", "released", "accepted"].includes(v) ? "success" : "neutral"; }
 function evidenceNodes(order) { const nodes = order.evidence?.nodes || state.graph?.graph?.nodes || []; if (Array.isArray(nodes) && nodes.length) return nodes; return ["Diff", "Tests", "Policy", "Environment", "Artifact", "Outcome"].map((label) => ({ label, status: label === "Tests" && order.verificationVerdict !== "pass" ? "blocked" : "linked" })); }
 
 function workOrderPanel(order) {

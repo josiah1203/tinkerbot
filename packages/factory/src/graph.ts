@@ -1,9 +1,11 @@
 import crypto from "node:crypto";
+import type { FactoryStageId, WorkOrderState } from "./index";
+import { isLegalWorkOrderTransition } from "./transition-contract";
 
 /** The provider-neutral, append-only source of truth for every Tinkerbot surface. */
 export const FACTORY_EVENT_TYPES = [
   "factory.created", "objective.created", "intent.created", "intent.challenged", "intent.revised", "intent.approved", "intent.rejected", "intent.superseded",
-  "spec.created", "spec.approved", "work_order.created", "task.decomposed", "task.queued", "task.assigned", "task.blocked", "task.started", "task.completed", "task.reworked",
+  "spec.created", "spec.approved", "work_order.created", "work_order.transitioned", "task.decomposed", "task.queued", "task.assigned", "task.blocked", "task.started", "task.completed", "task.reworked",
   "worker.registered", "worker.session_started", "worker.claim_emitted", "worker.session_completed", "change.proposed", "change.updated", "integration_candidate.created", "integration_candidate.assembled",
   "verification.started", "verification.completed", "verification.recorded", "evidence.receipt_created", "review.requested", "review.completed", "review.recorded", "approval.requested", "approval.recorded", "release.requested", "release.completed", "release.decided", "release.executed", "release.rolled_back",
   "outcome.measurement_started", "outcome.observed", "outcome.matured", "incident.created", "capacity.updated", "cost.recorded", "autonomy.changed", "policy.updated", "external_reference.created", "external_command.received",
@@ -11,14 +13,18 @@ export const FACTORY_EVENT_TYPES = [
 export type FactoryEventType = (typeof FACTORY_EVENT_TYPES)[number];
 export const LEGACY_FACTORY_EVENT_TYPES = ["verification.completed", "review.completed", "release.completed"] as const;
 export type LegacyFactoryEventType = (typeof LEGACY_FACTORY_EVENT_TYPES)[number];
-export const CANONICAL_FACTORY_EVENT_TYPES = ["verification.recorded", "review.recorded", "approval.requested", "approval.recorded", "release.requested", "release.decided", "release.executed", "release.rolled_back"] as const;
+export const CANONICAL_FACTORY_EVENT_TYPES = ["verification.recorded", "review.recorded", "approval.requested", "approval.recorded", "release.requested", "release.decided", "release.executed", "release.rolled_back", "work_order.transitioned"] as const;
 export type CanonicalFactoryEventType = (typeof CANONICAL_FACTORY_EVENT_TYPES)[number];
+export const WORK_ORDER_TRANSITION_EVENT_TYPES = ["task.queued", "spec.created", "task.started", "review.requested", "verification.started", "task.blocked", "task.reworked", "integration_candidate.assembled"] as const;
+export const FACTORY_COMMAND_BOUNDARY_EVENT_TYPES = [...CANONICAL_FACTORY_EVENT_TYPES, ...WORK_ORDER_TRANSITION_EVENT_TYPES, "change.proposed", "change.updated"] as const;
+export function isFactoryCommandBoundaryEventType(type: FactoryEventType): boolean { return (FACTORY_COMMAND_BOUNDARY_EVENT_TYPES as readonly string[]).includes(type); }
 export type VerificationVerdictV2 = "PASS" | "FAIL" | "UNKNOWN";
 export type ReviewDecision = "NOT_REVIEWED" | "APPROVE" | "REQUEST_CHANGES" | "ESCALATE";
 export type ReviewAssessmentV2 = "NOT_REVIEWED" | "CLEAR" | "NEEDS_HUMAN_REVIEW" | "REVISE";
 export type ReviewOutcome = "NO_FINDINGS" | "FINDINGS" | "ESCALATE";
 export type ApprovalScope = "SPEC" | "RELEASE" | "ROLLBACK";
 export type ApprovalOutcome = "GRANTED" | "DENIED";
+export type ApprovalTargetOutcome = "RELEASE" | "HOLD" | "ROLLBACK";
 export type ReleaseDecisionV2 = "NOT_RELEASED" | "RELEASE" | "HOLD" | "ROLLBACK";
 export type OutcomeStatus = "UNMEASURED" | "PENDING" | "POSITIVE" | "NEUTRAL" | "NEGATIVE" | "UNKNOWN";
 export type OutcomeMaturity = "IMMATURE" | "MATURE" | "CLOSED";
@@ -43,6 +49,7 @@ export interface WorkerCapability { capabilityId: string; workerId: string; name
 export interface WorkerSession { sessionId: string; workerId: string; taskId: string; executionCellId: string; status: "active" | "completed" | "failed"; }
 export interface ExecutionCell { executionCellId: string; repositoryId: string; branchRef: string; permissionScope: string; networkPolicy: string; resourceBudget: string; cleanupAt: string; }
 export interface ChangeSet { changeSetId: string; taskId: string; sessionId: string; revision: string; files: string[]; workOrderId?: string; digest?: string; }
+export interface ChangeSetScopePayload { workOrderId: string; changeSetId: string; changeSetDigest: string; }
 export interface BranchRef { branchRefId: string; repositoryId: string; name: string; commitSha?: string; }
 export interface PullRequestRef { pullRequestRefId: string; repositoryId: string; externalReferenceId: string; branchRefId: string; }
 export interface IntegrationCandidate { integrationCandidateId: string; factoryId: string; changeSetIds: string[]; status: "created" | "assembled" | "verified" | "rejected"; }
@@ -108,42 +115,64 @@ export interface ApprovalRequestedPayload {
   scope: ApprovalScope;
   requestId: string;
 }
-export interface ApprovalRecordedPayload {
-  workOrderId: string;
-  changeSetId?: string;
-  changeSetDigest?: string;
-  approvalEventId: ApprovalEventId;
-  scope: ApprovalScope;
-  outcome: ApprovalOutcome;
-  approverId: string;
-  rationale?: string;
-  releaseId?: string;
-}
+export type ApprovalRecordedPayload =
+  | {
+      workOrderId: string;
+      changeSetId?: string;
+      changeSetDigest?: string;
+      approvalEventId: ApprovalEventId;
+      scope: "SPEC";
+      outcome: ApprovalOutcome;
+      approverId: string;
+      rationale?: string;
+      releaseId?: never;
+      targetOutcome?: never;
+    }
+  | {
+      workOrderId: string;
+      changeSetId: string;
+      changeSetDigest: string;
+      approvalEventId: ApprovalEventId;
+      scope: "RELEASE";
+      outcome: ApprovalOutcome;
+      targetOutcome: "RELEASE" | "HOLD";
+      approverId: string;
+      rationale?: string;
+      releaseId?: never;
+    }
+  | {
+      workOrderId: string;
+      changeSetId?: string;
+      changeSetDigest: string;
+      approvalEventId: ApprovalEventId;
+      scope: "ROLLBACK";
+      outcome: ApprovalOutcome;
+      targetOutcome: "ROLLBACK";
+      approverId: string;
+      rationale?: string;
+      releaseId: string;
+    };
 export interface ReleaseRequestedPayload {
   workOrderId: string;
   requestId: string;
   changeSetId?: string;
   changeSetDigest?: string;
 }
-export interface ReleaseApprovalRef {
-  kind: "release_approval";
-  eventId: ApprovalEventId;
-  scope: "RELEASE" | "ROLLBACK";
-  targetOutcome: "RELEASE" | "HOLD" | "ROLLBACK";
-  changeSetDigest?: string;
-  releaseId?: string;
-}
+export type ReleaseApprovalRef =
+  | { kind: "release_approval"; eventId: ApprovalEventId; scope: "RELEASE"; targetOutcome: "RELEASE" | "HOLD"; changeSetDigest: string; releaseId?: never }
+  | { kind: "release_approval"; eventId: ApprovalEventId; scope: "ROLLBACK"; targetOutcome: "ROLLBACK"; changeSetDigest: string; releaseId: string };
 export interface ReleaseDecidedPayload {
   workOrderId: string;
   releaseId: string;
   outcome: Exclude<ReleaseDecisionV2, "NOT_RELEASED">;
   approvalRef: ReleaseApprovalRef;
   changeSetId?: string;
-  changeSetDigest?: string;
+  changeSetDigest: string;
   reason?: string;
 }
 export interface ReleaseExecutedPayload { workOrderId: string; releaseId: string; changeSetDigest?: string; executionRef?: string; }
 export interface ReleaseRolledBackPayload { workOrderId: string; releaseId: string; rollbackId?: string; reason?: string; }
+export interface WorkOrderTransitionPayload { workOrderId: string; fromState: WorkOrderState; toState: WorkOrderState; causeId: string; currentStage: FactoryStageId | "complete"; }
 
 export interface FactoryEvent<T = unknown> {
   eventId: string;
@@ -180,13 +209,15 @@ export type ReleaseRequestedEvent = FactoryEvent<ReleaseRequestedPayload> & { ty
 export type ReleaseDecidedEvent = FactoryEvent<ReleaseDecidedPayload> & { type: "release.decided" };
 export type ReleaseExecutedEvent = FactoryEvent<ReleaseExecutedPayload> & { type: "release.executed" };
 export type ReleaseRolledBackEvent = FactoryEvent<ReleaseRolledBackPayload> & { type: "release.rolled_back" };
-export type CanonicalFactoryEvent = VerificationRecordedEvent | ReviewRecordedEvent | ApprovalRequestedEvent | ApprovalRecordedEvent | ReleaseRequestedEvent | ReleaseDecidedEvent | ReleaseExecutedEvent | ReleaseRolledBackEvent;
+export type WorkOrderTransitionEvent = FactoryEvent<WorkOrderTransitionPayload> & { type: "work_order.transitioned" };
+export type CanonicalFactoryEvent = VerificationRecordedEvent | ReviewRecordedEvent | ApprovalRequestedEvent | ApprovalRecordedEvent | ReleaseRequestedEvent | ReleaseDecidedEvent | ReleaseExecutedEvent | ReleaseRolledBackEvent | WorkOrderTransitionEvent;
 
 function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value && typeof value === "object" && !Array.isArray(value)); }
 function nonEmptyString(value: unknown): value is string { return typeof value === "string" && value.trim().length > 0; }
 function isReviewOutcome(value: unknown): value is ReviewOutcome { return value === "NO_FINDINGS" || value === "FINDINGS" || value === "ESCALATE"; }
 function isApprovalScope(value: unknown): value is ApprovalScope { return value === "SPEC" || value === "RELEASE" || value === "ROLLBACK"; }
 function isApprovalOutcome(value: unknown): value is ApprovalOutcome { return value === "GRANTED" || value === "DENIED"; }
+function isApprovalTargetOutcome(value: unknown): value is ApprovalTargetOutcome { return value === "RELEASE" || value === "HOLD" || value === "ROLLBACK"; }
 function isReleaseOutcome(value: unknown): value is Exclude<ReleaseDecisionV2, "NOT_RELEASED"> { return value === "RELEASE" || value === "HOLD" || value === "ROLLBACK"; }
 
 /** Guards domain authority before an event enters either local or hosted append-only storage. */
@@ -201,6 +232,9 @@ export function assertFactoryEventAuthority(event: FactoryEvent): void {
   if (event.type === "verification.recorded") {
     if (!nonEmptyString(payload.workOrderId) || !nonEmptyString(payload.changeSetId) || !nonEmptyString(payload.changeSetDigest) || !nonEmptyString(payload.verificationRunId) || !["PASS", "FAIL", "UNKNOWN"].includes(String(payload.verdict))) throw new Error("invalid_verification_recorded_payload");
   }
+  if (event.type === "change.proposed" || event.type === "change.updated") {
+    if (!nonEmptyString(payload.workOrderId) || !nonEmptyString(payload.changeSetId) || !nonEmptyString(payload.changeSetDigest)) throw new Error("invalid_change_set_scope_payload");
+  }
   if (event.type === "approval.requested") {
     if (!nonEmptyString(payload.workOrderId) || !nonEmptyString(payload.requestId) || !isApprovalScope(payload.scope)) throw new Error("invalid_approval_requested_payload");
   }
@@ -210,14 +244,22 @@ export function assertFactoryEventAuthority(event: FactoryEvent): void {
   if (event.type === "approval.recorded") {
     if (nonEmptyString(payload.decision)) {
       // Legacy approval rows remain readable during migration.
-    } else if (!nonEmptyString(payload.workOrderId) || payload.approvalEventId !== event.eventId || !isApprovalScope(payload.scope) || !isApprovalOutcome(payload.outcome)) {
-      throw new Error("invalid_approval_recorded_payload");
+    } else {
+      if (!nonEmptyString(payload.workOrderId) || payload.approvalEventId !== event.eventId || !isApprovalScope(payload.scope) || !isApprovalOutcome(payload.outcome) || !nonEmptyString(payload.approverId)) throw new Error("invalid_approval_recorded_payload");
+      if (payload.scope === "SPEC") {
+        if (payload.targetOutcome !== undefined || payload.releaseId !== undefined) throw new Error("invalid_spec_approval_scope");
+      } else if (payload.scope === "RELEASE") {
+        if (!isApprovalTargetOutcome(payload.targetOutcome) || !["RELEASE", "HOLD"].includes(payload.targetOutcome) || !nonEmptyString(payload.changeSetId) || !nonEmptyString(payload.changeSetDigest) || payload.releaseId !== undefined) throw new Error("invalid_release_approval_scope");
+      } else if (payload.targetOutcome !== "ROLLBACK" || !nonEmptyString(payload.changeSetDigest) || !nonEmptyString(payload.releaseId)) {
+        throw new Error("invalid_rollback_approval_scope");
+      }
     }
   }
   if (event.type === "release.executed" && (!nonEmptyString(payload.workOrderId) || !nonEmptyString(payload.releaseId))) throw new Error("invalid_release_executed_payload");
   if (event.type === "release.rolled_back" && (!nonEmptyString(payload.workOrderId) || !nonEmptyString(payload.releaseId))) throw new Error("invalid_release_rolled_back_payload");
+  if (event.type === "work_order.transitioned" && (!nonEmptyString(payload.workOrderId) || !isWorkOrderStateValue(payload.fromState) || !isWorkOrderStateValue(payload.toState) || !nonEmptyString(payload.causeId) || !isFactoryStageValue(payload.currentStage))) throw new Error("invalid_work_order_transition_payload");
   if (event.type === "release.decided") {
-    if (!nonEmptyString(payload.workOrderId) || !nonEmptyString(payload.releaseId) || !isReleaseOutcome(payload.outcome) || !isRecord(payload.approvalRef) || payload.approvalRef.kind !== "release_approval") throw new Error("invalid_release_decided_payload");
+    if (!nonEmptyString(payload.workOrderId) || !nonEmptyString(payload.releaseId) || !nonEmptyString(payload.changeSetDigest) || !isReleaseOutcome(payload.outcome) || !isRecord(payload.approvalRef) || payload.approvalRef.kind !== "release_approval") throw new Error("invalid_release_decided_payload");
     const approvalRef = payload.approvalRef as Record<string, unknown>;
     if (!nonEmptyString(approvalRef.eventId) || !isApprovalScope(approvalRef.scope) || !isReleaseOutcome(approvalRef.targetOutcome) || approvalRef.targetOutcome !== payload.outcome) throw new Error("invalid_release_approval_reference");
     if (payload.outcome === "ROLLBACK" && !nonEmptyString(approvalRef.releaseId)) throw new Error("rollback_requires_active_release_reference");
@@ -283,9 +325,21 @@ export function createReviewRecordedEvent(input: Parameters<typeof eventContext>
   return event;
 }
 
-export function createApprovalRecordedEvent(input: Parameters<typeof eventContext>[0] & Omit<ApprovalRecordedPayload, "workOrderId" | "approvalEventId" | "scope"> & { workOrderId?: string; scope: ApprovalScope }): ApprovalRecordedEvent {
+type ApprovalRecordedEventInputBase = Parameters<typeof eventContext>[0] & { workOrderId?: string; approverId: string; rationale?: string };
+export type ApprovalRecordedEventInput =
+  | (ApprovalRecordedEventInputBase & { scope: "SPEC"; outcome: ApprovalOutcome; changeSetId?: string; changeSetDigest?: string; releaseId?: never; targetOutcome?: never })
+  | (ApprovalRecordedEventInputBase & { scope: "RELEASE"; outcome: ApprovalOutcome; changeSetId: string; changeSetDigest: string; targetOutcome: "RELEASE" | "HOLD"; releaseId?: never })
+  | (ApprovalRecordedEventInputBase & { scope: "ROLLBACK"; outcome: ApprovalOutcome; changeSetId?: string; changeSetDigest: string; targetOutcome: "ROLLBACK"; releaseId: string });
+
+export function createApprovalRecordedEvent(input: ApprovalRecordedEventInput): ApprovalRecordedEvent {
   const base = eventContext(input);
-  const event = { ...base, type: "approval.recorded" as const, payload: { workOrderId: input.workOrderId ?? input.aggregateId, changeSetId: input.changeSetId, changeSetDigest: input.changeSetDigest, approvalEventId: asApprovalEventId(base.eventId), scope: input.scope, outcome: input.outcome, approverId: input.approverId, rationale: input.rationale, releaseId: input.releaseId } };
+  const common = { workOrderId: input.workOrderId ?? input.aggregateId, approvalEventId: asApprovalEventId(base.eventId), approverId: input.approverId, rationale: input.rationale };
+  const payload: ApprovalRecordedPayload = input.scope === "SPEC"
+    ? { ...common, scope: "SPEC", outcome: input.outcome, changeSetId: input.changeSetId, changeSetDigest: input.changeSetDigest }
+    : input.scope === "RELEASE"
+      ? { ...common, scope: "RELEASE", outcome: input.outcome, changeSetId: input.changeSetId, changeSetDigest: input.changeSetDigest, targetOutcome: input.targetOutcome }
+      : { ...common, scope: "ROLLBACK", outcome: input.outcome, changeSetId: input.changeSetId, changeSetDigest: input.changeSetDigest, targetOutcome: "ROLLBACK", releaseId: input.releaseId };
+  const event = { ...base, type: "approval.recorded" as const, payload };
   assertCanonicalFactoryEvent(event);
   return event;
 }
@@ -336,8 +390,9 @@ export function validateIntent(intent: IntentContract): string[] {
 
 export class FactoryEventLedger {
   private readonly events: FactoryEvent[] = [];
-  append<T extends Record<string, unknown>>(event: Omit<FactoryEvent<T>, "eventId" | "occurredAt" | "schemaVersion"> & Partial<Pick<FactoryEvent, "eventId" | "occurredAt" | "schemaVersion">>): FactoryEvent<T> {
+  append<T = unknown>(event: Omit<FactoryEvent<T>, "eventId" | "occurredAt" | "schemaVersion"> & Partial<Pick<FactoryEvent, "eventId" | "occurredAt" | "schemaVersion">>): FactoryEvent<T> {
     const full = { ...event, eventId: event.eventId ?? factoryId("evt"), occurredAt: event.occurredAt ?? new Date().toISOString(), schemaVersion: 1 } as FactoryEvent<T>;
+    if (isFactoryCommandBoundaryEventType(full.type)) throw new Error("factory_command_boundary_required");
     assertFactoryEventAuthority(full);
     if (this.events.some((item) => item.eventId === full.eventId)) throw new Error("duplicate_event_id");
     this.events.push(Object.freeze(full));
@@ -350,6 +405,12 @@ export class FactoryEventLedger {
 
 export interface FactoryProjection {
   aggregateId?: string;
+  /** Compatibility route state, reconstructed from WorkOrder transition events. */
+  workOrderState?: WorkOrderState;
+  /** Compatibility stage, reconstructed from WorkOrder transition events. */
+  currentStage?: FactoryStageId | "complete";
+  currentActorId?: string;
+  lastTransitionAt?: string;
   verificationVerdict: VerificationVerdictV2;
   reviewDecision: ReviewDecision;
   /** Canonical review projection; reviewDecision remains for legacy clients. */
@@ -362,6 +423,7 @@ export interface FactoryProjection {
   latestVerificationRunId?: string;
   releaseApprovalEventId?: ApprovalEventId;
   releaseApprovalScope?: ApprovalScope;
+  releaseApprovalTargetOutcome?: ApprovalTargetOutcome;
   releaseApprovalDigest?: string;
   releaseId?: string;
   releaseExecuted?: boolean;
@@ -377,6 +439,16 @@ function compareFactoryEvents(left: FactoryEvent, right: FactoryEvent): number {
 function eventDigest(payload: Record<string, unknown>): string | undefined {
   const value = payload.changeSetDigest ?? payload.digest;
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+const WORK_ORDER_STATE_VALUES: readonly WorkOrderState[] = ["intake", "triage", "specification", "implementation", "review", "verification", "approval", "ready", "merged", "released", "blocked", "failed", "cancelled", "unknown"];
+const FACTORY_STAGE_VALUES: readonly FactoryStageId[] = ["foreman", "triage", "specification", "architecture", "implementation", "test", "review", "security", "verification", "release", "outcome"];
+function isWorkOrderStateValue(value: unknown): value is WorkOrderState { return typeof value === "string" && WORK_ORDER_STATE_VALUES.includes(value as WorkOrderState); }
+function isFactoryStageValue(value: unknown): value is FactoryStageId | "complete" { return value === "complete" || (typeof value === "string" && FACTORY_STAGE_VALUES.includes(value as FactoryStageId)); }
+function stageForWorkOrderState(state: WorkOrderState, prior?: FactoryStageId | "complete"): FactoryStageId | "complete" {
+  if (state === "released" || state === "merged") return "complete";
+  if (state === "ready" || state === "approval") return "release";
+  return FACTORY_STAGE_VALUES.includes(state as FactoryStageId) ? state as FactoryStageId : prior ?? "foreman";
 }
 
 function reviewAssessmentForOutcome(value: unknown): ReviewAssessmentV2 {
@@ -398,26 +470,56 @@ function stableEventPayload(value: unknown): string {
   return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableEventPayload(record[key])}`).join(",")}}`;
 }
 
+function isIdempotentEventReplay(event: FactoryEvent, priorEvents: readonly FactoryEvent[]): boolean {
+  return priorEvents.some((candidate) => candidate.type === event.type
+    && stableEventPayload(candidate.payload) === stableEventPayload(event.payload)
+    && typeof candidate.idempotencyKey === "string"
+    && candidate.idempotencyKey === event.idempotencyKey
+    && typeof candidate.payloadFingerprint === "string"
+    && candidate.payloadFingerprint === event.payloadFingerprint);
+}
+
 export function projectFactoryEvents(events: readonly FactoryEvent[]): FactoryProjection {
-  const state: FactoryProjection = { aggregateId: events[0]?.aggregateId, verificationVerdict: "UNKNOWN", reviewDecision: "NOT_REVIEWED", reviewAssessment: "NOT_REVIEWED", releaseDecision: "NOT_RELEASED", outcomeStatus: "UNMEASURED", outcomeMaturity: "IMMATURE", eventCount: events.length };
+  const isWorkOrder = events[0]?.aggregateType === "work_order";
+  const state: FactoryProjection = { aggregateId: events[0]?.aggregateId, workOrderState: isWorkOrder ? "intake" : undefined, currentStage: isWorkOrder ? "foreman" : undefined, verificationVerdict: "UNKNOWN", reviewDecision: "NOT_REVIEWED", reviewAssessment: "NOT_REVIEWED", releaseDecision: "NOT_RELEASED", outcomeStatus: "UNMEASURED", outcomeMaturity: "IMMATURE", eventCount: events.length };
   for (const event of [...events].sort(compareFactoryEvents)) {
     const value = isRecord(event.payload) ? event.payload : {};
+    if (event.aggregateType === "work_order") {
+      if (event.type === "work_order.created") {
+        if (isWorkOrderStateValue(value.status)) state.workOrderState = value.status;
+        if (isFactoryStageValue(value.currentStage)) state.currentStage = value.currentStage;
+        else if (state.workOrderState) state.currentStage = stageForWorkOrderState(state.workOrderState, state.currentStage);
+        state.currentActorId = event.actorId;
+        state.lastTransitionAt = event.occurredAt;
+      }
+      if (isWorkOrderStateValue(value.toState) && isWorkOrderStateValue(value.fromState)) {
+        state.workOrderState = value.toState;
+        state.currentStage = isFactoryStageValue(value.currentStage) ? value.currentStage : stageForWorkOrderState(value.toState, state.currentStage);
+        state.currentActorId = event.actorId;
+        state.lastTransitionAt = event.occurredAt;
+      }
+    }
     if (event.type === "change.proposed" || event.type === "change.updated") {
       const digest = eventDigest(value);
       const changeSetId = typeof value.changeSetId === "string" ? value.changeSetId : undefined;
       if (digest || changeSetId) {
+        const newDigest = Boolean(digest && digest !== state.currentChangeSetDigest);
+        const firstChangeSet = !state.currentChangeSetDigest && !state.currentChangeSetId;
         state.currentChangeSetDigest = digest;
         state.currentChangeSetId = changeSetId;
-        state.verificationVerdict = "UNKNOWN";
-        state.latestVerificationRunId = undefined;
-        state.reviewAssessment = "NOT_REVIEWED";
-        state.reviewDecision = "NOT_REVIEWED";
-        state.releaseDecision = "NOT_RELEASED";
-        state.releaseApprovalEventId = undefined;
-        state.releaseApprovalScope = undefined;
-        state.releaseApprovalDigest = undefined;
-        state.releaseId = undefined;
-        state.releaseExecuted = false;
+        if (newDigest || firstChangeSet) {
+          state.verificationVerdict = "UNKNOWN";
+          state.latestVerificationRunId = undefined;
+          state.reviewAssessment = "NOT_REVIEWED";
+          state.reviewDecision = "NOT_REVIEWED";
+          state.releaseDecision = "NOT_RELEASED";
+          state.releaseApprovalEventId = undefined;
+          state.releaseApprovalScope = undefined;
+          state.releaseApprovalTargetOutcome = undefined;
+          state.releaseApprovalDigest = undefined;
+          state.releaseId = undefined;
+          state.releaseExecuted = false;
+        }
       }
     }
     if (event.type === "verification.recorded" || event.type === "verification.completed") {
@@ -440,9 +542,10 @@ export function projectFactoryEvents(events: readonly FactoryEvent[]): FactoryPr
     if (event.type === "approval.recorded") {
       const scope = value.scope ?? value.approvalScope;
       if (scope === "SPEC" && value.outcome === "GRANTED" && digestMatchesCurrent(state, value)) state.reviewDecision = "APPROVE";
-      if (scope === "RELEASE" && value.outcome === "GRANTED" && digestMatchesCurrent(state, value)) {
+      if ((scope === "RELEASE" || scope === "ROLLBACK") && value.outcome === "GRANTED" && digestMatchesCurrent(state, value)) {
         state.releaseApprovalEventId = asApprovalEventId(typeof value.approvalEventId === "string" ? value.approvalEventId : event.eventId);
-        state.releaseApprovalScope = "RELEASE";
+        state.releaseApprovalScope = scope;
+        if (isApprovalTargetOutcome(value.targetOutcome)) state.releaseApprovalTargetOutcome = value.targetOutcome;
         state.releaseApprovalDigest = eventDigest(value);
       }
       // Legacy approval rows are preserved for old client projections only.
@@ -459,6 +562,7 @@ export function projectFactoryEvents(events: readonly FactoryEvent[]): FactoryPr
         const approvalRef = isRecord(value.approvalRef) ? value.approvalRef : undefined;
         if (approvalRef?.eventId && typeof approvalRef.eventId === "string") state.releaseApprovalEventId = asApprovalEventId(approvalRef.eventId);
         if (approvalRef?.scope === "RELEASE" || approvalRef?.scope === "ROLLBACK") state.releaseApprovalScope = approvalRef.scope;
+        if (isApprovalTargetOutcome(approvalRef?.targetOutcome)) state.releaseApprovalTargetOutcome = approvalRef.targetOutcome;
         if (typeof approvalRef?.changeSetDigest === "string") state.releaseApprovalDigest = approvalRef.changeSetDigest;
       }
     }
@@ -484,35 +588,44 @@ export function projectFactoryEvents(events: readonly FactoryEvent[]): FactoryPr
 export function assertFactoryEventOrdering(event: FactoryEvent, priorEvents: readonly FactoryEvent[]): void {
   const priorProjection = projectFactoryEvents(priorEvents);
   const payload = isRecord(event.payload) ? event.payload : {};
+  if (isWorkOrderStateValue(payload.fromState) && isWorkOrderStateValue(payload.toState)) {
+    if (!isLegalWorkOrderTransition(payload.fromState, payload.toState)) throw new Error("invalid_work_order_transition");
+    if (priorProjection.workOrderState && payload.fromState !== priorProjection.workOrderState) throw new Error("work_order_transition_source_mismatch");
+  }
+  const digest = eventDigest(payload);
+  const historicalVerification = event.type === "verification.recorded"
+    && Boolean(priorProjection.currentChangeSetDigest && digest && digest !== priorProjection.currentChangeSetDigest);
   if (["verification.recorded", "review.recorded", "approval.recorded", "release.decided"].includes(event.type) && !(event.type === "approval.recorded" && (payload.scope ?? payload.approvalScope) === "ROLLBACK") && !(event.type === "release.decided" && payload.outcome === "ROLLBACK")) {
-    const digest = eventDigest(payload);
-    if (priorProjection.currentChangeSetDigest && digest && digest !== priorProjection.currentChangeSetDigest) throw new Error("stale_change_set");
+    if (!historicalVerification && priorProjection.currentChangeSetDigest && digest && digest !== priorProjection.currentChangeSetDigest) throw new Error("stale_change_set");
   }
   if (priorProjection.releaseDecision === "RELEASE" && ["verification.recorded", "review.recorded", "release.decided"].includes(event.type)) {
-    const digest = eventDigest(payload);
-    const sameReleaseReplay = priorEvents.some((candidate) => candidate.type === event.type && stableEventPayload(candidate.payload) === stableEventPayload(event.payload));
-    const rollbackApproval = event.type === "release.decided" && payload.outcome === "ROLLBACK";
-    if (!rollbackApproval && !sameReleaseReplay && (!digest || digest !== priorProjection.currentChangeSetDigest)) throw new Error("stale_change_set_after_release");
-    if (!rollbackApproval && !sameReleaseReplay) throw new Error("non_idempotent_event_after_release");
+    if (!historicalVerification) {
+      const sameReleaseReplay = isIdempotentEventReplay(event, priorEvents);
+      const rollbackApproval = event.type === "release.decided" && payload.outcome === "ROLLBACK";
+      if (!rollbackApproval && !sameReleaseReplay && (!digest || digest !== priorProjection.currentChangeSetDigest)) throw new Error("stale_change_set_after_release");
+      if (!rollbackApproval && !sameReleaseReplay) throw new Error("non_idempotent_event_after_release");
+    }
   }
   if (priorProjection.releaseDecision === "RELEASE" && event.type === "approval.recorded" && (payload.scope ?? payload.approvalScope) !== "ROLLBACK") throw new Error("release_approval_closed_after_release");
   if (event.type === "release.decided") {
     const projection = priorProjection;
-    if (payload.outcome === "RELEASE") {
+    if (payload.outcome === "RELEASE" || payload.outcome === "HOLD") {
       if (projection.verificationVerdict !== "PASS") throw new Error("release_requires_current_deterministic_pass");
       if (projection.reviewAssessment !== "CLEAR" && projection.reviewDecision !== "APPROVE") throw new Error("release_requires_current_review_clear");
       if (projection.currentChangeSetDigest && payload.changeSetDigest !== projection.currentChangeSetDigest) throw new Error("release_decision_stale_change_set");
     }
-    if (payload.outcome === "ROLLBACK" && (projection.releaseDecision !== "RELEASE" || projection.releaseId !== payload.releaseId)) throw new Error("rollback_requires_executed_release");
+    if (payload.outcome === "ROLLBACK" && (projection.releaseDecision !== "RELEASE" || !projection.releaseExecuted || projection.releaseId !== payload.releaseId)) throw new Error("rollback_requires_executed_release");
   }
   if (event.type === "release.executed") {
     const payload = isRecord(event.payload) ? event.payload : {};
     const projection = projectFactoryEvents(priorEvents);
+    if (priorEvents.some((candidate) => candidate.type === "release.executed") && !isIdempotentEventReplay(event, priorEvents)) throw new Error("release_execution_already_recorded");
     if (projection.releaseDecision !== "RELEASE" || (projection.releaseId && projection.releaseId !== payload.releaseId)) throw new Error("release_execution_requires_release_decision");
   }
   if (event.type === "release.rolled_back") {
     const payload = isRecord(event.payload) ? event.payload : {};
     const projection = projectFactoryEvents(priorEvents);
+    if (priorEvents.some((candidate) => candidate.type === "release.rolled_back") && !isIdempotentEventReplay(event, priorEvents)) throw new Error("rollback_execution_already_recorded");
     if (projection.releaseDecision !== "ROLLBACK" || (projection.releaseId && projection.releaseId !== payload.releaseId)) throw new Error("rollback_execution_requires_rollback_decision");
   }
 }
@@ -548,13 +661,14 @@ export function parseIntegrationCommand(raw: string): IntegrationCommand | undef
 export function integrationReply(input: { status: string; controlPlaneUrl: string }): string { return `${input.status}\nTinkerbot: ${input.controlPlaneUrl}`; }
 
 /** Converts legacy WorkOrder state transitions into canonical graph events during migration. */
-export function graphEventForWorkOrderTransition(input: { workOrderId: string; factoryId: string; organizationId: string; actor: string; policyVersion: string; fromState: string; toState: string; causeId: string; createdAt: string; definitionDigest?: string; changeSetId?: string; changeSetDigest?: string }): FactoryEvent | undefined {
+export function graphEventForWorkOrderTransition(input: { workOrderId: string; factoryId: string; organizationId: string; actor: string; policyVersion: string; fromState: string; toState: string; causeId: string; createdAt: string; currentStage?: string; definitionDigest?: string; changeSetId?: string; changeSetDigest?: string }): FactoryEvent {
   const eventType: Partial<Record<string, FactoryEventType>> = {
     triage: "task.queued", specification: "spec.created", implementation: "task.started", review: "review.requested", verification: "verification.started", approval: "approval.requested", ready: "release.requested", merged: "integration_candidate.assembled", released: "release.executed", blocked: "task.blocked", failed: "task.reworked",
   };
-  const type = eventType[input.toState];
-  if (!type) return undefined;
-  const payload: Record<string, unknown> = { fromState: input.fromState, toState: input.toState, workOrderId: input.workOrderId };
+  const type = eventType[input.toState] ?? "work_order.transitioned";
+  const normalizedToState = isWorkOrderStateValue(input.toState) ? input.toState : "unknown";
+  const currentStage = isFactoryStageValue(input.currentStage) ? input.currentStage : stageForWorkOrderState(normalizedToState);
+  const payload: Record<string, unknown> = { fromState: input.fromState, toState: input.toState, workOrderId: input.workOrderId, causeId: input.causeId, currentStage };
   if (type === "approval.requested") Object.assign(payload, { requestId: input.causeId, scope: "SPEC" });
   if (type === "release.requested") Object.assign(payload, { requestId: input.causeId, changeSetId: input.changeSetId ?? input.workOrderId, changeSetDigest: input.changeSetDigest ?? input.definitionDigest });
   if (type === "release.executed") Object.assign(payload, { releaseId: `release_${input.workOrderId}`, changeSetDigest: input.changeSetDigest ?? input.definitionDigest });

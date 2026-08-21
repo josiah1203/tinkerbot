@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { createWorkOrder, executeFactoryRun, factoryDefinitionDigest, isExternalHarness, signRecord, type FactoryDefinition, type FactoryEvent, type FactorySourceType } from "../../factory/src";
+import { createWorkOrder, executeFactoryRun, factoryDefinitionDigest, isExternalHarness, isFactoryCommandBoundaryEventType, signRecord, type FactoryDefinition, type FactoryEvent, type FactorySourceType } from "../../factory/src";
 import { LOCAL_ORGANIZATION_ID, mergeRuntimeProfile, soloRuntimeOverlay, type RuntimeProfile } from "../../factory/src/runtime";
 import { factoryAiFromProvider, type InferenceProvider } from "../../factory/src/inference";
 import { SqliteFactoryStore } from "./sqlite-store";
@@ -77,10 +77,15 @@ export async function runLocalFactory(input: LocalRunInput): Promise<{ workOrder
   const runId = crypto.randomUUID();
   await input.store.insertRun({ runId, workOrderId: order.workOrderId, factoryId, definitionDigest: order.definitionDigest, status: "running", now });
   const appendRunGraphEvent = async (type: FactoryEvent["type"], payload: Record<string, unknown>, actorId: string, actorType: FactoryEvent["actorType"] = "system"): Promise<void> => {
-    await input.store.appendFactoryEvent({
+    const event: FactoryEvent = {
       eventId: `${runId}:${type}`, type, aggregateId: order.workOrderId, aggregateType: "work_order", organizationId: order.organizationId, factoryId,
       actorId, actorType, occurredAt: new Date().toISOString(), correlationId: runId, schemaVersion: 1, policyVersion: order.policyVersion, provenance: actorType === "human" ? "HUMAN_VERIFIED" : "ATTESTED", payload,
-    });
+    };
+    if (isFactoryCommandBoundaryEventType(type)) {
+      await input.store.dispatchFactoryCommand({ organizationId: order.organizationId, factoryId, workOrderId: order.workOrderId, actorId, actorType, idempotencyKey: `run:${runId}:${type}`, payload, now: event.occurredAt, buildEvents: () => [event] });
+      return;
+    }
+    await input.store.appendFactoryEvent(event);
   };
   await appendRunGraphEvent("worker.session_started", { sessionId: runId, workerId: "local-composite", workOrderId: order.workOrderId }, "local-composite", "agent");
   const inference = input.inference;
@@ -186,7 +191,7 @@ export async function runLocalFactory(input: LocalRunInput): Promise<{ workOrder
     const persistedReceipt = signed ? { ...receipt, integrity: { algorithm: signed.algorithm, digest: signed.digest, signed: true, signedAt: signed.signedAt, keyId: signed.keyId } } : { ...receipt, integrity: { algorithm: "sha256", digest: receiptDigest, signed: false } };
     await input.store.insertAgentReceipt({ runId, agentId: "composite", receipt: persistedReceipt, digest: receiptDigest, signed: Boolean(signed), now });
     await appendRunGraphEvent("worker.claim_emitted", { sessionId: runId, workerId: "local-composite", claimStatus: "ATTESTED", receiptDigest, signed: Boolean(signed) }, "local-composite", "agent");
-    await appendRunGraphEvent("change.proposed", { sessionId: runId, changeRef: `run://${runId}`, receiptDigest }, "local-composite", "agent");
+    await appendRunGraphEvent("change.proposed", { workOrderId: order.workOrderId, sessionId: runId, changeRef: `run://${runId}`, changeSetId: order.workOrderId, changeSetDigest: order.definitionDigest, receiptDigest }, "local-composite", "agent");
     await appendRunGraphEvent("evidence.receipt_created", { sessionId: runId, receiptDigest, signed: Boolean(signed) }, "local-composite", "agent");
     await appendRunGraphEvent("worker.session_completed", { sessionId: runId, workerId: "local-composite", terminal: result.terminal }, "local-composite", "agent");
     if (definition.runtime.sync !== "offline") {

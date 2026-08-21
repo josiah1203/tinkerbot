@@ -1,4 +1,4 @@
-import { assertCanonicalFactoryEvent, createMicroIntent, factoryId, type FactoryEvent, type IntentContract } from "./graph";
+import { assertCanonicalFactoryEvent, createMicroIntent, factoryId, isFactoryCommandBoundaryEventType, type FactoryEvent, type IntentContract } from "./graph";
 import type { FactoryStore } from "./store";
 
 export interface LifecycleContext { organizationId: string; factoryId: string; actorId: string; actorType: FactoryEvent["actorType"]; correlationId?: string; policyVersion?: string; }
@@ -20,7 +20,7 @@ export class FactoryLifecycle {
   private async append(context: LifecycleContext, type: FactoryEvent["type"], aggregateId: string, aggregateType: string, provenance: FactoryEvent["provenance"], payload: Record<string, unknown>): Promise<FactoryEvent> {
     const event: FactoryEvent = { eventId: factoryId("evt"), type, aggregateId, aggregateType, organizationId: context.organizationId, factoryId: context.factoryId, actorId: context.actorId, actorType: context.actorType, occurredAt: new Date().toISOString(), correlationId: context.correlationId ?? aggregateId, schemaVersion: 1, policyVersion: context.policyVersion, provenance, payload };
     assertCanonicalFactoryEvent(event);
-    const bindingEvent = ["verification.recorded", "review.recorded", "approval.requested", "approval.recorded", "release.requested", "release.decided", "release.executed", "release.rolled_back"].includes(event.type);
+    const bindingEvent = isFactoryCommandBoundaryEventType(event.type);
     if (bindingEvent && !this.store.dispatchFactoryCommand) throw new Error("factory_command_boundary_required");
     if (bindingEvent && this.store.dispatchFactoryCommand) {
       await this.store.dispatchFactoryCommand({ organizationId: context.organizationId, factoryId: context.factoryId, workOrderId: aggregateId, actorId: context.actorId, actorType: context.actorType, idempotencyKey: `lifecycle:${event.eventId}`, payload, now: event.occurredAt, buildEvents: () => [event] });

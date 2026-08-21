@@ -1,8 +1,8 @@
 import { createHmac, generateKeyPairSync, createSign } from "node:crypto";
-import { createSelfHostedCompletion, implementBranchName, resetOidcJwksCache } from "../packages/factory/src";
+import { createSelfHostedCompletion, implementBranchName, resetOidcJwksCache, type FactoryEvent } from "../packages/factory/src";
 import worker, { FactoryRunWorkflow, handleFactoryQueueMessage } from "../apps/control-plane-worker/src";
 import { D1FactoryStore } from "../apps/control-plane-worker/src/factory-store";
-import { ForemanDurableObject, handleFactoryMcpRequest, intakeFromIntegration, persistTranscript, runFactoryTurn, sweepFactoryOs } from "../apps/control-plane-worker/src/factory-runtime";
+import { ForemanDurableObject, factoryQueueCoordinationName, factoryWorkOrderCoordinationName, handleFactoryMcpRequest, intakeFromIntegration, persistTranscript, routeFactoryCellHold, routeFactoryGraphCommand, routeFactorySpecApproval, routeFactoryTransition, routeFactoryVerification, runFactoryTurn, sweepFactoryOs } from "../apps/control-plane-worker/src/factory-runtime";
 
 function cookieFrom(response: Response, name: string): string {
   const raw = typeof response.headers.getSetCookie === "function" ? response.headers.getSetCookie().join("; ") : (response.headers.get("set-cookie") ?? "");
@@ -304,8 +304,176 @@ test("hosted queue messages are serialized through the Foreman Durable Object", 
     },
   };
   const result = await handleFactoryQueueMessage(env, { deliveryId: "delivery-1", organizationId: "org-1", sourceType: "manual", sourceId: "source-1", actor: "operator" });
-  expect(names).toEqual(["org-1:source-1"]);
+  expect(names).toEqual(["org-1:intake:manual:source-1"]);
+  expect(factoryWorkOrderCoordinationName("org-1", "wo-1")).toBe("org-1:wo-1");
+  expect(factoryQueueCoordinationName({ organizationId: "org-1", sourceType: "manual", sourceId: "source-1", workOrderId: "wo-1" })).toBe("org-1:wo-1");
   expect(result).toMatchObject({ workOrderId: "wo-1", runId: "run-1", terminal: "implementation" });
+});
+
+test("hosted verification callbacks use the same WorkOrder coordinator", async () => {
+  const names: string[] = [];
+  const env = {
+    DB: factorySeed(),
+    FOREMAN: {
+      idFromName: (name: string) => { names.push(name); return name; },
+      get: () => ({ fetch: async (request: Request) => {
+        expect(request.headers.get("x-tinkerbot-internal")).toBe("foreman-v1");
+        expect(await request.json()).toMatchObject({ command: "record_verification", workOrderId: "wo-1", organizationId: "org-1" });
+        return Response.json({ projection: { verificationVerdict: "PASS" } });
+      } }),
+    },
+  };
+  await expect(routeFactoryVerification(env, { workOrderId: "wo-1", organizationId: "org-1", verificationRunId: "run-1", verdict: "PASS", now: "2030-01-01T00:00:00.000Z" })).resolves.toMatchObject({ verificationVerdict: "PASS" });
+  expect(names).toEqual(["org-1:wo-1"]);
+});
+
+test("hosted graph commands and compatibility transitions use the same WorkOrder coordinator", async () => {
+  const names: string[] = [];
+  const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const env = {
+    DB: factorySeed(),
+    FOREMAN: {
+      idFromName: (name: string) => { names.push(name); return name; },
+      get: () => ({ fetch: async (request: Request) => {
+        calls.push({ path: new URL(request.url).pathname, body: await request.json() as Record<string, unknown> });
+        return new URL(request.url).pathname.endsWith("/command")
+          ? Response.json({ replayed: false, commandId: "cmd-1", eventIds: [], events: [], projection: {} })
+          : Response.json({ ok: true, order: { workOrderId: "wo-1", status: "triage" } });
+      } }),
+    },
+  };
+  const event: FactoryEvent = {
+    eventId: "change:cs-1",
+    type: "change.proposed",
+    aggregateId: "wo-1",
+    aggregateType: "work_order",
+    organizationId: "org-1",
+    factoryId: "fac-1",
+    actorId: "operator",
+    actorType: "human",
+    occurredAt: "2030-01-01T00:00:00.000Z",
+    correlationId: "cs-1",
+    schemaVersion: 1,
+    provenance: "HUMAN_VERIFIED",
+    payload: { workOrderId: "wo-1", changeSetId: "cs-1", changeSetDigest: "sha256:abc" },
+  };
+  await expect(routeFactoryGraphCommand(env, {
+    organizationId: "org-1",
+    factoryId: "fac-1",
+    workOrderId: "wo-1",
+    actorId: "operator",
+    actorType: "human",
+    idempotencyKey: "change-set:cs-1",
+    payload: { changeSetId: "cs-1", changeSetDigest: "sha256:abc" },
+    now: event.occurredAt,
+    event,
+  })).resolves.toMatchObject({ commandId: "cmd-1" });
+  await expect(routeFactoryTransition(env, {
+    organizationId: "org-1",
+    workOrderId: "wo-1",
+    toState: "triage",
+    causeId: "operator:triage",
+    actor: "operator",
+    now: "2030-01-01T00:01:00.000Z",
+  })).resolves.toMatchObject({ ok: true, order: { workOrderId: "wo-1" } });
+  await expect(routeFactorySpecApproval(env, {
+    organizationId: "org-1",
+    workOrderId: "wo-1",
+    actor: "operator",
+    decision: "approved",
+    signature: "session",
+    now: "2030-01-01T00:02:00.000Z",
+  })).resolves.toBeUndefined();
+  expect(names).toEqual(["org-1:wo-1", "org-1:wo-1", "org-1:wo-1"]);
+  expect(calls.map((call) => call.path)).toEqual(["/foreman/command", "/foreman/transition", "/foreman/approval"]);
+  expect(calls[0]?.body).toMatchObject({ command: "graph_command", idempotencyKey: "change-set:cs-1", workOrderId: "wo-1" });
+  expect(calls[1]?.body).toMatchObject({ command: "transition", toState: "triage", causeId: "operator:triage" });
+  expect(calls[2]?.body).toMatchObject({ command: "spec_approval", decision: "approved", signature: "session" });
+});
+
+test("hosted cell ownership actions use the same WorkOrder coordinator", async () => {
+  const names: string[] = [];
+  const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const env = {
+    DB: factorySeed(),
+    FOREMAN: {
+      idFromName: (name: string) => { names.push(name); return name; },
+      get: () => ({ fetch: async (request: Request) => {
+        calls.push({ path: new URL(request.url).pathname, body: await request.json() as Record<string, unknown> });
+        return Response.json({ ok: true, workOrder: { workOrderId: "wo-1" }, held: calls.length === 1 });
+      } }),
+    },
+  };
+  await expect(routeFactoryCellHold(env, { workOrderId: "wo-1", organizationId: "org-1", actor: "operator", action: "take", now: "2030-01-01T00:00:00.000Z" })).resolves.toMatchObject({ ok: true, held: true });
+  await expect(routeFactoryCellHold(env, { workOrderId: "wo-1", organizationId: "org-1", actor: "operator", action: "return", now: "2030-01-01T00:01:00.000Z" })).resolves.toMatchObject({ ok: true, held: false });
+  expect(names).toEqual(["org-1:wo-1", "org-1:wo-1"]);
+  expect(calls.map((call) => call.path)).toEqual(["/foreman/cell-hold", "/foreman/cell-hold"]);
+  expect(calls[0]?.body).toMatchObject({ command: "cell_hold", action: "take", workOrderId: "wo-1" });
+  expect(calls[1]?.body).toMatchObject({ command: "cell_hold", action: "return", workOrderId: "wo-1" });
+});
+
+test("Foreman Durable Object applies routed graph commands before compatibility transitions", async () => {
+  const database = factorySeed({
+    workOrders: [{
+      work_order_id: "wo_1", factory_id: "fac_1", organization_id: "org_1", source_type: "manual", source_id: "source-1",
+      repository_id: "acme/payments", policy_version: "default", definition_version: "1", definition_digest: "sha256:abc",
+      current_stage: "foreman", status: "intake", actor: "system", created_at: "2030-01-01T00:00:00.000Z", updated_at: "2030-01-01T00:00:00.000Z",
+    }],
+  });
+  const foreman = new ForemanDurableObject({ id: { toString: () => "org_1:wo_1" } }, { DB: database });
+  const graphResponse = await foreman.fetch(new Request("https://do/command", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-tinkerbot-internal": "foreman-v1" },
+    body: JSON.stringify({
+      command: "graph_command", organizationId: "org_1", factoryId: "fac_1", workOrderId: "wo_1", actorId: "operator", actorType: "human",
+      idempotencyKey: "change-set:cs-1", payload: { changeSetId: "cs-1", changeSetDigest: "sha256:abc" }, now: "2030-01-01T00:00:00.000Z",
+      event: { eventId: "change:cs-1", type: "change.proposed", aggregateId: "wo_1", aggregateType: "work_order", organizationId: "org_1", factoryId: "fac_1", actorId: "operator", actorType: "human", occurredAt: "2030-01-01T00:00:00.000Z", correlationId: "cs-1", schemaVersion: 1, provenance: "HUMAN_VERIFIED", payload: { workOrderId: "wo_1", changeSetId: "cs-1", changeSetDigest: "sha256:abc" } },
+    }),
+  }));
+  expect(graphResponse.status).toBe(200);
+  expect(await graphResponse.json()).toMatchObject({ replayed: false, events: [{ type: "change.proposed" }] });
+  const transitionResponse = await foreman.fetch(new Request("https://do/transition", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-tinkerbot-internal": "foreman-v1" },
+    body: JSON.stringify({ command: "transition", organizationId: "org_1", workOrderId: "wo_1", toState: "triage", causeId: "operator:triage", actor: "operator", now: "2030-01-01T00:01:00.000Z" }),
+  }));
+  expect(transitionResponse.status).toBe(200);
+  expect(await transitionResponse.json()).toMatchObject({ ok: true, order: { workOrderId: "wo_1", status: "triage" } });
+  const approvalResponse = await foreman.fetch(new Request("https://do/approval", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-tinkerbot-internal": "foreman-v1" },
+    body: JSON.stringify({ command: "spec_approval", organizationId: "org_1", workOrderId: "wo_1", actor: "operator", decision: "approved", signature: "session", now: "2030-01-01T00:02:00.000Z" }),
+  }));
+  expect(approvalResponse.status).toBe(200);
+  expect(await approvalResponse.json()).toMatchObject({ accepted: true });
+  const cellResponse = await foreman.fetch(new Request("https://do/cell-hold", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-tinkerbot-internal": "foreman-v1" },
+    body: JSON.stringify({ command: "cell_hold", organizationId: "org_1", workOrderId: "wo_1", actor: "operator", action: "take", now: "2030-01-01T00:03:00.000Z" }),
+  }));
+  expect(cellResponse.status).toBe(200);
+  expect(await cellResponse.json()).toMatchObject({ ok: true, held: true, workOrder: { workOrderId: "wo_1", heldBy: "operator" } });
+});
+
+test("Foreman Durable Object keeps release HOLD on the typed decision path", async () => {
+  const database = factorySeed({
+    workOrders: [{
+      work_order_id: "wo_1", factory_id: "fac_1", organization_id: "org_1", source_type: "manual", source_id: "source-1",
+      repository_id: "acme/payments", policy_version: "default", definition_version: "1", definition_digest: "sha256:abc",
+      current_stage: "release", status: "approval", actor: "system", created_at: "2030-01-01T00:00:00.000Z", updated_at: "2030-01-01T00:00:00.000Z",
+    }],
+  });
+  const store = new D1FactoryStore(database);
+  await store.recordVerification({ workOrderId: "wo_1", organizationId: "org_1", changeSetId: "cs_1", changeSetDigest: "sha256:abc", verificationRunId: "verify_1", verdict: "PASS", now: "2030-01-01T00:00:00.000Z" });
+  await store.recordTypedDecision({ workOrderId: "wo_1", organizationId: "org_1", actor: "reviewer", type: "review", decision: "approved", now: "2030-01-01T00:01:00.000Z" });
+  const foreman = new ForemanDurableObject({ id: { toString: () => "wo_foreman" } }, { DB: database });
+  const response = await foreman.fetch(new Request("https://do/decision", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-tinkerbot-internal": "foreman-v1" },
+    body: JSON.stringify({ command: "work_decision", workOrderId: "wo_1", organizationId: "org_1", actor: "operator", type: "release", decision: "hold", now: "2030-01-01T00:00:00.000Z" }),
+  }));
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({ workOrder: { releaseDecision: "hold" } });
 });
 
 test("signed GitHub security alerts enqueue factory work and reject forged or replayed deliveries", async () => {
@@ -471,9 +639,11 @@ test("control-tower work orders expose group, take/return write human decisions,
     expect(csrf.status).toBe(403);
     const take = await worker.fetch(new Request("https://control.example/work-orders/wo_1/take", { method: "POST", headers: { origin: "https://control.example", cookie, "content-type": "application/json" }, body: "{}" }), env);
     expect(take.status).toBe(200);
+    expect(database._state.workOrders.get("wo_1")?.held_by).toBe("user_1");
     expect(database._state.decisions.some((row) => String(row.decision).includes("take") || String(row.reason ?? "").includes("parity"))).toBe(true);
     const returned = await worker.fetch(new Request("https://control.example/work-orders/wo_1/return", { method: "POST", headers: { origin: "https://control.example", cookie, "content-type": "application/json" }, body: "{}" }), env);
     expect(returned.status).toBe(200);
+    expect(database._state.workOrders.get("wo_1")?.held_by).toBeNull();
     const selfApprove = await worker.fetch(new Request("https://control.example/evolution/prop_steward/approve", { method: "POST", headers: { origin: "https://control.example", cookie, "content-type": "application/json" }, body: "{}" }), env);
     expect(selfApprove.status).toBe(409);
     expect(await selfApprove.json()).toMatchObject({ code: "steward_cannot_self_approve" });
@@ -487,9 +657,10 @@ test("control-tower work orders expose group, take/return write human decisions,
   }
 });
 
-function factorySeed() {
+function factorySeed(seed: Parameters<typeof memoryFactoryDb>[0] = {}) {
   return memoryFactoryDb({
-    factories: [{ factory_id: "fac_1", organization_id: "org_1", name: "payments", status: "active", updated_at: "2030-01-01T00:00:00.000Z", definition_digest: "sha256:abc" }],
+    ...seed,
+    factories: seed.factories ?? [{ factory_id: "fac_1", organization_id: "org_1", name: "payments", status: "active", updated_at: "2030-01-01T00:00:00.000Z", definition_digest: "sha256:abc" }],
   });
 }
 
@@ -795,6 +966,15 @@ test("authenticated factory HTTP lists products, cells, evolution, and MCP witho
     expect(await credential.json()).toMatchObject({ tokenShownOnce: true });
     expect((await worker.fetch(new Request("https://control.example/change-sets", { headers }), env)).status).toBe(200);
     expect((await worker.fetch(new Request("https://control.example/change-sets", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify({ name: "payments", repositories: [] }) }), env)).status).toBe(201);
+    database._state.workOrders.set("wo_change", {
+      work_order_id: "wo_change", factory_id: "fac_1", organization_id: "org_1", source_type: "manual", source_id: "change-source",
+      repository_id: "acme/payments", policy_version: "default", definition_version: "1", definition_digest: "sha256:abc",
+      current_stage: "implementation", status: "implementation", actor: "operator", created_at: "2030-01-01T00:00:00.000Z", updated_at: "2030-01-01T00:00:00.000Z",
+    });
+    const linkedChangeSet = await worker.fetch(new Request("https://control.example/change-sets", { method: "POST", headers: { ...headers, "content-type": "application/json", "x-idempotency-key": "change-api-1" }, body: JSON.stringify({ name: "linked-payments", workOrderId: "wo_change", changeSetId: "cs_api_1", repositories: [] }) }), env);
+    expect(linkedChangeSet.status).toBe(201);
+    expect(await linkedChangeSet.json()).toMatchObject({ changeSetId: "cs_api_1", changeSetDigest: expect.stringMatching(/^sha256:/) });
+    expect((await new D1FactoryStore(database).listFactoryEvents("wo_change", "org_1")).map((event) => event.type)).toContain("change.proposed");
     expect((await worker.fetch(new Request("https://control.example/release-assessments", { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: "{}" }), env)).status).toBe(200);
     expect((await worker.fetch(new Request("https://control.example/audit/export", { headers }), env)).status).toBe(200);
     expect((await worker.fetch(new Request("https://control.example/notifications", { headers }), env)).status).toBe(200);

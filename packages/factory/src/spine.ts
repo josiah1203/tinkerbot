@@ -33,8 +33,10 @@ export interface FactoryCommandReceipt {
 
 export interface FactoryCommandStore {
   listFactoryEvents(aggregateId: string, organizationId?: string): Promise<FactoryEvent[]>;
-  appendFactoryEvent(event: FactoryEvent): Promise<void>;
-  appendFactoryEvents?(events: readonly FactoryEvent[]): Promise<void>;
+  appendFactoryEvent(event: FactoryEvent, options?: { commandBoundary?: boolean }): Promise<void>;
+  appendFactoryEvents?(events: readonly FactoryEvent[], options?: { commandBoundary?: boolean }): Promise<void>;
+  /** Persist the event batch and its receipt as one adapter-level unit when supported. */
+  appendFactoryCommand?(events: readonly FactoryEvent[], receipt: FactoryCommandReceipt): Promise<void>;
   getFactoryCommandReceipt?(organizationId: string, workOrderId: string, idempotencyKey: string): Promise<FactoryCommandReceipt | null>;
   putFactoryCommandReceipt?(receipt: FactoryCommandReceipt): Promise<void>;
 }
@@ -62,6 +64,56 @@ export interface FactoryCommandResult {
   projection: FactoryProjection;
 }
 
+export type FactoryProjectionCheckpointStatus = "APPLIED" | "RETRY_PENDING";
+
+/** Durable read-model recovery state. The graph remains authoritative even
+ * when the compatibility projection is behind or needs to be rebuilt. */
+export interface FactoryProjectionCheckpoint {
+  organizationId: string;
+  aggregateId: string;
+  aggregateType: string;
+  lastEventId?: string;
+  lastAggregateSequence?: number;
+  projection: FactoryProjection;
+  projectionFingerprint: string;
+  status: FactoryProjectionCheckpointStatus;
+  attemptCount: number;
+  lastError?: string;
+  updatedAt: string;
+}
+
+function compareFactoryEvents(left: FactoryEvent, right: FactoryEvent): number {
+  if (left.aggregateSequence !== undefined && right.aggregateSequence !== undefined && left.aggregateSequence !== right.aggregateSequence) return left.aggregateSequence - right.aggregateSequence;
+  return left.occurredAt.localeCompare(right.occurredAt) || left.eventId.localeCompare(right.eventId);
+}
+
+export function createFactoryProjectionCheckpoint(input: {
+  organizationId: string;
+  aggregateId: string;
+  aggregateType: string;
+  events: readonly FactoryEvent[];
+  projection: FactoryProjection;
+  status: FactoryProjectionCheckpointStatus;
+  attemptCount: number;
+  lastError?: string;
+  updatedAt: string;
+}): FactoryProjectionCheckpoint {
+  const lastEvent = [...input.events].sort(compareFactoryEvents).at(-1);
+  return {
+    organizationId: input.organizationId,
+    aggregateId: input.aggregateId,
+    aggregateType: input.aggregateType,
+    lastEventId: lastEvent?.eventId,
+    lastAggregateSequence: lastEvent?.aggregateSequence,
+    projection: input.projection,
+    projectionFingerprint: commandPayloadFingerprint(input.projection),
+    status: input.status,
+    attemptCount: input.attemptCount,
+    lastError: input.lastError,
+    updatedAt: input.updatedAt,
+  };
+}
+
 export function replayFactoryGraph(events: readonly FactoryEvent[]): FactoryProjection {
   return projectFactoryEvents([...events]);
 }
@@ -85,11 +137,12 @@ export function validateReleaseApprovalReference(event: FactoryEvent, priorEvent
   const referenced = [...priorEvents, ...batchEvents].find((candidate) => candidate.eventId === ref.eventId);
   if (!referenced || referenced.type !== "approval.recorded") throw new Error("release_approval_reference_must_target_approval_event");
   const approval = referenced.payload as Record<string, unknown>;
-  if ((approval.scope ?? approval.approvalScope) !== ref.scope || approval.outcome !== "GRANTED" || approval.workOrderId !== payload.workOrderId) throw new Error("release_approval_reference_not_granted");
+  if (referenced.aggregateId !== event.aggregateId || referenced.organizationId !== event.organizationId || referenced.factoryId !== event.factoryId) throw new Error("release_approval_reference_scope_mismatch");
+  if ((approval.scope ?? approval.approvalScope) !== ref.scope || approval.outcome !== "GRANTED" || approval.workOrderId !== payload.workOrderId || approval.targetOutcome !== payload.outcome) throw new Error("release_approval_reference_not_granted");
   const outcome = payload.outcome;
   if (outcome === "ROLLBACK") {
-    if (ref.scope !== "ROLLBACK" || ref.releaseId !== payload.releaseId) throw new Error("rollback_approval_reference_mismatch");
-  } else if (ref.scope !== "RELEASE" || ref.changeSetDigest !== payload.changeSetDigest || approval.changeSetDigest !== payload.changeSetDigest) {
+    if (ref.scope !== "ROLLBACK" || ref.targetOutcome !== "ROLLBACK" || ref.releaseId !== payload.releaseId || approval.releaseId !== payload.releaseId || typeof ref.changeSetDigest !== "string" || approval.changeSetDigest !== ref.changeSetDigest || (payload.changeSetDigest !== undefined && ref.changeSetDigest !== payload.changeSetDigest)) throw new Error("rollback_approval_reference_mismatch");
+  } else if (ref.scope !== "RELEASE" || ref.targetOutcome !== outcome || ref.changeSetDigest !== payload.changeSetDigest || approval.changeSetDigest !== payload.changeSetDigest) {
     throw new Error("release_approval_reference_digest_mismatch");
   }
 }
@@ -148,11 +201,14 @@ export class FactoryCommandBoundary {
         assertCanonicalFactoryEvent(event);
         events.push(event);
       }
-      if (this.store.appendFactoryEvents) await this.store.appendFactoryEvents(events);
-      else for (const event of events) await this.store.appendFactoryEvent(event);
       const receipt: FactoryCommandReceipt = { organizationId: input.organizationId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, commandId, eventIds: events.map((event) => event.eventId), resultJson: JSON.stringify({ eventIds: events.map((event) => event.eventId) }), createdAt: input.now ?? new Date().toISOString() };
+      if (this.store.appendFactoryCommand) await this.store.appendFactoryCommand(events, receipt);
+      else {
+        if (this.store.appendFactoryEvents) await this.store.appendFactoryEvents(events, { commandBoundary: true });
+        else for (const event of events) await this.store.appendFactoryEvent(event, { commandBoundary: true });
+        await this.store.putFactoryCommandReceipt?.(receipt);
+      }
       this.receipts.set(receiptKey, receipt);
-      await this.store.putFactoryCommandReceipt?.(receipt);
       const allEvents = [...priorEvents, ...events];
       return { replayed: false, commandId, payloadFingerprint, eventIds: receipt.eventIds, events, projection: projectFactoryEvents(allEvents) };
     } finally {

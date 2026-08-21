@@ -1,0 +1,37 @@
+version: 1
+name: tinkerbot-self
+repositories:
+  - josiah1203/tinkerbot
+sources:
+  - type: github_pull_request
+  - type: github_issue
+  - type: github_dependabot
+  - type: manual
+  - type: mcp
+  - type: incident
+  - type: scheduled
+agents:
+  - id: foreman
+    provider: workers-ai
+    model: "@cf/openai/gpt-oss-120b"
+  - id: triage
+    provider: workers-ai
+    model: "@cf/zhipuai/glm-4.7-flash"
+  - id: specification
+    provider: workers-ai
+    model: "@cf/openai/gpt-oss-120b"
+  - id: implement
+    provider: workers-ai
+    model: "@cf/zhipuai/glm-5.2"
+    harness: tinkerbot-sandbox
+  - id: review
+    provider: workers-ai
+    model: "@cf/openai/gpt-oss-120b"
+runner:
+  type: github_actions
+  workflow: tinkerbot.yml
+  image: cloudflare/sandbox:next
+secretRefs:
+  - env:GITHUB_APP_PRIVATE_KEY
+approvals:
+  required: true

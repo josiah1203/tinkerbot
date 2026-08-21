@@ -2,14 +2,14 @@ import type { AftercareRecord, FactoryCommand } from "./authority";
 import type { WorkOrder, WorkOrderEvent, WorkOrderState } from "./index";
 import type { CostEstimate, ExecutionPlan, ProviderUsage } from "./runtime";
 import type { EvalAttempt, EvalSuite } from "./evals";
-import { assertFactoryEventAuthority, assertFactoryEventOrdering, graphEventForWorkOrderTransition, projectFactoryEvents, type FactoryEvent, type FactoryProjection } from "./graph";
+import { assertFactoryEventAuthority, assertFactoryEventOrdering, isFactoryCommandBoundaryEventType, graphEventForWorkOrderTransition, projectFactoryEvents, type FactoryEvent, type FactoryProjection } from "./graph";
 import { FactoryCommandBoundary, type FactoryCommandInput, type FactoryCommandReceipt, type FactoryCommandResult } from "./spine";
 
 export interface FactoryStore {
   insertWorkOrder(order: WorkOrder): Promise<void>;
   getWorkOrder(workOrderId: string): Promise<WorkOrder | null>;
   listWorkOrders(organizationId: string): Promise<WorkOrder[]>;
-  applyTransition(workOrderId: string, toState: WorkOrderState, causeId: string, actor: string): Promise<{ ok: true; order: WorkOrder; event?: WorkOrderEvent } | { ok: false; code: "not_found" | "invalid_transition" | "idempotent" }>;
+  applyTransition(workOrderId: string, toState: WorkOrderState, causeId: string, actor: string, now?: string): Promise<{ ok: true; order: WorkOrder; event?: WorkOrderEvent } | { ok: false; code: "not_found" | "invalid_transition" | "idempotent" }>;
   insertRun(run: { runId: string; workOrderId: string; factoryId: string; definitionDigest: string; status: string; now: string }): Promise<void>;
   getRun(runId: string): Promise<Record<string, string> | null>;
   getRunByWorkOrder(workOrderId: string): Promise<Record<string, string> | null>;
@@ -30,7 +30,7 @@ export interface FactoryStore {
   enqueueOutbox(event: OutboxEvent): Promise<void>;
   listOutbox(limit?: number): Promise<OutboxEvent[]>;
   markOutboxSynced(eventId: string, now: string): Promise<void>;
-  appendFactoryEvent(event: FactoryEvent): Promise<void>;
+  appendFactoryEvent(event: FactoryEvent, options?: { commandBoundary?: boolean }): Promise<void>;
   dispatchFactoryCommand?<T>(input: FactoryCommandInput<T>): Promise<FactoryCommandResult>;
   listFactoryEvents(aggregateId: string): Promise<FactoryEvent[]>;
   reconstructFactoryGraph(aggregateId: string): Promise<FactoryProjection>;
@@ -57,6 +57,19 @@ export interface OutboxEvent {
   payloadJson: string;
   createdAt: string;
   syncedAt?: string;
+}
+
+function applyFactoryProjectionToWorkOrder(order: WorkOrder, projection: FactoryProjection): WorkOrder {
+  return {
+    ...order,
+    ...(projection.workOrderState ? { status: projection.workOrderState } : {}),
+    ...(projection.currentStage ? { currentStage: projection.currentStage } : {}),
+    ...(projection.currentActorId ? { actor: projection.currentActorId } : {}),
+    ...(projection.lastTransitionAt ? { updatedAt: projection.lastTransitionAt } : {}),
+    verificationVerdict: projection.verificationVerdict,
+    reviewAssessment: projection.reviewAssessment === "CLEAR" || projection.reviewAssessment === "REVISE" ? projection.reviewAssessment : "NEEDS_HUMAN_REVIEW",
+    releaseDecision: projection.releaseDecision === "RELEASE" ? "READY" : "BLOCKED",
+  };
 }
 
 export class MemoryFactoryStore implements FactoryStore {
@@ -90,17 +103,18 @@ export class MemoryFactoryStore implements FactoryStore {
     return [...this.orders.values()].filter((order) => order.organizationId === organizationId);
   }
 
-  async applyTransition(workOrderId: string, toState: WorkOrderState, causeId: string, actor: string): Promise<{ ok: true; order: WorkOrder; event?: WorkOrderEvent } | { ok: false; code: "not_found" | "invalid_transition" | "idempotent" }> {
+  async applyTransition(workOrderId: string, toState: WorkOrderState, causeId: string, actor: string, now?: string): Promise<{ ok: true; order: WorkOrder; event?: WorkOrderEvent } | { ok: false; code: "not_found" | "invalid_transition" | "idempotent" }> {
     const { transitionWorkOrder } = await import("./index");
     const current = this.orders.get(workOrderId);
     if (!current) return { ok: false, code: "not_found" };
-    const result = transitionWorkOrder(current, toState, causeId, actor);
+    const result = transitionWorkOrder(current, toState, causeId, actor, now);
     if ("error" in result) return { ok: false, code: result.error };
     const graphEvent = graphEventForWorkOrderTransition({ ...result.order, fromState: result.event.fromState, toState: result.event.toState, causeId: result.event.causeId, createdAt: result.event.createdAt });
     if (graphEvent) await this.commandBoundary.dispatch({ organizationId: result.order.organizationId, factoryId: result.order.factoryId, workOrderId: result.order.workOrderId, actorId: graphEvent.actorId, actorType: graphEvent.actorType, idempotencyKey: `transition:${result.event.eventId}`, payload: graphEvent.payload, now: graphEvent.occurredAt, buildEvents: () => [graphEvent] });
-    this.orders.set(workOrderId, result.order);
+    const projection = projectFactoryEvents(this.factoryEvents.filter((item) => item.aggregateId === workOrderId));
+    this.orders.set(workOrderId, applyFactoryProjectionToWorkOrder(result.order, projection));
     this.events.push(result.event);
-    return { ok: true, order: result.order, event: result.event };
+    return { ok: true, order: this.orders.get(workOrderId)!, event: result.event };
   }
 
   async insertRun(run: { runId: string; workOrderId: string; factoryId: string; definitionDigest: string; status: string; now: string }): Promise<void> {
@@ -190,8 +204,8 @@ export class MemoryFactoryStore implements FactoryStore {
     if (event) event.syncedAt = now;
   }
 
-  async appendFactoryEvent(event: FactoryEvent): Promise<void> {
-    if (["verification.recorded", "review.recorded", "approval.requested", "approval.recorded", "release.requested", "release.decided", "release.executed", "release.rolled_back"].includes(event.type)) throw new Error("factory_command_boundary_required");
+  async appendFactoryEvent(event: FactoryEvent, options: { commandBoundary?: boolean } = {}): Promise<void> {
+    if (!options.commandBoundary && isFactoryCommandBoundaryEventType(event.type)) throw new Error("factory_command_boundary_required");
     assertFactoryEventAuthority(event);
     assertFactoryEventOrdering(event, this.factoryEvents.filter((item) => item.aggregateId === event.aggregateId));
     if (this.factoryEvents.some((item) => item.eventId === event.eventId)) throw new Error("duplicate_event_id");
@@ -199,19 +213,15 @@ export class MemoryFactoryStore implements FactoryStore {
     const order = this.orders.get(event.aggregateId);
     if (order && event.aggregateType === "work_order") {
       const projection = projectFactoryEvents(this.factoryEvents.filter((item) => item.aggregateId === event.aggregateId));
-      this.orders.set(event.aggregateId, {
-        ...order,
-        verificationVerdict: projection.verificationVerdict,
-        reviewAssessment: projection.reviewAssessment === "CLEAR" || projection.reviewAssessment === "REVISE" ? projection.reviewAssessment : "NEEDS_HUMAN_REVIEW",
-        releaseDecision: projection.releaseDecision === "RELEASE" ? "READY" : "BLOCKED",
-      });
+      this.orders.set(event.aggregateId, applyFactoryProjectionToWorkOrder(order, projection));
     }
   }
 
-  async appendFactoryEvents(events: readonly FactoryEvent[]): Promise<void> {
+  async appendFactoryEvents(events: readonly FactoryEvent[], options: { commandBoundary?: boolean } = {}): Promise<void> {
     const pending: FactoryEvent[] = [];
     const ids = new Set(this.factoryEvents.map((event) => event.eventId));
     for (const event of events) {
+      if (!options.commandBoundary && isFactoryCommandBoundaryEventType(event.type)) throw new Error("factory_command_boundary_required");
       assertFactoryEventAuthority(event);
       if (ids.has(event.eventId)) throw new Error("duplicate_event_id");
       assertFactoryEventOrdering(event, [...this.factoryEvents.filter((item) => item.aggregateId === event.aggregateId), ...pending.filter((item) => item.aggregateId === event.aggregateId)]);
@@ -223,7 +233,7 @@ export class MemoryFactoryStore implements FactoryStore {
       const order = this.orders.get(aggregateId);
       if (!order) continue;
       const projection = projectFactoryEvents(this.factoryEvents.filter((item) => item.aggregateId === aggregateId));
-      this.orders.set(aggregateId, { ...order, verificationVerdict: projection.verificationVerdict, reviewAssessment: projection.reviewAssessment === "CLEAR" || projection.reviewAssessment === "REVISE" ? projection.reviewAssessment : "NEEDS_HUMAN_REVIEW", releaseDecision: projection.releaseDecision === "RELEASE" ? "READY" : "BLOCKED" });
+      this.orders.set(aggregateId, applyFactoryProjectionToWorkOrder(order, projection));
     }
   }
 

@@ -45,13 +45,19 @@ import {
   classifyAiInvocation,
   INTELLIGENCE_STAGES,
   IN_PROGRESS_STATES,
+  isFactoryCommandBoundaryEventType,
+  isWorkOrderState,
   type ConversationMessage,
+  type FactoryCommandResult,
   type FactoryAi,
   type FactoryDefinition,
   type FactoryQueueMessage,
   type FactorySourceType,
   type FactoryEvent,
+  type FactoryProjection,
   type FactoryRunStepResult,
+  type WorkOrder,
+  type WorkOrderState,
   FACTORY_STAGES,
 } from "../../../packages/factory/src";
 import { modelForCostClass, type AiCostClass } from "../../../packages/control-plane/src";
@@ -189,7 +195,9 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
   const organizationId = message.organizationId ?? installation?.organization_id;
   if (!organizationId) return { workOrderId: message.sourceId, runId: "none", terminal: "unknown" };
   const listed = await factories.listFactories(organizationId);
-  const existingOrder = message.workOrderId ? await factories.getWorkOrderForOrganization(message.workOrderId, organizationId) : null;
+  const existingOrder = message.workOrderId
+    ? await factories.getWorkOrderForOrganization(message.workOrderId, organizationId)
+    : await factories.getWorkOrderForSource(organizationId, message.sourceType as FactorySourceType, message.sourceId);
   if (message.workOrderId && !existingOrder) return { workOrderId: message.workOrderId, runId: "none", terminal: "unknown" };
   const factory = listed.find((item) => item.factoryId === (existingOrder?.factoryId ?? message.factoryId)) ?? (existingOrder ? undefined : listed[0]);
   if (!factory) return { workOrderId: message.sourceId, runId: "none", terminal: "unknown" };
@@ -217,10 +225,15 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
   }
   const updateRunStatus = async (status: string): Promise<void> => { await factories.updateRun(runId, status, new Date().toISOString()); };
   const appendRunGraphEvent = async (type: FactoryEvent["type"], payload: Record<string, unknown>, actorId: string, actorType: FactoryEvent["actorType"] = "system"): Promise<void> => {
-    await factories.appendFactoryEvent({
+    const event: FactoryEvent = {
       eventId: `${runId}:${type}`, type, aggregateId: persistedOrder.workOrderId, aggregateType: "work_order", organizationId, factoryId: factory.factoryId,
       actorId, actorType, occurredAt: new Date().toISOString(), correlationId: runId, schemaVersion: 1, policyVersion: persistedOrder.policyVersion, provenance: actorType === "human" ? "HUMAN_VERIFIED" : "ATTESTED", payload,
-    });
+    };
+    if (isFactoryCommandBoundaryEventType(type)) {
+      await factories.dispatchFactoryCommand({ organizationId, factoryId: factory.factoryId, workOrderId: persistedOrder.workOrderId, actorId, actorType, idempotencyKey: `run:${runId}:${type}`, payload, now: event.occurredAt, buildEvents: () => [event] });
+      return;
+    }
+    await factories.appendFactoryEvent(event);
   };
   await appendRunGraphEvent("worker.session_started", { sessionId: runId, workerId: "factory-foreman", workOrderId: persistedOrder.workOrderId }, "factory-foreman", "agent");
   const calculated = await entitlementsForOrganization(env.DB, organizationId);
@@ -338,7 +351,7 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
       await factories.insertAgentReceipt({ runId, agentId: stage.stage, receipt, digest: receiptDigest, signed: receiptSigned, now });
       await appendRunGraphEvent("worker.claim_emitted", { sessionId: runId, workerId: `factory-${stage.stage}`, claimStatus: "ATTESTED", receiptDigest, signed: receiptSigned, stage: stage.stage }, `factory-${stage.stage}`, "agent");
       await appendRunGraphEvent("evidence.receipt_created", { sessionId: runId, receiptDigest, signed: receiptSigned, stage: stage.stage }, `factory-${stage.stage}`, "agent");
-      if (stage.stage === "implementation") await appendRunGraphEvent("change.proposed", { sessionId: runId, changeRef: `run-stage://${runId}/${stage.stage}`, receiptDigest }, `factory-${stage.stage}`, "agent");
+      if (stage.stage === "implementation") await appendRunGraphEvent("change.proposed", { workOrderId: order.workOrderId, sessionId: runId, changeRef: `run-stage://${runId}/${stage.stage}`, changeSetId: message.sha ?? order.workOrderId, changeSetDigest: message.sha ? `sha256:${message.sha}` : order.definitionDigest, receiptDigest }, `factory-${stage.stage}`, "agent");
       const tokens = Math.ceil(stage.summary.length / 4);
       const costCents = estimatedCostMinor(calculated.aiClass, tokens);
       await factories.insertUsage({ organizationId, factoryId: factory.factoryId, runId, kind: `agent:${stage.stage}`, tokens, costCents, now });
@@ -461,9 +474,7 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
  */
 export async function routeFactoryQueueMessage(env: FactoryEnv, message: FactoryQueueMessage & { factoryId?: string; specApproved?: boolean; sandboxComplete?: boolean; pullRequestSha?: string; verificationVerdict?: string; verificationIngested?: boolean; workOrderId?: string }): Promise<Awaited<ReturnType<typeof runFactoryTurn>>> {
   if (env.FOREMAN) {
-    const scope = message.organizationId ?? (message.installationId ? `installation:${message.installationId}` : "unscoped");
-    const aggregate = message.workOrderId ?? message.sourceId;
-    const id = env.FOREMAN.idFromName(`${scope}:${aggregate}`);
+    const id = env.FOREMAN.idFromName(factoryQueueCoordinationName(message));
     const response = await env.FOREMAN.get(id).fetch(new Request("https://tinkerbot.internal/foreman/run", {
       method: "POST",
       headers: { "content-type": "application/json", "x-tinkerbot-internal": "foreman-v1" },
@@ -477,14 +488,140 @@ export async function routeFactoryQueueMessage(env: FactoryEnv, message: Factory
   return runFactoryTurn(env, message);
 }
 
-export async function runForemanWorkDecision(env: FactoryEnv, input: { workOrderId: string; organizationId: string; actor: string; type: "review" | "release"; decision: "approved" | "rejected" | "changes_requested"; now: string }): Promise<{ workOrder: Awaited<ReturnType<D1FactoryStore["getWorkOrderView"]>>; availableActions: unknown[] }> {
+/** Stable per-WorkOrder coordinator identity shared by queue, API, and OIDC paths. */
+export function factoryWorkOrderCoordinationName(organizationId: string, workOrderId: string): string {
+  return `${organizationId}:${workOrderId}`;
+}
+
+export function factoryQueueCoordinationName(message: Pick<FactoryQueueMessage, "organizationId" | "installationId" | "sourceType" | "sourceId"> & { workOrderId?: string }): string {
+  const scope = message.organizationId ?? (message.installationId ? `installation:${message.installationId}` : "unscoped");
+  const aggregate = message.workOrderId ?? `intake:${message.sourceType}:${message.sourceId}`;
+  return `${scope}:${aggregate}`;
+}
+
+interface FactoryGraphCommandRouteInput {
+  organizationId: string;
+  factoryId: string;
+  workOrderId: string;
+  actorId: string;
+  actorType: FactoryEvent["actorType"];
+  idempotencyKey: string;
+  payload: Record<string, unknown>;
+  now: string;
+  event: FactoryEvent;
+}
+
+/**
+ * Route a hosted graph command through the same WorkOrder coordinator used by
+ * queue and verification traffic. The local fallback is intentionally kept
+ * for tests and self-hosted execution where no Durable Object is bound.
+ */
+export async function routeFactoryGraphCommand(env: FactoryEnv, input: FactoryGraphCommandRouteInput): Promise<FactoryCommandResult> {
+  if (!env.DB) throw new Error("factory_database_not_configured");
+  if (!env.FOREMAN) {
+    return new D1FactoryStore(env.DB).dispatchFactoryCommand({
+      organizationId: input.organizationId,
+      factoryId: input.factoryId,
+      workOrderId: input.workOrderId,
+      actorId: input.actorId,
+      actorType: input.actorType,
+      idempotencyKey: input.idempotencyKey,
+      payload: input.payload,
+      now: input.now,
+      buildEvents: () => [input.event],
+    });
+  }
+  const id = env.FOREMAN.idFromName(factoryWorkOrderCoordinationName(input.organizationId, input.workOrderId));
+  const response = await env.FOREMAN.get(id).fetch(new Request("https://tinkerbot.internal/foreman/command", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-tinkerbot-internal": "foreman-v1" },
+    body: JSON.stringify({ command: "graph_command", ...input }),
+  }));
+  if (!response.ok) throw new Error(`Foreman graph command failed with HTTP ${response.status}.`);
+  const result = await response.json() as unknown;
+  if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("Foreman graph command returned an invalid result.");
+  return result as FactoryCommandResult;
+}
+
+type FactoryTransitionRouteResult = Awaited<ReturnType<D1FactoryStore["applyTransition"]>>;
+
+/** Route a compatibility transition request through the WorkOrder Foreman. */
+export async function routeFactoryTransition(env: FactoryEnv, input: { organizationId: string; workOrderId: string; toState: WorkOrderState; causeId: string; actor: string; now?: string }): Promise<FactoryTransitionRouteResult> {
+  if (!env.DB) throw new Error("factory_database_not_configured");
+  if (!env.FOREMAN) return new D1FactoryStore(env.DB).applyTransition(input.workOrderId, input.toState, input.causeId, input.actor, input.now);
+  const id = env.FOREMAN.idFromName(factoryWorkOrderCoordinationName(input.organizationId, input.workOrderId));
+  const response = await env.FOREMAN.get(id).fetch(new Request("https://tinkerbot.internal/foreman/transition", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-tinkerbot-internal": "foreman-v1" },
+    body: JSON.stringify({ command: "transition", ...input }),
+  }));
+  const result = await response.json() as unknown;
+  if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("Foreman transition returned an invalid result.");
+  return result as FactoryTransitionRouteResult;
+}
+
+/** Route the legacy approval adapter through the same serialized coordinator. */
+export async function routeFactorySpecApproval(env: FactoryEnv, input: { workOrderId: string; organizationId: string; actor: string; decision: "approved" | "rejected"; signature: string; now: string }): Promise<void> {
+  if (!env.DB) throw new Error("factory_database_not_configured");
+  if (!env.FOREMAN) {
+    await new D1FactoryStore(env.DB).insertApproval(input.workOrderId, input.actor, input.decision, input.signature, input.now);
+    return;
+  }
+  const id = env.FOREMAN.idFromName(factoryWorkOrderCoordinationName(input.organizationId, input.workOrderId));
+  const response = await env.FOREMAN.get(id).fetch(new Request("https://tinkerbot.internal/foreman/approval", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-tinkerbot-internal": "foreman-v1" },
+    body: JSON.stringify({ command: "spec_approval", ...input }),
+  }));
+  if (!response.ok) throw new Error(`Foreman approval failed with HTTP ${response.status}.`);
+}
+
+type FactoryCellHoldRouteResult = { ok: true; workOrder: WorkOrder; held: boolean } | { ok: false; code: "not_found" };
+
+/** Route operator cell ownership through the same per-WorkOrder coordinator. */
+export async function routeFactoryCellHold(env: FactoryEnv, input: { workOrderId: string; organizationId: string; actor: string; action: "take" | "return"; now: string }): Promise<FactoryCellHoldRouteResult> {
+  if (!env.DB) throw new Error("factory_database_not_configured");
+  if (!env.FOREMAN) {
+    const workOrder = await new D1FactoryStore(env.DB).setWorkOrderCellHold(input);
+    return workOrder ? { ok: true, workOrder, held: input.action === "take" } : { ok: false, code: "not_found" };
+  }
+  const id = env.FOREMAN.idFromName(factoryWorkOrderCoordinationName(input.organizationId, input.workOrderId));
+  const response = await env.FOREMAN.get(id).fetch(new Request("https://tinkerbot.internal/foreman/cell-hold", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-tinkerbot-internal": "foreman-v1" },
+    body: JSON.stringify({ command: "cell_hold", ...input }),
+  }));
+  const result = await response.json() as unknown;
+  if (!response.ok) {
+    if (response.status === 404) return { ok: false, code: "not_found" };
+    throw new Error(`Foreman cell hold failed with HTTP ${response.status}.`);
+  }
+  if (!result || typeof result !== "object" || Array.isArray(result) || !((result as { workOrder?: unknown }).workOrder)) throw new Error("Foreman cell hold returned an invalid result.");
+  return result as FactoryCellHoldRouteResult;
+}
+
+export async function routeFactoryVerification(env: FactoryEnv, input: { workOrderId: string; organizationId: string; actorId?: string; changeSetId?: string; changeSetDigest?: string; verificationRunId: string; verdict: "PASS" | "FAIL" | "UNKNOWN"; now: string }): Promise<FactoryProjection | null> {
+  if (!env.DB) return null;
+  if (!env.FOREMAN) return new D1FactoryStore(env.DB).recordVerification(input);
+  const id = env.FOREMAN.idFromName(factoryWorkOrderCoordinationName(input.organizationId, input.workOrderId));
+  const response = await env.FOREMAN.get(id).fetch(new Request("https://tinkerbot.internal/foreman/verification", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-tinkerbot-internal": "foreman-v1" },
+    body: JSON.stringify({ command: "record_verification", ...input }),
+  }));
+  if (!response.ok) throw new Error(`Foreman verification failed with HTTP ${response.status}.`);
+  const result = await response.json() as { projection?: FactoryProjection | null };
+  return result.projection ?? null;
+}
+
+export async function runForemanWorkDecision(env: FactoryEnv, input: { workOrderId: string; organizationId: string; actor: string; type: "review" | "release"; decision: "approved" | "rejected" | "changes_requested" | "hold"; now: string }): Promise<{ workOrder: Awaited<ReturnType<D1FactoryStore["getWorkOrderView"]>>; availableActions: unknown[] }> {
   if (!env.DB) throw new Error("foreman_database_not_configured");
   const factories = new D1FactoryStore(env.DB);
   const order = await factories.getWorkOrderForOrganization(input.workOrderId, input.organizationId);
   if (!order) throw new Error("work_order_not_found");
-  if (input.type === "release" && input.decision !== "approved") throw new Error("invalid_release_decision");
+  if (input.type === "release" && input.decision !== "approved" && input.decision !== "hold") throw new Error("invalid_release_decision");
   await factories.recordTypedDecision({ workOrderId: order.workOrderId, organizationId: input.organizationId, actor: input.actor, type: input.type, decision: input.decision, now: input.now });
-  if (input.type === "release") {
+  if (input.type === "release" && input.decision === "approved") {
     const transition = order.status === "ready" ? await factories.applyTransition(order.workOrderId, "merged", `release-merge:${crypto.randomUUID()}`, input.actor) : { ok: true as const, order };
     if (!transition.ok) throw new Error(`release_candidate_${transition.code}`);
     const released = transition.order.status === "merged" ? await factories.applyTransition(order.workOrderId, "released", `release:${crypto.randomUUID()}`, input.actor) : transition;
@@ -594,9 +731,96 @@ export class ForemanDurableObject {
       && typeof body.organizationId === "string"
       && typeof body.actor === "string"
       && (body.type === "review" || body.type === "release")
-      && (body.decision === "approved" || body.decision === "rejected" || body.decision === "changes_requested")) {
+      && (body.decision === "approved" || body.decision === "rejected" || body.decision === "changes_requested" || body.decision === "hold")) {
       const result = await runForemanWorkDecision(this.env, { workOrderId: body.workOrderId, organizationId: body.organizationId, actor: body.actor, type: body.type, decision: body.decision, now: typeof body.now === "string" ? body.now : new Date().toISOString() });
       return Response.json(result);
+    }
+    if (request.method === "POST"
+      && request.headers.get("x-tinkerbot-internal") === "foreman-v1"
+      && body.command === "graph_command"
+      && typeof body.organizationId === "string"
+      && typeof body.factoryId === "string"
+      && typeof body.workOrderId === "string"
+      && typeof body.actorId === "string"
+      && (body.actorType === "human" || body.actorType === "agent" || body.actorType === "system" || body.actorType === "integration")
+      && typeof body.idempotencyKey === "string"
+      && body.payload !== null
+      && typeof body.payload === "object"
+      && !Array.isArray(body.payload)
+      && body.event !== null
+      && typeof body.event === "object"
+      && !Array.isArray(body.event)) {
+      if (!this.env.DB) return Response.json({ error: "Foreman database is not configured.", code: "foreman_database_not_configured" }, { status: 503 });
+      const factories = new D1FactoryStore(this.env.DB);
+      const result = await factories.dispatchFactoryCommand({
+        organizationId: body.organizationId,
+        factoryId: body.factoryId,
+        workOrderId: body.workOrderId,
+        actorId: body.actorId,
+        actorType: body.actorType,
+        idempotencyKey: body.idempotencyKey,
+        payload: body.payload as Record<string, unknown>,
+        now: typeof body.now === "string" ? body.now : new Date().toISOString(),
+        buildEvents: () => [body.event as FactoryEvent],
+      });
+      return Response.json(result);
+    }
+    if (request.method === "POST"
+      && request.headers.get("x-tinkerbot-internal") === "foreman-v1"
+      && body.command === "transition"
+      && typeof body.organizationId === "string"
+      && typeof body.workOrderId === "string"
+      && typeof body.toState === "string"
+      && isWorkOrderState(body.toState)
+      && typeof body.causeId === "string"
+      && typeof body.actor === "string") {
+      if (!this.env.DB) return Response.json({ error: "Foreman database is not configured.", code: "foreman_database_not_configured" }, { status: 503 });
+      const result = await new D1FactoryStore(this.env.DB).applyTransition(body.workOrderId, body.toState, body.causeId, body.actor, typeof body.now === "string" ? body.now : undefined);
+      return Response.json(result, { status: result.ok ? 200 : result.code === "not_found" ? 404 : 409 });
+    }
+    if (request.method === "POST"
+      && request.headers.get("x-tinkerbot-internal") === "foreman-v1"
+      && body.command === "spec_approval"
+      && typeof body.workOrderId === "string"
+      && typeof body.organizationId === "string"
+      && typeof body.actor === "string"
+      && (body.decision === "approved" || body.decision === "rejected")
+      && typeof body.signature === "string") {
+      if (!this.env.DB) return Response.json({ error: "Foreman database is not configured.", code: "foreman_database_not_configured" }, { status: 503 });
+      await new D1FactoryStore(this.env.DB).insertApproval(body.workOrderId, body.actor, body.decision, body.signature, typeof body.now === "string" ? body.now : new Date().toISOString());
+      return Response.json({ accepted: true });
+    }
+    if (request.method === "POST"
+      && request.headers.get("x-tinkerbot-internal") === "foreman-v1"
+      && body.command === "cell_hold"
+      && typeof body.workOrderId === "string"
+      && typeof body.organizationId === "string"
+      && typeof body.actor === "string"
+      && (body.action === "take" || body.action === "return")) {
+      if (!this.env.DB) return Response.json({ error: "Foreman database is not configured.", code: "foreman_database_not_configured" }, { status: 503 });
+      const workOrder = await new D1FactoryStore(this.env.DB).setWorkOrderCellHold({ workOrderId: body.workOrderId, organizationId: body.organizationId, actor: body.actor, action: body.action, now: typeof body.now === "string" ? body.now : new Date().toISOString() });
+      if (!workOrder) return Response.json({ error: "Work order not found.", code: "not_found" }, { status: 404 });
+      return Response.json({ ok: true, workOrder, held: body.action === "take" });
+    }
+    if (request.method === "POST"
+      && request.headers.get("x-tinkerbot-internal") === "foreman-v1"
+      && body.command === "record_verification"
+      && typeof body.workOrderId === "string"
+      && typeof body.organizationId === "string"
+      && typeof body.verificationRunId === "string"
+      && (body.verdict === "PASS" || body.verdict === "FAIL" || body.verdict === "UNKNOWN")) {
+      if (!this.env.DB) return Response.json({ error: "Foreman database is not configured.", code: "foreman_database_not_configured" }, { status: 503 });
+      const result = await new D1FactoryStore(this.env.DB).recordVerification({
+        workOrderId: body.workOrderId,
+        organizationId: body.organizationId,
+        actorId: typeof body.actorId === "string" ? body.actorId : undefined,
+        changeSetId: typeof body.changeSetId === "string" ? body.changeSetId : undefined,
+        changeSetDigest: typeof body.changeSetDigest === "string" ? body.changeSetDigest : undefined,
+        verificationRunId: body.verificationRunId,
+        verdict: body.verdict,
+        now: typeof body.now === "string" ? body.now : new Date().toISOString(),
+      });
+      return Response.json({ projection: result });
     }
     if (url.pathname.endsWith("/steer") || request.method === "POST") {
       const workOrderId = typeof body.workOrderId === "string" ? body.workOrderId : this.state.id.toString();

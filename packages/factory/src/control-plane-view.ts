@@ -1,6 +1,6 @@
 export type VerificationVerdictView = "pass" | "blocked" | "fail" | "unknown" | "not_run";
 export type ReviewDecisionView = "not_required" | "awaiting_human" | "approved" | "rejected" | "changes_requested";
-export type ReleaseDecisionView = "not_eligible" | "awaiting_authorization" | "approved" | "released" | "rolled_back" | "cancelled";
+export type ReleaseDecisionView = "not_eligible" | "awaiting_authorization" | "approved" | "hold" | "released" | "rolled_back" | "cancelled";
 export type OutcomeStatusView = "pending" | "accepted" | "reworked" | "failed" | "rejected" | "unknown";
 export type WorkOrderStageView = "intake" | "spec" | "build" | "test" | "verify" | "release";
 export type WorkOrderGroupView = "blocked" | "awaiting_review" | "in_progress" | "ready" | "released" | "unknown";
@@ -43,7 +43,7 @@ export interface WorkOrderView {
 
 const VERDICTS = new Set<VerificationVerdictView>(["pass", "blocked", "fail", "unknown", "not_run"]);
 const REVIEWS = new Set<ReviewDecisionView>(["not_required", "awaiting_human", "approved", "rejected", "changes_requested"]);
-const RELEASES = new Set<ReleaseDecisionView>(["not_eligible", "awaiting_authorization", "approved", "released", "rolled_back", "cancelled"]);
+const RELEASES = new Set<ReleaseDecisionView>(["not_eligible", "awaiting_authorization", "approved", "hold", "released", "rolled_back", "cancelled"]);
 const OUTCOMES = new Set<OutcomeStatusView>(["pending", "accepted", "reworked", "failed", "rejected", "unknown"]);
 
 export function normalizeVerificationVerdict(value: unknown, fallback: VerificationVerdictView = "unknown"): VerificationVerdictView {
@@ -71,6 +71,7 @@ export function normalizeReleaseDecision(value: unknown, input: { verification: 
   if (input.released || key === "release" || key === "released") return "released";
   if (key === "rolled_back" || key === "rollback") return "rolled_back";
   if (key === "cancelled" || key === "canceled") return "cancelled";
+  if (key === "hold" || key === "held") return "hold";
   if (key === "approved" || key === "ready") return input.verification === "pass" && input.review === "approved" ? "awaiting_authorization" : "not_eligible";
   if (key === "awaiting_authorization" || key === "awaiting_approval") return "awaiting_authorization";
   return RELEASES.has(key as ReleaseDecisionView) ? key as ReleaseDecisionView : "not_eligible";
@@ -103,7 +104,7 @@ export function groupView(input: { status?: unknown; group?: unknown; verificati
   if (["blocked", "needs_attention", "failed"].includes(raw) || ["blocked", "failed", "fail"].includes(status) || ["blocked", "fail"].includes(input.verification)) return "blocked";
   if (["released", "completed", "done"].includes(raw) || input.release === "released" || status === "released") return "released";
   if (raw === "unknown" || input.verification === "unknown" || input.outcome === "unknown") return "unknown";
-  if (raw === "ready" || input.release === "awaiting_authorization" || input.release === "approved") return "ready";
+  if (raw === "ready" || input.release === "awaiting_authorization" || input.release === "approved" || input.release === "hold") return "ready";
   if (["awaiting_review", "waiting_for_approval", "approval"].includes(raw) || input.review === "awaiting_human") return "awaiting_review";
   if (raw === "in_progress" || ["intake", "triage", "specification", "implementation", "review", "verification"].includes(status)) return "in_progress";
   return "unknown";

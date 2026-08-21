@@ -5,6 +5,7 @@ This directory distinguishes the current hosted-product contract from historical
 ## Current release documents
 
 - [Quickstart](./quickstart.md): authenticated terminal setup and verification.
+- [Architecture map](./architecture-map.md): source-level topology, authority planes, runtime boundaries, branch drift, and prioritized recommendations.
 - [Factories](./factories.md): Foreman loop, `v1alpha1` definitions, automations, and the factory dashboard.
 - [CLI contract](./cli-contract.md): hosted and local `tb` commands. `tb tui` is the terminal session; `tb dashboard` opens `/app`.
 - [TUI session](./tui.md) and [TUI architecture](./tui-architecture.md): master tabs, nested CLIs, Node `--once`.

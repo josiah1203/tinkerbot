@@ -84,6 +84,8 @@ export * from "./self-hosted";
 export { executeFactoryRun } from "./execute";
 import { assertCredentialRef, hostedRuntimeDefaults, parseRuntimeProfile, type RuntimeProfile } from "./runtime";
 import type { AcceptanceCriterionLink, Waiver } from "./authority";
+import { isLegalWorkOrderTransition } from "./transition-contract";
+export { WORK_ORDER_TRANSITION_CONTRACT, isLegalWorkOrderTransition, workOrderTransitionContractEdges, type WorkOrderTransitionContractState } from "./transition-contract";
 
 export const WORK_ORDER_STATES = [
   "intake",
@@ -129,23 +131,6 @@ export const ATTENTION_STATES: readonly WorkOrderState[] = ["blocked", "failed",
 export const IN_PROGRESS_STATES: readonly WorkOrderState[] = ["intake", "triage", "specification", "implementation", "review", "verification"];
 export const WAITING_STATES: readonly WorkOrderState[] = ["approval", "ready"];
 export const COMPLETED_STATES: readonly WorkOrderState[] = ["merged", "released"];
-
-const FORWARD: Record<WorkOrderState, WorkOrderState[]> = {
-  intake: ["triage", "specification", "implementation", "verification", "blocked", "cancelled", "unknown"],
-  triage: ["specification", "implementation", "verification", "blocked", "cancelled", "failed", "unknown"],
-  specification: ["implementation", "approval", "blocked", "cancelled", "failed", "unknown"],
-  implementation: ["review", "verification", "blocked", "cancelled", "failed", "unknown"],
-  review: ["verification", "implementation", "approval", "blocked", "cancelled", "failed", "unknown"],
-  verification: ["approval", "review", "blocked", "failed", "unknown"],
-  approval: ["ready", "implementation", "blocked", "cancelled", "unknown"],
-  ready: ["merged", "blocked", "cancelled", "unknown"],
-  merged: ["released", "unknown"],
-  released: [],
-  blocked: ["intake", "triage", "specification", "implementation", "review", "verification", "approval", "cancelled", "failed", "unknown"],
-  failed: ["intake", "cancelled", "unknown"],
-  cancelled: ["unknown"],
-  unknown: ["intake", "blocked", "failed", "cancelled"],
-};
 
 export interface FactoryAgentDefinition {
   id: string;
@@ -314,7 +299,7 @@ export function isWorkOrderState(value: string): value is WorkOrderState {
 }
 
 export function canTransition(from: WorkOrderState, to: WorkOrderState): boolean {
-  return FORWARD[from]?.includes(to) === true;
+  return isLegalWorkOrderTransition(from, to);
 }
 
 export function workOrderEventIdempotencyKey(workOrderId: string, fromState: WorkOrderState, toState: WorkOrderState, causeId: string): string {

@@ -19,13 +19,13 @@ Intake → Triage → Plan/Capacity → Specification → Spec approval
   → Revision? → Implementation
   → Release approval → Release.decided{RELEASE|HOLD}
   → Release execution (RELEASE path) → Outcome/Economics → Complete
+```
 
 An active release may take a separate rollback branch:
 
 ```text
 Released → Rollback approval → Release.decided{ROLLBACK}
          → Release.rolled_back → Outcome/Economics
-```
 ```
 
 Plan/Capacity and Outcome/Economics are Factory Graph subdomains, not new
@@ -72,6 +72,36 @@ outcomes `NO_FINDINGS`, `FINDINGS`, and `ESCALATE`. Release authority comes only
 from a scoped `approval.recorded` event and a subsequent `release.decided`
 event.
 
+## Executable contract snapshot
+
+The route legality implementation lives in
+`packages/factory/src/transition-contract.ts`. This snapshot is checked by the
+factory transition contract test; changing either the implementation or this
+table without changing the other is a verification failure.
+
+<!-- factory-transition-contract:start -->
+
+```json
+{
+  "intake": ["triage", "specification", "implementation", "verification", "blocked", "cancelled", "unknown"],
+  "triage": ["specification", "implementation", "verification", "blocked", "cancelled", "failed", "unknown"],
+  "specification": ["implementation", "approval", "blocked", "cancelled", "failed", "unknown"],
+  "implementation": ["review", "verification", "blocked", "cancelled", "failed", "unknown"],
+  "review": ["verification", "implementation", "approval", "blocked", "cancelled", "failed", "unknown"],
+  "verification": ["approval", "review", "blocked", "failed", "unknown"],
+  "approval": ["ready", "implementation", "blocked", "cancelled", "unknown"],
+  "ready": ["merged", "blocked", "cancelled", "unknown"],
+  "merged": ["released", "unknown"],
+  "released": [],
+  "blocked": ["intake", "triage", "specification", "implementation", "review", "verification", "approval", "cancelled", "failed", "unknown"],
+  "failed": ["intake", "cancelled", "unknown"],
+  "cancelled": ["unknown"],
+  "unknown": ["intake", "blocked", "failed", "cancelled"]
+}
+```
+
+<!-- factory-transition-contract:end -->
+
 ## Transition table
 
 | From | Trigger and precondition | Event(s) | Result | Revisitable / retry rule |
@@ -86,16 +116,16 @@ event.
 | `review` | Current-digest verification and review evidence are sufficient to request release authority. | `review.recorded(outcome=NO_FINDINGS)`, `release.requested`, `approval.requested(scope=RELEASE)` | `approval(scope=RELEASE)` | Review is never release authority; duplicate requests are idempotent. |
 | `review` | Findings require rework. | `review.recorded(outcome=FINDINGS)`, `task.reworked`, `change.updated` | `implementation` with a new digest | This is the normal revision loop; old verification and approvals are ineligible. |
 | `review` | Review cannot safely conclude. | `review.recorded(outcome=ESCALATE)` | `blocked` or scoped human review | No release request may bypass the escalation. |
-| `approval(scope=RELEASE)` | Authorized approver grants release for the exact current digest. | `approval.recorded(scope=RELEASE, outcome=GRANTED)` | `ready` | The approval reference is digest-bound and cannot be reused after `change.updated`. |
+| `approval(scope=RELEASE)` | Authorized approver grants release authority for the exact current digest and requested outcome. | `approval.recorded(scope=RELEASE, outcome=GRANTED, targetOutcome=RELEASE)` | `ready` | The approval reference is digest- and outcome-bound and cannot be reused after `change.updated`. |
 | `approval(scope=RELEASE)` | Release authority denies or withdraws approval. | `approval.recorded(scope=RELEASE, outcome=DENIED)` | `blocked`, `review`, or `implementation` per reason | No `release.decided` may reference a denied approval. |
 | `ready` | The Foreman has a valid `ReleaseApprovalRef`, current verification `PASS`, and policy gates pass. | `release.decided(outcome=RELEASE)` | `releaseDecision=RELEASE`; release execution may proceed | Same decision command is idempotent. A different outcome or approval reference conflicts. |
-| `ready` | Authorized release authority elects not to release yet. | `release.decided(outcome=HOLD)` | `releaseDecision=HOLD`; remains `ready` with a hold reason | A later `RELEASE` requires a new decision and a still-valid approval reference. `HOLD` never projects as `RELEASE`. |
+| `ready` | Authorized release authority elects not to release yet with an explicit hold authorization for the current digest. | `approval.recorded(scope=RELEASE, outcome=GRANTED, targetOutcome=HOLD)`, `release.decided(outcome=HOLD)` | `releaseDecision=HOLD`; remains `ready` with a hold reason | A later `RELEASE` requires a new decision and a still-valid `targetOutcome=RELEASE` approval reference. `HOLD` never projects as `RELEASE`. |
 | `ready` | A `RELEASE` decision exists and the approved ChangeSet is assembled or merged. | `integration_candidate.assembled` | `merged` | Assembly is replayable; it cannot create a release decision. |
 | `merged` | A prior `RELEASE` decision exists and execution succeeds. | `release.executed` | `released` | Execution is not authority; a duplicate execution is idempotent. |
-| `released` | An active release must be reversed and rollback policy permits it. | `approval.recorded(scope=ROLLBACK, outcome=GRANTED)`, `release.decided(outcome=ROLLBACK)` | `releaseDecision=ROLLBACK` | `ROLLBACK` is illegal without an existing release reference and rollback approval. |
+| `released` | An active release must be reversed and rollback policy permits it. | `approval.recorded(scope=ROLLBACK, outcome=GRANTED, targetOutcome=ROLLBACK)`, `release.decided(outcome=ROLLBACK)` | `releaseDecision=ROLLBACK` | `ROLLBACK` is illegal without an existing release reference and rollback approval. |
 | `released` | The authorized rollback operation completes. | `release.rolled_back` | Rollback execution evidence is recorded; the WorkOrder remains historically released while the Release projection is rolled back. | Duplicate rollback execution is idempotent; it cannot create a second release decision. |
 | `released` | The outcome measurement window is opened and later matures. | `outcome.measurement_started`, `outcome.observed`, `outcome.matured`, `cost.recorded` | Outcome/Economics sidecars become mature; `WorkOrder.status` remains `released`. | Observations are append-only and may not mark an immature positive outcome. |
-| Any non-terminal state | Authorized cancellation is requested. | `work_order.cancelled` | `cancelled` | Cancellation is idempotent; it cannot be used to disguise a release decision. |
+| Any non-terminal state | Authorized cancellation is requested. | `work_order.transitioned{toState=cancelled}` | `cancelled` | Cancellation is idempotent; it cannot be used to disguise a release decision. |
 
 ## Digest and late-event rules
 
@@ -114,6 +144,10 @@ event.
 5. Projection order is the per-WorkOrder event sequence assigned by the
    Foreman. D1 and SQLite must produce the same state from the same sequence,
    regardless of wall-clock arrival order.
+6. Every compatibility route transition carries `fromState`, `toState`,
+   `causeId`, and `currentStage` in its command-bound graph event. Domain
+   event families are used where available; `work_order.transitioned` is the
+   canonical fallback for states such as `cancelled` and `unknown`.
 
 ## Illegal transitions that must fail closed
 
@@ -129,3 +163,6 @@ event.
   treated as a replay.
 - A projection or compatibility column cannot advance a WorkOrder without the
   corresponding ledger event.
+- Typed constructors must reject review IDs where approval IDs are expected;
+  untrusted JSON, persisted legacy rows, and remote commands must also pass
+  runtime validation at the Foreman boundary.

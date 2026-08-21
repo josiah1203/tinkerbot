@@ -16,11 +16,13 @@ describe("control-plane normalized read model", () => {
     expect(normalizeReviewDecision("NEEDS_HUMAN_REVIEW")).toBe("awaiting_human");
     expect(normalizeReleaseDecision("READY", { verification: "pass", review: "not_required" })).toBe("not_eligible");
     expect(normalizeReleaseDecision("READY", { verification: "pass", review: "approved" })).toBe("awaiting_authorization");
+    expect(normalizeReleaseDecision("HOLD", { verification: "pass", review: "approved" })).toBe("hold");
   });
 
   test("groups deterministic failures and unresolved unknowns before release", () => {
     expect(groupView({ status: "failed", verification: "fail", review: "awaiting_human", release: "not_eligible", outcome: "pending" })).toBe("blocked");
     expect(groupView({ status: "verification", verification: "pass", review: "approved", release: "awaiting_authorization", outcome: "pending" })).toBe("ready");
+    expect(groupView({ status: "ready", verification: "pass", review: "approved", release: "hold", outcome: "pending" })).toBe("ready");
     expect(groupView({ status: "verification", verification: "unknown", review: "awaiting_human", release: "not_eligible", outcome: "unknown" })).toBe("unknown");
     expect(normalizeOutcomeStatus("successful_release")).toBe("accepted");
     expect(stageView("implementation")).toBe("build");
