@@ -287,10 +287,29 @@ test("mainAsync tui work attaches hosted ingest state without rewriting PASS", a
   process.env.TINKERBOT_CONTROL_PLANE_URL = "https://control.example";
   process.env.TINKERBOT_SESSION_TOKEN = "sessiontokenvalue012345";
   const originalFetch = globalThis.fetch;
+  const workOrder = {
+    id: "wo_1",
+    workOrderId: "wo_1",
+    factoryId: "fac_1",
+    title: "Hosted work",
+    stage: "verify",
+    group: "in_progress",
+    viewGroup: "in_progress",
+    lane: "verify",
+    risk: "low",
+    updatedAt: "2030-01-01T00:00:00.000Z",
+    verificationVerdict: "unknown",
+    reviewDecision: "awaiting_human",
+    releaseDecision: "not_eligible",
+    outcomeStatus: "pending",
+    unresolvedUnknownCount: 0,
+    availableActions: [],
+  };
   globalThis.fetch = async (input, init) => {
     const url = String(input);
     if (url.includes("/work-orders/wo_1/take")) return new Response(JSON.stringify({ ok: true }), { status: 200 });
-    if (url.includes("/work-orders/wo_1")) return new Response(JSON.stringify({ workOrder: { workOrderId: "wo_1", verificationIngested: false }, stages: [{ stage: "verification", status: "ok", summary: "tests passed PASS" }] }), { status: 200 });
+    if (url.includes("/work-orders/wo_1/graph")) return new Response(JSON.stringify({ workOrder, graph: { eventCount: 0, verificationVerdict: "UNKNOWN", reviewDecision: "NOT_REVIEWED", releaseDecision: "NOT_RELEASED", outcomeStatus: "UNMEASURED", outcomeMaturity: "IMMATURE" }, economics: { cogsCents: 0, copqCents: 0, acceptedChanges: 0, unrevertedChanges: 0, outcomePositiveChanges: 0, costPerAcceptedUnrevertedOutcomePositiveChange: null }, events: [], sourceOfTruth: "append_only_factory_graph" }), { status: 200 });
+    if (url.includes("/work-orders/wo_1")) return new Response(JSON.stringify({ workOrder, stages: [{ stage: "verification", status: "ok", summary: "tests passed PASS" }] }), { status: 200 });
     return new Response(JSON.stringify({ error: String(init?.method ?? "GET") }), { status: 404 });
   };
   try {

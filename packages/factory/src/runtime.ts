@@ -13,6 +13,101 @@ export type SyncMode = "offline" | "manual" | "hosted";
 export type RuntimeOrigin = "local" | "hosted";
 export type Uncertainty = "known" | "unknown";
 
+export type RuntimeCapabilityCode =
+  | "invalid_runner"
+  | "invalid_provider"
+  | "invalid_inference_mode"
+  | "invalid_worker_host"
+  | "hosted_runner_unsupported"
+  | "hosted_self_hosted_worker_missing"
+  | "hosted_byok_boundary_missing"
+  | "hosted_local_inference_boundary_missing"
+  | "local_worker_host_mismatch"
+  | "cloudflare_sandbox_unsupported";
+
+export class RuntimeCapabilityError extends Error {
+  constructor(readonly code: RuntimeCapabilityCode, message: string) {
+    super(message);
+    this.name = "RuntimeCapabilityError";
+  }
+}
+
+const RUNNER_ALIASES: Record<string, RunnerKind> = {
+  "cloudflare-sandbox": "cloudflare_sandbox",
+  "cloudflare_sandbox": "cloudflare_sandbox",
+  "github": "github_actions",
+  "github-action": "github_actions",
+  "github-actions": "github_actions",
+  "github_action": "github_actions",
+  "github_actions": "github_actions",
+  "local-docker": "docker",
+  "local-process": "process",
+  sandbox: "cloudflare_sandbox",
+  selfhosted: "self_hosted",
+  "self-hosted": "self_hosted",
+  "self_hosted": "self_hosted",
+  "tinkerbot-sandbox": "cloudflare_sandbox",
+};
+
+const INFERENCE_PROVIDER_ALIASES: Record<string, string> = {
+  anthropic_api: "anthropic",
+  "anthropic-api": "anthropic",
+  claude: "anthropic",
+  cloudflare_workers_ai: "workers-ai",
+  "cloudflare-workers-ai": "workers-ai",
+  "cloudflare/workers-ai": "workers-ai",
+  gemini: "google",
+  google_gemini: "google",
+  "google-gemini": "google",
+  managed: "workers-ai",
+  "open-ai": "openai",
+  open_ai: "openai",
+  tinkerbot: "workers-ai",
+  "tinkerbot-hosted": "workers-ai",
+  vertex_ai: "google",
+  "vertex-ai": "google",
+  workers_ai: "workers-ai",
+  workersai: "workers-ai",
+};
+
+const VALID_RUNNERS = new Set<RunnerKind>(["process", "docker", "cloudflare_sandbox", "github_actions", "self_hosted"]);
+const INFERENCE_PROVIDER_PATTERN = /^[a-z0-9][a-z0-9._:-]{0,63}$/;
+
+export function normalizeRunnerKind(value: unknown, fallback: RunnerKind): RunnerKind {
+  const candidate = typeof value === "string" && value.trim() ? value.trim().toLowerCase() : fallback;
+  const normalized = RUNNER_ALIASES[candidate] ?? candidate;
+  if (!VALID_RUNNERS.has(normalized as RunnerKind)) throw new RuntimeCapabilityError("invalid_runner", "runtime.runner.type is invalid.");
+  return normalized as RunnerKind;
+}
+
+export function normalizeInferenceProvider(value: unknown, fallback?: string): string | undefined {
+  const raw = typeof value === "string" && value.trim() ? value.trim().toLowerCase().replace(/\s+/g, "-") : typeof fallback === "string" && fallback.trim() ? fallback.trim().toLowerCase().replace(/\s+/g, "-") : undefined;
+  if (!raw) return undefined;
+  const normalized = INFERENCE_PROVIDER_ALIASES[raw] ?? raw;
+  if (!INFERENCE_PROVIDER_PATTERN.test(normalized)) throw new RuntimeCapabilityError("invalid_provider", "runtime.inference.provider must be a lowercase provider identifier.");
+  return normalized;
+}
+
+export interface RuntimeCapabilityDecision {
+  ok: boolean;
+  code: "supported" | RuntimeCapabilityCode;
+  boundary: RunnerKind;
+}
+
+/** Resolve the executable boundary without allowing provider choice to become
+ * an implicit authority decision. A Sandbox binding is an explicit capability
+ * input; absent that binding, the hosted Sandbox path remains fail-closed. */
+export function runtimeCapabilityDecision(profile: RuntimeProfile, options: { sandboxAvailable?: boolean } = {}): RuntimeCapabilityDecision {
+  const sandboxAvailable = options.sandboxAvailable === true;
+  if (profile.controlPlane === "hosted" && (profile.runner.type === "process" || profile.runner.type === "docker")) return { ok: false, code: "hosted_runner_unsupported", boundary: profile.runner.type };
+  if (profile.controlPlane === "hosted" && profile.runner.type === "cloudflare_sandbox" && !sandboxAvailable) return { ok: false, code: "cloudflare_sandbox_unsupported", boundary: profile.runner.type };
+  if (profile.controlPlane === "hosted" && profile.runner.type === "self_hosted" && !profile.workerHost?.match(SELF_HOSTED_WORKER_PATTERN)) return { ok: false, code: "hosted_self_hosted_worker_missing", boundary: profile.runner.type };
+  if (profile.controlPlane === "hosted" && profile.inference.mode === "byok" && !(profile.runner.type === "self_hosted" && profile.workerHost?.match(SELF_HOSTED_WORKER_PATTERN))) return { ok: false, code: "hosted_byok_boundary_missing", boundary: profile.runner.type };
+  if (profile.controlPlane === "hosted" && profile.inference.mode === "local" && !(profile.runner.type === "self_hosted" && profile.workerHost?.match(SELF_HOSTED_WORKER_PATTERN))) return { ok: false, code: "hosted_local_inference_boundary_missing", boundary: profile.runner.type };
+  if (profile.controlPlane === "local" && profile.workerHost === "local" && profile.runner.type === "self_hosted") return { ok: false, code: "local_worker_host_mismatch", boundary: profile.runner.type };
+  return { ok: true, code: "supported", boundary: profile.runner.type };
+}
+
 export interface InferenceRef {
   mode: InferenceMode;
   provider?: string;
@@ -188,23 +283,22 @@ export function parseRuntimeProfile(raw: unknown, defaults: RuntimeProfile): Run
   const syncRaw = record.sync && typeof record.sync === "object" && !Array.isArray(record.sync) ? (record.sync as Record<string, unknown>).mode ?? (record.sync as Record<string, unknown>).type : record.sync;
   if (syncRaw != null && syncRaw !== "offline" && syncRaw !== "manual" && syncRaw !== "hosted") throw new Error("runtime.sync must be offline, manual, or hosted.");
   const runnerRaw = record.runner && typeof record.runner === "object" && !Array.isArray(record.runner) ? record.runner as Record<string, unknown> : {};
-  const runnerType = typeof runnerRaw.type === "string" ? runnerRaw.type : defaults.runner.type;
-  if (!["process", "docker", "cloudflare_sandbox", "github_actions", "self_hosted"].includes(runnerType)) throw new Error("runtime.runner.type is invalid.");
+  const runnerType = normalizeRunnerKind(runnerRaw.type, defaults.runner.type);
   const inferenceRaw = record.inference && typeof record.inference === "object" && !Array.isArray(record.inference) ? record.inference as Record<string, unknown> : {};
   const inferenceMode = typeof inferenceRaw.mode === "string" ? inferenceRaw.mode : defaults.inference.mode;
-  if (!["local", "byok", "managed"].includes(inferenceMode)) throw new Error("runtime.inference.mode is invalid.");
+  if (!["local", "byok", "managed"].includes(inferenceMode)) throw new RuntimeCapabilityError("invalid_inference_mode", "runtime.inference.mode is invalid.");
   const controlPlaneResolved = (controlPlane === "local" || controlPlane === "hosted" ? controlPlane : defaults.controlPlane) as ControlPlaneMode;
   const pipelineResolved = (pipeline === "single_agent" || pipeline === "adaptive" || pipeline === "multi_agent" ? pipeline : defaults.pipeline) as PipelineMode;
   const credentialRef = assertCredentialRef(typeof inferenceRaw.credentialRef === "string" ? inferenceRaw.credentialRef : undefined, "runtime.inference");
   const workerHostRaw = typeof record.workerHost === "string" ? record.workerHost : typeof runnerRaw.workerHost === "string" ? runnerRaw.workerHost : defaults.workerHost;
   const workerHost = workerHostRaw == null || workerHostRaw === "" ? undefined : workerHostRaw.trim().toLowerCase();
-  if (workerHost && !/^(local|self_hosted(?::[a-z0-9._-]{1,64})?|warp|github_actions|tinkerbot-sandbox)$/.test(workerHost)) throw new Error("runtime.workerHost is invalid.");
+  if (workerHost && !/^(local|self_hosted(?::[a-z0-9._-]{1,64})?|warp|github_actions|tinkerbot-sandbox)$/.test(workerHost)) throw new RuntimeCapabilityError("invalid_worker_host", "runtime.workerHost is invalid.");
   const selfHostedWorker = Boolean(workerHost && SELF_HOSTED_WORKER_PATTERN.test(workerHost));
-  if (workerHost === "local" && controlPlaneResolved === "hosted") throw new Error("runtime.workerHost=local requires controlPlane=local.");
-  if (controlPlaneResolved === "hosted" && (runnerType === "process" || runnerType === "docker")) throw new Error("Hosted control planes cannot run process or Docker runners; use cloudflare_sandbox, github_actions, or a self_hosted worker.");
-  if (runnerType === "self_hosted" && controlPlaneResolved === "hosted" && !selfHostedWorker) throw new Error("Hosted self_hosted runners require workerHost=self_hosted[:worker-id].");
-  if (inferenceMode === "byok" && controlPlaneResolved === "hosted" && !(runnerType === "self_hosted" && selfHostedWorker)) throw new Error("BYOK inference on hosted control planes requires runner.type self_hosted and workerHost=self_hosted[:worker-id].");
-  if (inferenceMode === "local" && controlPlaneResolved === "hosted" && !(runnerType === "self_hosted" && selfHostedWorker)) throw new Error("Local inference on hosted control planes requires a self_hosted worker boundary.");
+  if (workerHost === "local" && controlPlaneResolved === "hosted") throw new RuntimeCapabilityError("local_worker_host_mismatch", "runtime.workerHost=local requires controlPlane=local.");
+  if (controlPlaneResolved === "hosted" && (runnerType === "process" || runnerType === "docker")) throw new RuntimeCapabilityError("hosted_runner_unsupported", "Hosted control planes cannot run process or Docker runners; use cloudflare_sandbox, github_actions, or a self_hosted worker.");
+  if (runnerType === "self_hosted" && controlPlaneResolved === "hosted" && !selfHostedWorker) throw new RuntimeCapabilityError("hosted_self_hosted_worker_missing", "Hosted self_hosted runners require workerHost=self_hosted[:worker-id].");
+  if (inferenceMode === "byok" && controlPlaneResolved === "hosted" && !(runnerType === "self_hosted" && selfHostedWorker)) throw new RuntimeCapabilityError("hosted_byok_boundary_missing", "BYOK inference on hosted control planes requires runner.type self_hosted and workerHost=self_hosted[:worker-id].");
+  if (inferenceMode === "local" && controlPlaneResolved === "hosted" && !(runnerType === "self_hosted" && selfHostedWorker)) throw new RuntimeCapabilityError("hosted_local_inference_boundary_missing", "Local inference on hosted control planes requires a self_hosted worker boundary.");
   const image = typeof runnerRaw.image === "string" ? runnerRaw.image.trim() : defaults.runner.image;
   if (image && (!RUNNER_IMAGE_PATTERN.test(image) || image.includes(".."))) throw new Error("runtime.runner.image must be a safe container image or local runner identifier.");
   return {
@@ -219,7 +313,7 @@ export function parseRuntimeProfile(raw: unknown, defaults: RuntimeProfile): Run
     workerHost,
     inference: {
       mode: inferenceMode as InferenceMode,
-      provider: typeof inferenceRaw.provider === "string" ? inferenceRaw.provider : defaults.inference.provider,
+      provider: normalizeInferenceProvider(inferenceRaw.provider, defaults.inference.provider),
       model: typeof inferenceRaw.model === "string" ? inferenceRaw.model : defaults.inference.model,
       credentialRef,
     },

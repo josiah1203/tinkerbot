@@ -1,4 +1,0 @@
-image = "cloudflare/sandbox:next"
-timeoutSeconds = 1800
-allow = "github.com"
-allow = "api.github.com"

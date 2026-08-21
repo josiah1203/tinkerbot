@@ -1,6 +1,0 @@
-id: release
-stages: [foreman, triage, verification, release]
-agents: [foreman, release, verification]
-autonomy: restricted
-requiredEvidence: [verification-receipt, rollback]
-approvalRoles: [admin, owner]

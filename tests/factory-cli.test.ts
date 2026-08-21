@@ -132,6 +132,13 @@ test("factory validate, receipt validate, login, and hosted inspect commands are
     if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ authenticated: true, user: { id: "user_1" } }), { status: 200 });
     if (url.endsWith("/auth/signout")) return new Response(JSON.stringify({ signedOut: true }), { status: 200 });
     if (url.includes("/factories")) return new Response(JSON.stringify({ factories: [] }), { status: 200 });
+    if (url.endsWith("/work-orders/wo_1/graph")) return new Response(JSON.stringify({
+      workOrder: { id: "wo_1", workOrderId: "wo_1", title: "Example", factoryId: "fac_1", stage: "intake", group: "in_progress", viewGroup: "in_progress", lane: "intake", updatedAt: "2030-01-01T00:00:00.000Z", verificationVerdict: "unknown", reviewDecision: "awaiting_human", releaseDecision: "not_eligible", outcomeStatus: "pending", unresolvedUnknownCount: 0, availableActions: [] },
+      graph: { eventCount: 0, verificationVerdict: "UNKNOWN", reviewDecision: "NOT_REVIEWED", releaseDecision: "NOT_RELEASED", outcomeStatus: "UNMEASURED", outcomeMaturity: "IMMATURE" },
+      economics: { cogsCents: 0, copqCents: 0, acceptedChanges: 0, unrevertedChanges: 0, outcomePositiveChanges: 0, costPerAcceptedUnrevertedOutcomePositiveChange: null },
+      events: [],
+      sourceOfTruth: "append_only_factory_graph",
+    }), { status: 200 });
     if (url.includes("/work-orders")) return new Response(JSON.stringify({ workOrders: [] }), { status: 200 });
     if (url.includes("/runs/")) return new Response(JSON.stringify({ run: { run_id: "run_1" }, stages: [] }), { status: 200 });
     if (url.includes("/tenant/organizations")) return new Response(JSON.stringify({ organizations: [] }), { status: 200 });

@@ -15,6 +15,7 @@ import {
   createReleaseRolledBackEvent,
   createVerificationRecordedEvent,
   createWorkOrder,
+  isFactoryCommandTelemetry,
   projectFactoryEvents,
   shadowReadFactoryProjection,
 } from "../packages/factory/src";
@@ -70,6 +71,37 @@ test("command boundary serializes a WorkOrder and replays idempotently", async (
   expect(rollbackReplay.replayed).toBe(true);
   await expect(store.commandBoundary.dispatch({ organizationId: context.organizationId, factoryId: context.factoryId, workOrderId: context.aggregateId, actorId: "release-system", actorType: "system", idempotencyKey: "rollback-execution-duplicate", payload: { releaseId: "release-1" }, buildEvents: () => [createReleaseRolledBackEvent({ ...context, eventId: "rollback-execution-duplicate-event", actorId: "release-system", actorType: "system", workOrderId: context.aggregateId, releaseId: "release-1", rollbackId: "rollback-duplicate" })] })).rejects.toThrow("rollback_execution_already_recorded");
   expect(await store.listFactoryEvents(context.aggregateId)).toHaveLength(9);
+});
+
+test("WorkOrder admission persists the create event, receipt, and projection as one command", async () => {
+  const order = createWorkOrder({ factoryId: context.factoryId, organizationId: context.organizationId, sourceType: "manual", sourceId: "admission", repositoryId: "acme/admission", policyVersion: "v1", definitionVersion: "v1", definitionDigest: "sha256:definition", actor: "human", workOrderId: "wo_admission" });
+  const memory = new MemoryFactoryStore();
+  const first = await memory.admitWorkOrder(order);
+  expect(first.replayed).toBe(false);
+  expect(first.events).toMatchObject([{ type: "work_order.created", aggregateSequence: 1, payload: { workOrderId: order.workOrderId, sourceId: order.sourceId } }]);
+  expect((await memory.listFactoryEvents(order.workOrderId))).toHaveLength(1);
+  const replay = await memory.admitWorkOrder(order);
+  expect(replay.replayed).toBe(true);
+  expect(await memory.listFactoryEvents(order.workOrderId)).toHaveLength(1);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tb-spine-admission-"));
+  const sqlite = new SqliteFactoryStore(path.join(dir, "local.db"));
+  await sqlite.admitWorkOrder(order);
+  const reopened = new SqliteFactoryStore(path.join(dir, "local.db"));
+  expect(await reopened.listFactoryEvents(order.workOrderId)).toMatchObject([{ type: "work_order.created", aggregateSequence: 1 }]);
+  expect(await reopened.getWorkOrder(order.workOrderId)).toMatchObject({ workOrderId: order.workOrderId, status: order.status });
+});
+
+test("command telemetry records correlation, replay, latency, and failure without payload data", async () => {
+  const store = new MemoryFactoryStore();
+  const order = createWorkOrder({ factoryId: context.factoryId, organizationId: context.organizationId, sourceType: "manual", sourceId: "telemetry", repositoryId: "acme/telemetry", policyVersion: "v1", definitionVersion: "v1", definitionDigest: "sha256:definition", actor: "human", workOrderId: "wo_telemetry" });
+  await store.admitWorkOrder(order);
+  await store.admitWorkOrder(order);
+  await expect(store.commandBoundary.dispatch({ organizationId: order.organizationId, factoryId: order.factoryId, workOrderId: order.workOrderId, actorId: "human", actorType: "human", idempotencyKey: `admission:${order.workOrderId}`, payload: { kind: "conflicting-admission" }, buildEvents: () => [] })).rejects.toThrow("idempotency_conflict");
+  expect(store.commandBoundary.telemetry.map((item) => item.outcome)).toEqual(["committed", "replayed", "failed"]);
+  expect(store.commandBoundary.telemetry.every(isFactoryCommandTelemetry)).toBe(true);
+  expect(store.commandBoundary.telemetry.at(0)).toMatchObject({ kind: "factory_command", workOrderId: order.workOrderId, correlationId: order.workOrderId, eventCount: 1, projectionEventCount: 1, projectionStatus: "available" });
+  expect(store.commandBoundary.telemetry.at(-1)).not.toHaveProperty("payload");
 });
 
 test("canonical event families retain stale evidence without changing current state and reject illegal execution edges", async () => {

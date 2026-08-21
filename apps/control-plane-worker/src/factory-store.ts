@@ -3,303 +3,164 @@ import {
   WorkOrder,
   WorkOrderEvent,
   WorkOrderState,
-  applyFactoryTree,
   assertFactoryEventAuthority,
-  assertFactoryEventOrdering,
-  assertFactoryTreeIntegrity,
   isFactoryCommandBoundaryEventType,
-  classifyActivityColumn,
+  createWorkOrderCreatedEvent,
   classifyWorkOrderGroup,
   createWorkOrder,
-  containsRawCredentials,
   graphEventForWorkOrderTransition,
-  factoryDashboardMetrics,
-  factoryDefinitionDigest,
   parseFactoryDefinition,
   transitionWorkOrder,
-  projectFactoryEvents,
-  projectFactoryAuditEvents,
-  shadowReadFactoryProjection,
   FactoryCommandBoundary,
   createApprovalRecordedEvent,
-  createReleaseDecisionEvent,
-  createReviewRecordedEvent,
-  createVerificationRecordedEvent,
-  createFactoryProjectionCheckpoint,
-  asApprovalEventId,
   type FactoryCommandInput,
   type FactoryCommandReceipt,
   type FactoryCommandResult,
   type FactoryEvent,
   type FactoryProjection,
-  type FactoryProjectionCheckpoint,
   type FactoryDefinition,
-  type ActionCapability,
   type WorkOrderView,
-  type WorkOrderGroupView,
-  normalizeOutcomeStatus,
-  normalizeReleaseDecision,
-  normalizeReviewDecision,
-  normalizeVerificationVerdict,
-  stageView,
-  groupView,
-  validateFactoryDefinition,
 } from "../../../packages/factory/src";
+import { D1FactoryProjectionStore, type FactoryShadowReadSummary } from "./factory-projection-store";
+import { D1FactoryTelemetryStore } from "./factory-telemetry-store";
+import { D1FactoryWorkspaceStore, type WorkspaceEnvironment, type WorkspaceIntegration, type WorkspaceSecretMetadata } from "./factory-workspace-store";
+import { D1FactoryReadModel } from "./factory-read-model";
+import { D1FactoryArtifactStore } from "./factory-artifact-store";
+import { D1FactoryOperationsStore } from "./factory-operations-store";
+import { D1FactoryDefinitionStore, type FactoryRecord } from "./factory-definition-store";
+import { D1FactoryGraphStore } from "./factory-graph-store";
 
-type WorkspaceEnvironment = { id: string; name: string; status: string; owner?: string; updatedAt: string; factoryId?: string };
-type WorkspaceIntegration = { id: string; name: string; kind: string; status: string; owner?: string; updatedAt: string; scopes?: string };
-type WorkspaceSecretMetadata = { id: string; name: string; status: string; owner?: string; updatedAt: string; references?: string };
+export type { FactoryShadowReadSummary } from "./factory-projection-store";
+
+function workOrderInsertStatement(database: D1DatabaseLike, order: WorkOrder, ignore = false) {
+  const verb = ignore ? "INSERT OR IGNORE" : "INSERT";
+  return database.prepare(`${verb} INTO tinkerbot_work_orders (work_order_id, factory_id, organization_id, source_type, source_id, repository_id, issue_or_pull_request, intent, acceptance_criteria, policy_version, definition_version, definition_digest, current_stage, status, actor, created_at, updated_at, product_id, line_id, cell_id, owner, risk, autonomy_mode, output_kind, policy_json, dependencies_json, held_by, verification_verdict, review_assessment, release_decision, waiver_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)`).bind(
+    order.workOrderId, order.factoryId, order.organizationId, order.sourceType, order.sourceId, order.repositoryId, order.issueOrPullRequest ?? null, order.intent ?? null, order.acceptanceCriteria ?? null, order.policyVersion, order.definitionVersion, order.definitionDigest, order.currentStage, order.status, order.actor, order.createdAt, order.updatedAt, order.productId ?? null, order.lineId ?? null, order.cellId ?? null, order.owner ?? null, order.risk ?? null, order.autonomyMode ?? null, order.outputKind ?? null, order.policyJson ?? null, order.dependenciesJson ?? null, order.heldBy ?? null, order.verificationVerdict ?? "UNKNOWN", order.reviewAssessment ?? "NEEDS_HUMAN_REVIEW", order.releaseDecision ?? "BLOCKED", order.waiver ? JSON.stringify(order.waiver) : null,
+  );
+}
 
 export class D1FactoryStore {
   readonly commandBoundary: FactoryCommandBoundary;
+  private readonly projectionStore: D1FactoryProjectionStore;
+  private readonly telemetryStore: D1FactoryTelemetryStore;
+  private readonly workspaceStore: D1FactoryWorkspaceStore;
+  private readonly readModel: D1FactoryReadModel;
+  private readonly artifactStore: D1FactoryArtifactStore;
+  private readonly operationsStore: D1FactoryOperationsStore;
+  private readonly definitionStore: D1FactoryDefinitionStore;
+  private readonly graphStore: D1FactoryGraphStore;
 
   constructor(private readonly database: D1DatabaseLike) {
-    this.commandBoundary = new FactoryCommandBoundary(this);
+    this.telemetryStore = new D1FactoryTelemetryStore(database);
+    this.workspaceStore = new D1FactoryWorkspaceStore(database);
+    this.definitionStore = new D1FactoryDefinitionStore(database, {
+      replaceAutomations: (factoryId, automations, now) => this.workspaceStore.replaceAutomations(factoryId, automations, now),
+    });
+    this.readModel = new D1FactoryReadModel(this);
+    this.artifactStore = new D1FactoryArtifactStore(database, (factoryId) => this.getFactory(factoryId));
+    this.operationsStore = new D1FactoryOperationsStore(database, (factoryId) => this.getFactory(factoryId));
+    this.commandBoundary = new FactoryCommandBoundary(this, (telemetry) => this.telemetryStore.persistCommandTelemetry(telemetry));
+    this.projectionStore = new D1FactoryProjectionStore(database, {
+      commandBoundary: this.commandBoundary,
+      getWorkOrder: (workOrderId) => this.getWorkOrder(workOrderId),
+      listWorkOrders: (organizationId) => this.listWorkOrders(organizationId),
+      listFactoryEvents: (aggregateId, organizationId) => this.listFactoryEvents(aggregateId, organizationId),
+      reconstructFactoryGraph: (aggregateId, organizationId) => this.reconstructFactoryGraph(aggregateId, organizationId),
+    });
+    this.graphStore = new D1FactoryGraphStore(database, {
+      refreshLifecycleProjection: (workOrderId, organizationId, updatedAt) => this.refreshLifecycleProjection(workOrderId, organizationId, updatedAt),
+    });
+  }
+
+  async pruneCommandTelemetry(retentionDays: number, now = new Date().toISOString()): Promise<number> {
+    return this.telemetryStore.pruneCommandTelemetry(retentionDays, now);
+  }
+
+  async persistOperationalSignal(signal: import("../../../packages/factory/src").FactoryOperationalSignal): Promise<void> {
+    return this.telemetryStore.persistOperationalSignal(signal);
+  }
+
+  async pruneOperationalTelemetry(retentionDays: number, now = new Date().toISOString()): Promise<number> {
+    return this.telemetryStore.pruneOperationalTelemetry(retentionDays, now);
+  }
+
+  async pruneTelemetry(retentionDays: number, now = new Date().toISOString()): Promise<{ commandDeleted: number; operationalDeleted: number }> {
+    return this.telemetryStore.pruneTelemetry(retentionDays, now);
   }
 
   async listFactories(organizationId: string): Promise<Array<{ factoryId: string; name: string; status: string; updatedAt: string }>> {
-    const statement = this.database.prepare("SELECT factory_id, name, status, updated_at FROM tinkerbot_factories WHERE organization_id = ?1 ORDER BY updated_at DESC").bind(organizationId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<{ factory_id: string; name: string; status: string; updated_at: string }>();
-    return (result.results ?? []).map((row) => ({ factoryId: row.factory_id, name: row.name, status: row.status, updatedAt: row.updated_at }));
+    return this.definitionStore.listFactories(organizationId);
   }
 
-  async getFactory(factoryId: string): Promise<{ factoryId: string; organizationId: string; name: string; status: string; definitionDigest?: string } | null> {
-    const row = await this.database.prepare("SELECT factory_id, organization_id, name, status, definition_digest FROM tinkerbot_factories WHERE factory_id = ?1").bind(factoryId).first<{ factory_id: string; organization_id: string; name: string; status: string; definition_digest?: string | null }>();
-    return row ? { factoryId: row.factory_id, organizationId: row.organization_id, name: row.name, status: row.status, definitionDigest: row.definition_digest ?? undefined } : null;
+  async getFactory(factoryId: string): Promise<FactoryRecord | null> {
+    return this.definitionStore.getFactory(factoryId);
   }
 
   async putFactory(input: { factoryId: string; organizationId: string; name: string; yaml?: string; files?: Array<{ path: string; contents: string }>; now?: string }): Promise<{ factoryId: string; digest?: string }> {
-    const now = input.now ?? new Date().toISOString();
-    let digest: string | undefined;
-    const bytes = (value: string): number => new TextEncoder().encode(value).byteLength;
-    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(input.factoryId)) throw new Error("Factory id is invalid.");
-    if (!/^[A-Za-z0-9][A-Za-z0-9 ._:-]{0,199}$/.test(input.name.trim())) throw new Error("Factory name is invalid.");
-    const existing = await this.getFactory(input.factoryId);
-    if (existing && existing.organizationId !== input.organizationId) throw new Error("Factory belongs to another organization.");
-    if (input.yaml !== undefined && (typeof input.yaml !== "string" || input.yaml.length === 0 || bytes(input.yaml) > 512_000)) throw new Error("Factory YAML must be between 1 and 512000 bytes.");
-    const normalizedFiles = input.files?.map((file) => ({ ...file, path: file.path.replaceAll("\\", "/") }));
-    if (normalizedFiles && (normalizedFiles.length > 128 || normalizedFiles.some((file) => !file || typeof file.path !== "string" || !file.path || file.path.length > 512 || bytes(file.path) > 2_048 || file.path.includes("\0") || file.path.startsWith("/") || file.path.split("/").includes("..") || typeof file.contents !== "string" || bytes(file.contents) > 512_000))) throw new Error("Factory files exceed the allowed count, path, or content limits.");
-    if (normalizedFiles && new Set(normalizedFiles.map((file) => file.path)).size !== normalizedFiles.length) throw new Error("Factory file paths must be unique.");
-    if (normalizedFiles) assertFactoryTreeIntegrity(normalizedFiles);
-    if (normalizedFiles && normalizedFiles.reduce((total, file) => total + bytes(file.contents), 0) > 4_000_000) throw new Error("Factory files exceed the 4 MB content limit.");
-    if ((input.yaml !== undefined || normalizedFiles) && containsRawCredentials({ yaml: input.yaml, files: normalizedFiles })) throw new Error("Factory definitions must not contain raw credentials.");
-    if (input.yaml) {
-      let definition = parseFactoryDefinition(input.yaml);
-      const definitionFile = normalizedFiles?.find((file) => file.path === ".tinkerbot/factory.yaml");
-      if (definitionFile && definitionFile.contents !== input.yaml) throw new Error("Factory YAML must match the .tinkerbot/factory.yaml file payload.");
-      if (normalizedFiles?.length) definition = applyFactoryTree(definition, normalizedFiles);
-      const definitionErrors = validateFactoryDefinition(definition, { requireForeman: definition.schemaVersion === "v1alpha1" || definition.agents.some((agent) => agent.agentType === "FOREMAN") });
-      if (definitionErrors.length) throw new Error(`Invalid factory definition: ${definitionErrors.join("; ")}`);
-      digest = factoryDefinitionDigest(definition);
-      const definitionId = crypto.randomUUID();
-      await this.database.prepare("INSERT INTO tinkerbot_factory_definitions (definition_id, factory_id, digest, yaml, files_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(definitionId, input.factoryId, digest, input.yaml, normalizedFiles?.length ? JSON.stringify(normalizedFiles) : null, now).run();
-      await this.database.prepare("INSERT INTO tinkerbot_factory_definition_versions (version_id, factory_id, definition_id, version, digest, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(crypto.randomUUID(), input.factoryId, definitionId, Date.now(), digest, now).run();
-      await this.replaceAutomations(input.factoryId, definition.automations ?? [], now);
-    }
-    await this.database.prepare("INSERT INTO tinkerbot_factories (factory_id, organization_id, name, status, definition_digest, created_at, updated_at) VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?5) ON CONFLICT(factory_id) DO UPDATE SET name = excluded.name, definition_digest = COALESCE(excluded.definition_digest, tinkerbot_factories.definition_digest), updated_at = excluded.updated_at").bind(input.factoryId, input.organizationId, input.name, digest ?? null, now).run();
-    return { factoryId: input.factoryId, digest };
+    return this.definitionStore.putFactory(input);
   }
 
   async getLatestDefinition(factoryId: string): Promise<{ yaml: string; files: Array<{ path: string; contents: string }>; digest: string } | null> {
-    const row = await this.database.prepare("SELECT yaml, files_json, digest FROM tinkerbot_factory_definitions WHERE factory_id = ?1 ORDER BY created_at DESC").bind(factoryId).first<{ yaml: string; files_json?: string | null; digest: string }>();
-    if (!row) return null;
-    let files: Array<{ path: string; contents: string }> = [];
-    if (row.files_json) {
-      try {
-        const parsed = JSON.parse(row.files_json) as unknown;
-        if (Array.isArray(parsed)) files = parsed.filter((item): item is { path: string; contents: string } => Boolean(item && typeof item === "object" && typeof (item as { path?: unknown }).path === "string" && typeof (item as { contents?: unknown }).contents === "string"));
-      } catch { /* Stored files_json that is not an array is treated as missing files. */ }
-    }
-    return { yaml: row.yaml, files, digest: row.digest };
+    return this.definitionStore.getLatestDefinition(factoryId);
   }
 
-  async factoryOperatorView(factoryId: string, organizationId: string): Promise<{
-    factory: { factoryId: string; organizationId: string; name: string; status: string; definitionDigest?: string; alias?: string; schemaVersion?: string };
-    activity: Array<WorkOrder & { group: ReturnType<typeof classifyWorkOrderGroup>; column: ReturnType<typeof classifyActivityColumn> }>;
-    runs: Array<Record<string, string>>;
-    scorers: Array<Record<string, unknown>>;
-    selfImprovement: Array<Record<string, unknown>>;
-    automations: FactoryDefinition["automations"];
-    agents: FactoryDefinition["agents"];
-    definitionFiles: Array<{ path: string; contents: string }>;
-    metrics: ReturnType<typeof factoryDashboardMetrics>;
-    graph: Record<string, FactoryProjection>;
-    workOrders: WorkOrderView[];
-    costs: { totalCents: number; acceptedChanges: number; medianDurationSeconds?: number; ownershipLabel: string };
-  } | null> {
-    const factory = await this.getFactory(factoryId);
-    if (!factory || factory.organizationId !== organizationId) return null;
-    const orders = (await this.listWorkOrders(organizationId)).filter((order) => order.factoryId === factoryId);
-    const graphEntries = await Promise.all(orders.map(async (order) => ({ order, graph: await this.reconstructFactoryGraph(order.workOrderId, organizationId) })));
-    const projectedOrders = graphEntries.map(({ order, graph }) => ({ ...order, status: graph.workOrderState ?? order.status, currentStage: graph.currentStage ?? order.currentStage, actor: graph.currentActorId ?? order.actor }));
-    const latest = await this.getLatestDefinition(factoryId);
-    let definition: FactoryDefinition | undefined;
-    if (latest) {
-      definition = parseFactoryDefinition(latest.yaml);
-      if (latest.files.length) definition = applyFactoryTree(definition, latest.files);
-    }
-    const workOrders = await Promise.all(orders.map((order) => this.getWorkOrderView(order.workOrderId, organizationId)));
-    const normalizedOrders = workOrders.filter((order): order is WorkOrderView => Boolean(order));
-    const dashboardMetrics = factoryDashboardMetrics({ statuses: projectedOrders.map((order) => order.status) });
-    const counts = normalizedOrders.reduce((result, order) => { result[order.group] += 1; return result; }, { blocked: 0, awaiting_review: 0, in_progress: 0, ready: 0, released: 0, unknown: 0 } as Record<WorkOrderGroupView, number>);
-    const usage = await this.listFactoryUsage(factoryId, organizationId);
-    return {
-      factory: { ...factory, alias: definition?.alias, schemaVersion: definition?.schemaVersion },
-      activity: projectedOrders.map((order) => ({ ...order, column: classifyActivityColumn(order.status) })),
-      runs: await this.listFactoryRuns(factoryId),
-      scorers: await this.listScorers(factoryId),
-      selfImprovement: await this.listSelfImprovement(factoryId),
-      automations: definition?.automations ?? [],
-      agents: definition?.agents ?? [],
-      definitionFiles: latest?.files ?? (latest ? [{ path: ".tinkerbot/factory.yaml", contents: latest.yaml }] : []),
-      metrics: { ...dashboardMetrics, inProgress: counts.in_progress, awaitingReview: counts.awaiting_review, released: counts.released },
-      graph: Object.fromEntries(graphEntries.map(({ order, graph }) => [order.workOrderId, graph])),
-      workOrders: normalizedOrders,
-      costs: { totalCents: usage.reduce((total, item) => total + item.costCents, 0), acceptedChanges: counts.released, medianDurationSeconds: undefined, ownershipLabel: "Measured platform and provider spend are reported separately." },
-    };
+  async factoryOperatorView(factoryId: string, organizationId: string): Promise<Awaited<ReturnType<D1FactoryReadModel["factoryOperatorView"]>>> {
+    return this.readModel.factoryOperatorView(factoryId, organizationId);
   }
+
 
   async listWorkOrderViews(organizationId: string, factoryId?: string): Promise<WorkOrderView[]> {
-    const orders = await this.listWorkOrders(organizationId);
-    const views = await Promise.all(orders.filter((order) => !factoryId || order.factoryId === factoryId).map((order) => this.getWorkOrderView(order.workOrderId, organizationId)));
-    return views.filter((view): view is WorkOrderView => Boolean(view));
+    return this.readModel.listWorkOrderViews(organizationId, factoryId);
   }
+
 
   async getWorkOrderView(workOrderId: string, organizationId: string): Promise<WorkOrderView | null> {
-    const order = await this.getWorkOrder(workOrderId);
-    if (!order || order.organizationId !== organizationId) return null;
-    const events = await this.listFactoryEvents(workOrderId, organizationId);
-    const graph = projectFactoryEvents(events);
-    const projectedStatus = graph.workOrderState ?? order.status;
-    const projectedStage = graph.currentStage ?? order.currentStage;
-    const projectedActor = graph.currentActorId ?? order.actor;
-    const latest = <T extends { occurredAt: string }>(items: T[]): T | undefined => items.slice().sort((a, b) => a.occurredAt.localeCompare(b.occurredAt)).at(-1);
-    const verificationEvent = latest(events.filter((event) => ["verification.recorded", "verification.completed"].includes(event.type)));
-    const reviewEvent = latest(events.filter((event) => ["review.recorded", "review.completed", "approval.recorded"].includes(event.type) && event.actorType === "human"));
-    const releaseEvent = latest(events.filter((event) => ["release.decided", "release.executed", "release.completed", "release.authorized"].includes(event.type) && event.actorType === "human"));
-    const verification = normalizeVerificationVerdict(graph.verificationVerdict ?? (verificationEvent?.payload && typeof verificationEvent.payload === "object" ? (verificationEvent.payload as Record<string, unknown>).verdict : order.verificationVerdict), projectedStage ? "not_run" : "unknown");
-    const reviewPayload = reviewEvent?.payload && typeof reviewEvent.payload === "object" ? reviewEvent.payload as Record<string, unknown> : undefined;
-    const canonicalReview = graph.reviewAssessment === "CLEAR" ? "approved" : graph.reviewAssessment === "REVISE" ? "changes_requested" : graph.reviewAssessment === "NEEDS_HUMAN_REVIEW" ? "awaiting_human" : undefined;
-    const review = canonicalReview ? normalizeReviewDecision(canonicalReview, "awaiting_human") : reviewEvent ? normalizeReviewDecision(reviewPayload?.decision, "awaiting_human") : normalizeReviewDecision(order.reviewAssessment, "awaiting_human");
-    const releasePayload = releaseEvent?.payload && typeof releaseEvent.payload === "object" ? releaseEvent.payload as Record<string, unknown> : undefined;
-    const canonicalRelease = graph.releaseExecuted ? "released" : graph.releaseDecision === "RELEASE" ? "approved" : graph.releaseDecision === "HOLD" ? "hold" : graph.releaseApprovalEventId ? "awaiting_authorization" : verification === "pass" && review === "approved" && ["approval", "ready", "merged"].includes(projectedStatus) ? "awaiting_authorization" : undefined;
-    const release = canonicalRelease ? normalizeReleaseDecision(canonicalRelease, { verification, review, released: canonicalRelease === "released" }) : normalizeReleaseDecision(releaseEvent ? releasePayload?.decision : order.releaseDecision, { verification, review, released: Boolean(graph.releaseExecuted) });
-    const outcome = normalizeOutcomeStatus(projectedStatus === "released" ? "accepted" : projectedStatus === "failed" ? "failed" : undefined, "pending");
-    const run = await this.getRunByWorkOrder(order.workOrderId);
-    const unresolvedUnknownCount = verification === "unknown" || verification === "not_run" && ["verification", "release"].includes(stageView(projectedStage)) ? 1 : 0;
-    const group = groupView({ status: projectedStatus, verification, review, release, outcome });
-    const canRetry = ["failed", "blocked"].includes(projectedStatus);
-    const canReview = review === "awaiting_human" && verification !== "fail" && verification !== "blocked";
-    const canRelease = verification === "pass" && review === "approved" && (release === "awaiting_authorization" || release === "hold");
-    const availableActions: ActionCapability[] = [
-      { id: order.heldBy ? "return" : "take", label: order.heldBy ? "Return cell" : "Take cell", allowed: true },
-      { id: "steer", label: "Add operator note", allowed: true },
-      { id: "retry", label: "Retry run", allowed: canRetry, reason: canRetry ? undefined : "Retry is available after a failed or blocked run." },
-      { id: "review", label: "Record review", allowed: canReview, reason: canReview ? undefined : "Review is only available when the work is awaiting human review." },
-      { id: "authorize_release", label: "Authorize release", allowed: canRelease, reason: canRelease ? undefined : "Deterministic verification, human review, and release policy must be resolved first." },
-    ];
-    const actorKind: "agent" | "human" | "system" = order.sourceType === "manual" ? "human" : projectedActor.toLowerCase().startsWith("agent") || projectedActor.toLowerCase().includes("bot") ? "agent" : "system";
-    return {
-      id: order.workOrderId,
-      workOrderId: order.workOrderId,
-      title: order.issueOrPullRequest ?? order.intent ?? order.workOrderId,
-      factoryId: order.factoryId,
-      status: projectedStatus,
-      repository: order.repositoryId ? { id: order.repositoryId, name: order.repositoryId } : undefined,
-      stage: stageView(projectedStage),
-      actor: { id: projectedActor, name: projectedActor, kind: actorKind },
-      risk: order.risk ?? "unknown",
-      updatedAt: order.updatedAt,
-      verificationVerdict: verification,
-      reviewDecision: review,
-      releaseDecision: release,
-      outcomeStatus: outcome,
-      unresolvedUnknownCount,
-      latestRunId: run?.run_id,
-      group,
-      availableActions,
-      intent: order.intent,
-      acceptanceCriteria: order.acceptanceCriteria,
-      sourceType: order.sourceType,
-      sourceId: order.sourceId,
-      blockedReason: projectedStatus === "blocked" ? "A required factory gate or authorized execution surface is unresolved." : projectedStatus === "failed" ? "The latest deterministic verification failed." : undefined,
-    };
+    return this.readModel.getWorkOrderView(workOrderId, organizationId);
   }
 
+
   async listFactoryRuns(factoryId: string): Promise<Array<Record<string, string>>> {
-    const statement = this.database.prepare("SELECT run_id, work_order_id, factory_id, definition_digest, status, started_at, completed_at, updated_at FROM tinkerbot_factory_runs WHERE factory_id = ?1 ORDER BY started_at DESC").bind(factoryId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<Record<string, string>>();
-    return result.results ?? [];
+    return this.artifactStore.listFactoryRuns(factoryId);
   }
 
   async listFactoryUsage(factoryId: string, organizationId: string): Promise<Array<{ kind: string; tokens: number; costCents: number; createdAt: string }>> {
-    const statement = this.database.prepare("SELECT kind, tokens, cost_cents, created_at FROM tinkerbot_usage_events WHERE factory_id = ?1 AND organization_id = ?2 ORDER BY created_at DESC").bind(factoryId, organizationId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<{ kind: string; tokens: number; cost_cents: number; created_at: string }>();
-    return (result.results ?? []).map((row) => ({ kind: row.kind, tokens: row.tokens, costCents: row.cost_cents, createdAt: row.created_at }));
+    return this.artifactStore.listFactoryUsage(factoryId, organizationId);
   }
 
   async listFactoryEvidence(factoryId: string, organizationId: string): Promise<Array<Record<string, unknown>>> {
-    const statement = this.database.prepare("SELECT e.evidence_id, e.run_id, e.kind, e.object_key, e.digest, e.signed, e.created_at, r.work_order_id, r.factory_id FROM tinkerbot_evidence_records e JOIN tinkerbot_factory_runs r ON r.run_id = e.run_id JOIN tinkerbot_factories f ON f.factory_id = r.factory_id WHERE r.factory_id = ?1 AND f.organization_id = ?2 ORDER BY e.created_at DESC").bind(factoryId, organizationId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<Record<string, unknown>>();
-    return (result.results ?? []).map((row) => ({ id: row.evidence_id, evidenceId: row.evidence_id, name: `${String(row.kind)} evidence`, workOrderId: row.work_order_id, factoryId: row.factory_id, type: row.kind, producer: "Factory run", provenance: row.signed ? "signed" : "recorded", recordedAt: row.created_at }));
+    return this.artifactStore.listFactoryEvidence(factoryId, organizationId);
   }
 
   async listEnvironments(organizationId: string): Promise<WorkspaceEnvironment[]> {
-    const statement = this.database.prepare("SELECT environment_id, name, status, owner, factory_id, updated_at FROM tinkerbot_environments WHERE organization_id = ?1 ORDER BY updated_at DESC").bind(organizationId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<{ environment_id: string; name: string; status: string; owner?: string | null; factory_id?: string | null; updated_at: string }>();
-    return (result.results ?? []).map((row) => ({ id: row.environment_id, name: row.name, status: row.status, owner: row.owner ?? undefined, factoryId: row.factory_id ?? undefined, updatedAt: row.updated_at }));
+    return this.workspaceStore.listEnvironments(organizationId);
   }
 
   async listIntegrations(organizationId: string): Promise<WorkspaceIntegration[]> {
-    const statement = this.database.prepare("SELECT integration_id, name, kind, status, owner, scopes, updated_at FROM tinkerbot_integrations WHERE organization_id = ?1 ORDER BY updated_at DESC").bind(organizationId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<{ integration_id: string; name: string; kind: string; status: string; owner?: string | null; scopes?: string | null; updated_at: string }>();
-    return (result.results ?? []).map((row) => ({ id: row.integration_id, name: row.name, kind: row.kind, status: row.status, owner: row.owner ?? undefined, scopes: row.scopes ?? undefined, updatedAt: row.updated_at }));
+    return this.workspaceStore.listIntegrations(organizationId);
   }
 
   async listSecretMetadata(organizationId: string): Promise<WorkspaceSecretMetadata[]> {
-    const statement = this.database.prepare("SELECT secret_id, name, status, owner, references_text, updated_at FROM tinkerbot_secret_metadata WHERE organization_id = ?1 ORDER BY updated_at DESC").bind(organizationId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<{ secret_id: string; name: string; status: string; owner?: string | null; references_text?: string | null; updated_at: string }>();
-    return (result.results ?? []).map((row) => ({ id: row.secret_id, name: row.name, status: row.status, owner: row.owner ?? undefined, references: row.references_text ?? undefined, updatedAt: row.updated_at }));
+    return this.workspaceStore.listSecretMetadata(organizationId);
   }
 
   async createSecretMetadata(input: { organizationId: string; name: string; reference: string; owner: string; now: string }): Promise<WorkspaceSecretMetadata> {
-    const id = crypto.randomUUID();
-    await this.database.prepare("INSERT INTO tinkerbot_secret_metadata (secret_id, organization_id, name, status, owner, references_text, updated_at) VALUES (?1, ?2, ?3, 'managed', ?4, ?5, ?6)").bind(id, input.organizationId, input.name, input.owner, input.reference, input.now).run();
-    return { id, name: input.name, status: "managed", owner: input.owner, references: input.reference, updatedAt: input.now };
+    return this.workspaceStore.createSecretMetadata(input);
   }
 
   async createIntegrationMetadata(input: { organizationId: string; name: string; kind: string; now: string }): Promise<WorkspaceIntegration> {
-    const id = crypto.randomUUID();
-    await this.database.prepare("INSERT INTO tinkerbot_integrations (integration_id, organization_id, name, kind, status, owner, scopes, updated_at) VALUES (?1, ?2, ?3, ?4, 'pending', 'Workspace', 'Awaiting configuration', ?5)").bind(id, input.organizationId, input.name, input.kind, input.now).run();
-    return { id, name: input.name, kind: input.kind, status: "pending", owner: "Workspace", scopes: "Awaiting configuration", updatedAt: input.now };
+    return this.workspaceStore.createIntegrationMetadata(input);
   }
 
   async listScorers(factoryId: string): Promise<Array<Record<string, unknown>>> {
-    const statement = this.database.prepare("SELECT scorer_id, factory_id, name, criteria, enabled, self_improve, updated_at FROM tinkerbot_scorers WHERE factory_id = ?1 ORDER BY updated_at DESC").bind(factoryId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<Record<string, unknown>>();
-    return (result.results ?? []).map((row) => ({ ...row, upgradesVerdict: false }));
+    return this.operationsStore.listScorers(factoryId);
   }
 
   async listSelfImprovement(factoryId: string): Promise<Array<Record<string, unknown>>> {
-    const statement = this.database.prepare("SELECT task_id, factory_id, work_order_id, title, status, created_at FROM tinkerbot_self_improvement_tasks WHERE factory_id = ?1 ORDER BY created_at DESC").bind(factoryId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<Record<string, unknown>>();
-    return (result.results ?? []).map((row) => ({ ...row, autoMerge: false }));
+    return this.operationsStore.listSelfImprovement(factoryId);
   }
 
   async replaceAutomations(factoryId: string, automations: FactoryDefinition["automations"], now: string): Promise<void> {
-    await this.database.prepare("DELETE FROM tinkerbot_automations WHERE factory_id = ?1").bind(factoryId).run();
-    for (const automation of automations) {
-      await this.database.prepare("INSERT INTO tinkerbot_automations (automation_id, factory_id, trigger, agent_id, enabled, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(`${factoryId}:${automation.name}`, factoryId, JSON.stringify(automation.triggers), automation.agent, automation.enabled ? 1 : 0, now).run();
-    }
+    return this.workspaceStore.replaceAutomations(factoryId, automations, now);
   }
 
   async listWorkOrders(organizationId: string): Promise<Array<WorkOrder & { group: ReturnType<typeof classifyWorkOrderGroup> }>> {
@@ -329,23 +190,25 @@ export class D1FactoryStore {
     return row ? rowToWorkOrder(row) : null;
   }
 
-  async insertWorkOrder(order: WorkOrder): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_work_orders (work_order_id, factory_id, organization_id, source_type, source_id, repository_id, issue_or_pull_request, intent, acceptance_criteria, policy_version, definition_version, definition_digest, current_stage, status, actor, created_at, updated_at, product_id, line_id, cell_id, owner, risk, autonomy_mode, output_kind, policy_json, dependencies_json, held_by, verification_verdict, review_assessment, release_decision, waiver_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)").bind(order.workOrderId, order.factoryId, order.organizationId, order.sourceType, order.sourceId, order.repositoryId, order.issueOrPullRequest ?? null, order.intent ?? null, order.acceptanceCriteria ?? null, order.policyVersion, order.definitionVersion, order.definitionDigest, order.currentStage, order.status, order.actor, order.createdAt, order.updatedAt, order.productId ?? null, order.lineId ?? null, order.cellId ?? null, order.owner ?? null, order.risk ?? null, order.autonomyMode ?? null, order.outputKind ?? null, order.policyJson ?? null, order.dependenciesJson ?? null, order.heldBy ?? null, order.verificationVerdict ?? "UNKNOWN", order.reviewAssessment ?? "NEEDS_HUMAN_REVIEW", order.releaseDecision ?? "BLOCKED", order.waiver ? JSON.stringify(order.waiver) : null).run();
-    await this.appendFactoryEvent({
-      eventId: `evt_${order.workOrderId}`,
-      type: "work_order.created",
-      aggregateId: order.workOrderId,
-      aggregateType: "work_order",
+  /** Seed-only compatibility path for tests and legacy migration fixtures. */
+  async seedWorkOrder(order: WorkOrder): Promise<void> {
+    await workOrderInsertStatement(this.database, order).run();
+  }
+
+  async admitWorkOrder(order: WorkOrder): Promise<FactoryCommandResult> {
+    const actorType: FactoryEvent["actorType"] = order.sourceType === "manual" ? "human" : order.sourceType.startsWith("github") || order.sourceType.startsWith("gitlab") ? "integration" : "system";
+    const event = createWorkOrderCreatedEvent(order, actorType);
+    return this.commandBoundary.dispatch({
       organizationId: order.organizationId,
       factoryId: order.factoryId,
+      workOrderId: order.workOrderId,
       actorId: order.actor,
-      actorType: order.sourceType === "manual" ? "human" : order.sourceType.startsWith("github") || order.sourceType.startsWith("gitlab") ? "integration" : "system",
-      occurredAt: order.createdAt,
-      correlationId: order.workOrderId,
-      schemaVersion: 1,
-      policyVersion: order.policyVersion,
-      provenance: "ATTESTED",
-      payload: { workOrderId: order.workOrderId, intent: order.intent ?? order.issueOrPullRequest ?? "", acceptanceCriteria: order.acceptanceCriteria ?? "" },
+      actorType,
+      idempotencyKey: `admission:${order.workOrderId}`,
+      payload: { kind: "work_order_admission", order },
+      admission: order,
+      now: order.createdAt,
+      buildEvents: () => [event],
     });
   }
 
@@ -378,16 +241,15 @@ export class D1FactoryStore {
   }
 
   async insertRun(run: { runId: string; workOrderId: string; factoryId: string; definitionDigest: string; status: string; now: string }): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_factory_runs (run_id, work_order_id, factory_id, definition_digest, status, started_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)").bind(run.runId, run.workOrderId, run.factoryId, run.definitionDigest, run.status, run.now).run();
+    return this.artifactStore.insertRun(run);
   }
 
   async updateRun(runId: string, status: string, now: string): Promise<void> {
-    const terminal = status !== "running" && !status.startsWith("waiting");
-    await this.database.prepare("UPDATE tinkerbot_factory_runs SET status = ?1, completed_at = CASE WHEN ?2 = 1 THEN COALESCE(completed_at, ?3) ELSE completed_at END, updated_at = ?3 WHERE run_id = ?4").bind(status, terminal ? 1 : 0, now, runId).run();
+    return this.artifactStore.updateRun(runId, status, now);
   }
 
   async updateRunDefinition(runId: string, definitionDigest: string, now: string): Promise<void> {
-    await this.database.prepare("UPDATE tinkerbot_factory_runs SET definition_digest = ?1, updated_at = ?2 WHERE run_id = ?3").bind(definitionDigest, now, runId).run();
+    return this.artifactStore.updateRunDefinition(runId, definitionDigest, now);
   }
 
   async updateWorkOrderDefinition(workOrderId: string, definitionDigest: string, now: string): Promise<void> {
@@ -395,85 +257,64 @@ export class D1FactoryStore {
   }
 
   async getRun(runId: string): Promise<Record<string, string> | null> {
-    return this.database.prepare("SELECT run_id, work_order_id, factory_id, definition_digest, status, started_at, completed_at, updated_at FROM tinkerbot_factory_runs WHERE run_id = ?1").bind(runId).first<Record<string, string>>();
+    return this.artifactStore.getRun(runId);
   }
 
   async getRunForOrganization(runId: string, organizationId: string): Promise<Record<string, string> | null> {
-    const run = await this.getRun(runId);
-    if (!run) return null;
-    const factory = await this.getFactory(run.factory_id);
-    if (!factory || factory.organizationId !== organizationId) return null;
-    return run;
+    return this.artifactStore.getRunForOrganization(runId, organizationId);
   }
 
   async consumeOidcReplayKey(key: string, now: string): Promise<"ok" | "replay"> {
-    const result = await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_oidc_jti (jti, consumed_at) VALUES (?1, ?2)").bind(key, now).run() as { meta?: { changes?: number } };
-    return result.meta?.changes === 0 ? "replay" : "ok";
+    return this.artifactStore.consumeOidcReplayKey(key, now);
   }
 
   async listRunStages(runId: string): Promise<Array<{ stage: string; status: string; summary?: string }>> {
-    const statement = this.database.prepare("SELECT stage, status, summary FROM tinkerbot_run_stages WHERE run_id = ?1 ORDER BY started_at").bind(runId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<{ stage: string; status: string; summary?: string }>();
-    return result.results ?? [];
+    return this.artifactStore.listRunStages(runId);
   }
 
   async insertStage(runId: string, stage: string, status: string, summary: string, now: string): Promise<boolean> {
-    // The stable key makes concurrent queue deliveries converge on one row;
-    // the runtime can then avoid issuing a second receipt/cost record when it
-    // loses the insert race.
-    const result = await this.database.prepare("INSERT INTO tinkerbot_run_stages (run_stage_id, run_id, stage, status, summary, started_at, completed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) ON CONFLICT(run_stage_id) DO NOTHING").bind(`${runId}:${stage}`, runId, stage, status, summary, now).run() as { meta?: { changes?: number } };
-    return result.meta?.changes !== 0;
+    return this.artifactStore.insertStage(runId, stage, status, summary, now);
   }
 
   /** Complete an already-persisted stage without appending a duplicate row. */
   async updateStage(runId: string, stage: string, status: string, summary: string, now: string): Promise<void> {
-    await this.database.prepare("UPDATE tinkerbot_run_stages SET status = ?1, summary = ?2, completed_at = ?3 WHERE run_id = ?4 AND stage = ?5").bind(status, summary, now, runId, stage).run();
+    return this.artifactStore.updateStage(runId, stage, status, summary, now);
   }
 
   async insertUsage(event: { organizationId: string; factoryId?: string; runId?: string; kind: string; tokens: number; costCents: number; now: string }): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_usage_events (usage_id, organization_id, factory_id, run_id, kind, tokens, cost_cents, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)").bind(crypto.randomUUID(), event.organizationId, event.factoryId ?? null, event.runId ?? null, event.kind, event.tokens, event.costCents, event.now).run();
+    return this.artifactStore.insertUsage(event);
   }
 
   async insertAiCostEvent(event: { organizationId: string; factoryId?: string; workOrderId?: string; runId?: string; stageId?: string; agentId?: string; modelId: string; tokens: number; costMinor: number; now: string; provider?: string }): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_ai_cost_events (event_id, organization_id, factory_id, seat_id, service_identity_id, work_order_id, run_id, stage_id, agent_id, model_id, provider, input_tokens, cached_input_tokens, output_tokens, retry_count, estimated_cost_minor, cost_catalog_version, created_at) VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, 0, 0, ?11, '2026-08-18.seat-v1', ?12)").bind(crypto.randomUUID(), event.organizationId, event.factoryId ?? null, event.workOrderId ?? null, event.runId ?? null, event.stageId ?? null, event.agentId ?? null, event.modelId, event.provider ?? "workers-ai", event.tokens, event.costMinor, event.now).run();
+    return this.artifactStore.insertAiCostEvent(event);
   }
 
   async insertAgentReceipt(input: { runId: string; agentId: string; receipt: unknown; digest: string; signed: boolean; now: string }): Promise<void> {
-    const agentRunId = crypto.randomUUID();
-    await this.database.prepare("INSERT INTO tinkerbot_agent_runs (agent_run_id, run_id, agent_id, status, created_at) VALUES (?1, ?2, ?3, 'recorded', ?4)").bind(agentRunId, input.runId, input.agentId, input.now).run();
-    await this.database.prepare("INSERT INTO tinkerbot_agent_receipts (receipt_id, agent_run_id, digest, signed, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(crypto.randomUUID(), agentRunId, input.digest, input.signed ? 1 : 0, JSON.stringify(input.receipt), input.now).run();
+    return this.artifactStore.insertAgentReceipt(input);
   }
 
   async insertEvidence(input: { runId: string; kind: string; objectKey: string; digest: string; signed?: boolean; now: string }): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_evidence_records (evidence_id, run_id, kind, object_key, digest, signed, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)").bind(crypto.randomUUID(), input.runId, input.kind, input.objectKey, input.digest, input.signed ? 1 : 0, input.now).run();
+    return this.artifactStore.insertEvidence(input);
   }
 
   async putSeatLedger(organizationId: string, periodStart: string, activeSeats: number, now: string): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_seat_ledger (organization_id, period_start, active_seats, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(organization_id, period_start) DO UPDATE SET active_seats = excluded.active_seats, updated_at = excluded.updated_at").bind(organizationId, periodStart, activeSeats, now).run();
+    return this.artifactStore.putSeatLedger(organizationId, periodStart, activeSeats, now);
   }
 
   async listUsage(organizationId: string): Promise<Array<{ kind: string; tokens: number; costCents: number; createdAt: string }>> {
-    const statement = this.database.prepare("SELECT kind, tokens, cost_cents, created_at FROM tinkerbot_usage_events WHERE organization_id = ?1 ORDER BY created_at DESC").bind(organizationId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<{ kind: string; tokens: number; cost_cents: number; created_at: string }>();
-    return (result.results ?? []).map((row) => ({ kind: row.kind, tokens: row.tokens, costCents: row.cost_cents, createdAt: row.created_at }));
+    return this.artifactStore.listUsage(organizationId);
   }
 
   async putRunToken(tokenId: string, runId: string, repository: string, sha: string | undefined, expiresAt: string, now: string): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_run_tokens (token_id, run_id, repository, sha, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(tokenId, runId, repository, sha ?? null, expiresAt, now).run();
+    return this.artifactStore.putRunToken(tokenId, runId, repository, sha, expiresAt, now);
   }
 
   async getRunToken(tokenId: string): Promise<{ runId: string; repository: string; sha?: string; expiresAt: string } | null> {
-    const row = await this.database.prepare("SELECT run_id, repository, sha, expires_at FROM tinkerbot_run_tokens WHERE token_id = ?1").bind(tokenId).first<{ run_id: string; repository: string; sha?: string | null; expires_at: string }>();
-    return row ? { runId: row.run_id, repository: row.repository, sha: row.sha ?? undefined, expiresAt: row.expires_at } : null;
+    return this.artifactStore.getRunToken(tokenId);
   }
 
   async putPublication(input: { runId: string; commitSha: string; fingerprint: string; kind: string; remoteId?: string; now: string }): Promise<"created" | "duplicate"> {
-    const existing = await this.database.prepare("SELECT publication_id FROM tinkerbot_github_publications WHERE run_id = ?1 AND fingerprint = ?2 AND commit_sha = ?3 AND kind = ?4").bind(input.runId, input.fingerprint, input.commitSha, input.kind).first<{ publication_id: string }>();
-    if (existing) return "duplicate";
-    await this.database.prepare("INSERT INTO tinkerbot_github_publications (publication_id, run_id, commit_sha, fingerprint, kind, remote_id, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)").bind(crypto.randomUUID(), input.runId, input.commitSha, input.fingerprint, input.kind, input.remoteId ?? null, input.now).run();
-    return "created";
+    return this.artifactStore.putPublication(input);
   }
 
   async insertApproval(workOrderId: string, actor: string, decision: "approved" | "rejected", signature: string, now: string): Promise<void> {
@@ -502,27 +343,23 @@ export class D1FactoryStore {
   }
 
   async putConversation(input: { workOrderId: string; agentId: string; r2Key: string; now: string }): Promise<string> {
-    const conversationId = crypto.randomUUID();
-    await this.database.prepare("INSERT INTO tinkerbot_conversations (conversation_id, work_order_id, agent_id, r2_key, zdr, training, updated_at) VALUES (?1, ?2, ?3, ?4, 1, 0, ?5)").bind(conversationId, input.workOrderId, input.agentId, input.r2Key, input.now).run();
-    return conversationId;
+    return this.artifactStore.putConversation(input);
   }
 
   async insertScorer(input: { factoryId: string; name: string; criteria: string; now: string }): Promise<string> {
-    const scorerId = crypto.randomUUID();
-    await this.database.prepare("INSERT INTO tinkerbot_scorers (scorer_id, factory_id, name, criteria, enabled, self_improve, updated_at) VALUES (?1, ?2, ?3, ?4, 1, 1, ?5)").bind(scorerId, input.factoryId, input.name, input.criteria, input.now).run();
-    return scorerId;
+    return this.operationsStore.insertScorer(input);
   }
 
   async insertBenchmark(factoryId: string, metric: string, value: number, now: string): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_benchmark_results (benchmark_id, factory_id, metric, value, created_at) VALUES (?1, ?2, ?3, ?4, ?5)").bind(crypto.randomUUID(), factoryId, metric, value, now).run();
+    return this.operationsStore.insertBenchmark(factoryId, metric, value, now);
   }
 
   async insertSelfImprovement(input: { factoryId: string; title: string; workOrderId?: string; now: string }): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_self_improvement_tasks (task_id, factory_id, work_order_id, title, status, created_at) VALUES (?1, ?2, ?3, ?4, 'open', ?5)").bind(crypto.randomUUID(), input.factoryId, input.workOrderId ?? null, input.title, input.now).run();
+    return this.operationsStore.insertSelfImprovement(input);
   }
 
   async getRunByWorkOrder(workOrderId: string): Promise<Record<string, string> | null> {
-    return this.database.prepare("SELECT run_id, work_order_id, factory_id, definition_digest, status, started_at, completed_at, updated_at FROM tinkerbot_factory_runs WHERE work_order_id = ?1 ORDER BY started_at DESC").bind(workOrderId).first<Record<string, string>>();
+    return this.artifactStore.getRunByWorkOrder(workOrderId);
   }
 
   async hitRateLimit(bucket: string, limit: number, windowMs: number, now = Date.now()): Promise<boolean> {
@@ -552,220 +389,85 @@ export class D1FactoryStore {
     return this.getWorkOrder(current.workOrderId);
   }
 
-  private async readFactoryProjectionCheckpoint(organizationId: string, aggregateId: string): Promise<FactoryProjectionCheckpoint | null> {
-    const row = await this.database.prepare("SELECT organization_id, aggregate_id, aggregate_type, last_event_id, last_aggregate_sequence, projection_json, projection_fingerprint, status, attempt_count, last_error, updated_at FROM tinkerbot_factory_projection_checkpoints WHERE organization_id = ?1 AND aggregate_id = ?2").bind(organizationId, aggregateId).first<Record<string, unknown>>();
-    if (!row) return null;
-    let projection: FactoryProjection;
-    try { projection = JSON.parse(String(row.projection_json)) as FactoryProjection; } catch { return null; }
-    return {
-      organizationId: String(row.organization_id),
-      aggregateId: String(row.aggregate_id),
-      aggregateType: String(row.aggregate_type),
-      lastEventId: row.last_event_id ? String(row.last_event_id) : undefined,
-      lastAggregateSequence: row.last_aggregate_sequence === null || row.last_aggregate_sequence === undefined ? undefined : Number(row.last_aggregate_sequence),
-      projection,
-      projectionFingerprint: String(row.projection_fingerprint),
-      status: String(row.status) === "RETRY_PENDING" ? "RETRY_PENDING" : "APPLIED",
-      attemptCount: Number(row.attempt_count ?? 0),
-      lastError: row.last_error ? String(row.last_error) : undefined,
-      updatedAt: String(row.updated_at),
-    };
-  }
-
-  private async writeFactoryProjectionCheckpoint(checkpoint: FactoryProjectionCheckpoint): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_factory_projection_checkpoints (organization_id, aggregate_id, aggregate_type, last_event_id, last_aggregate_sequence, projection_json, projection_fingerprint, status, attempt_count, last_error, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(organization_id, aggregate_id) DO UPDATE SET aggregate_type = excluded.aggregate_type, last_event_id = excluded.last_event_id, last_aggregate_sequence = excluded.last_aggregate_sequence, projection_json = excluded.projection_json, projection_fingerprint = excluded.projection_fingerprint, status = excluded.status, attempt_count = excluded.attempt_count, last_error = excluded.last_error, updated_at = excluded.updated_at").bind(
-      checkpoint.organizationId, checkpoint.aggregateId, checkpoint.aggregateType, checkpoint.lastEventId ?? null, checkpoint.lastAggregateSequence ?? null, JSON.stringify(checkpoint.projection), checkpoint.projectionFingerprint, checkpoint.status, checkpoint.attemptCount, checkpoint.lastError ?? null, checkpoint.updatedAt,
-    ).run();
-  }
-
-  private projectionErrorMessage(error: unknown): string {
-    return (error instanceof Error ? error.message : String(error)).slice(0, 2_000);
-  }
-
   private async refreshLifecycleProjection(workOrderId: string, organizationId: string, updatedAt = new Date().toISOString()): Promise<FactoryProjection> {
-    const events = await this.listFactoryEvents(workOrderId, organizationId);
-    const projection = projectFactoryEvents(events);
-    const reviewAssessment = projection.reviewAssessment === "CLEAR" || projection.reviewAssessment === "REVISE" ? projection.reviewAssessment : "NEEDS_HUMAN_REVIEW";
-    const releaseDecision = projection.releaseDecision === "RELEASE" ? "READY" : "BLOCKED";
-    const priorCheckpoint = await this.readFactoryProjectionCheckpoint(organizationId, workOrderId);
-    const checkpoint = createFactoryProjectionCheckpoint({ organizationId, aggregateId: workOrderId, aggregateType: events[0]?.aggregateType ?? "work_order", events, projection, status: "APPLIED", attemptCount: 0, updatedAt });
-    const updateStatement = this.database.prepare("UPDATE tinkerbot_work_orders SET status = COALESCE(?1, status), current_stage = COALESCE(?2, current_stage), actor = COALESCE(?3, actor), updated_at = COALESCE(?4, updated_at), verification_verdict = ?5, review_assessment = ?6, release_decision = ?7 WHERE work_order_id = ?8").bind(
-      projection.workOrderState ?? null,
-      projection.currentStage ?? null,
-      projection.currentActorId ?? null,
-      projection.lastTransitionAt ?? null,
-      projection.verificationVerdict,
-      reviewAssessment,
-      releaseDecision,
-      workOrderId,
-    );
-    try {
-      if (this.database.batch) await this.database.batch([updateStatement, this.database.prepare("INSERT INTO tinkerbot_factory_projection_checkpoints (organization_id, aggregate_id, aggregate_type, last_event_id, last_aggregate_sequence, projection_json, projection_fingerprint, status, attempt_count, last_error, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(organization_id, aggregate_id) DO UPDATE SET aggregate_type = excluded.aggregate_type, last_event_id = excluded.last_event_id, last_aggregate_sequence = excluded.last_aggregate_sequence, projection_json = excluded.projection_json, projection_fingerprint = excluded.projection_fingerprint, status = excluded.status, attempt_count = excluded.attempt_count, last_error = excluded.last_error, updated_at = excluded.updated_at").bind(
-        checkpoint.organizationId, checkpoint.aggregateId, checkpoint.aggregateType, checkpoint.lastEventId ?? null, checkpoint.lastAggregateSequence ?? null, JSON.stringify(checkpoint.projection), checkpoint.projectionFingerprint, checkpoint.status, checkpoint.attemptCount, checkpoint.lastError ?? null, checkpoint.updatedAt,
-      )]);
-      else {
-        await updateStatement.run();
-        await this.writeFactoryProjectionCheckpoint(checkpoint);
-      }
-      return projection;
-    } catch (error) {
-      const retry = createFactoryProjectionCheckpoint({ organizationId, aggregateId: workOrderId, aggregateType: events[0]?.aggregateType ?? "work_order", events, projection, status: "RETRY_PENDING", attemptCount: (priorCheckpoint?.attemptCount ?? 0) + 1, lastError: this.projectionErrorMessage(error), updatedAt });
-      try { await this.writeFactoryProjectionCheckpoint(retry); } catch { /* preserve the original projection failure */ }
-      throw error;
-    }
+    return this.projectionStore.refreshLifecycleProjection(workOrderId, organizationId, updatedAt);
   }
 
-  async getFactoryProjectionCheckpoint(workOrderId: string, organizationId: string): Promise<FactoryProjectionCheckpoint | null> {
-    const order = await this.getWorkOrder(workOrderId);
-    if (!order || order.organizationId !== organizationId) return null;
-    return this.readFactoryProjectionCheckpoint(organizationId, workOrderId);
+  async getFactoryProjectionCheckpoint(workOrderId: string, organizationId: string) {
+    return this.projectionStore.getFactoryProjectionCheckpoint(workOrderId, organizationId);
   }
 
   /** Rebuilds the compatibility projection from the authoritative graph. */
-  async rebuildFactoryProjection(workOrderId: string, organizationId: string, updatedAt = new Date().toISOString()): Promise<FactoryProjection | null> {
-    const order = await this.getWorkOrder(workOrderId);
-    if (!order || order.organizationId !== organizationId) return null;
-    return this.refreshLifecycleProjection(workOrderId, organizationId, updatedAt);
+  async rebuildFactoryProjection(workOrderId: string, organizationId: string, updatedAt = new Date().toISOString()) {
+    return this.projectionStore.rebuildFactoryProjection(workOrderId, organizationId, updatedAt);
   }
 
-  async retryFactoryProjection(workOrderId: string, organizationId: string, updatedAt = new Date().toISOString()): Promise<FactoryProjection | null> {
-    return this.rebuildFactoryProjection(workOrderId, organizationId, updatedAt);
+  async retryFactoryProjection(workOrderId: string, organizationId: string, updatedAt = new Date().toISOString()) {
+    return this.projectionStore.retryFactoryProjection(workOrderId, organizationId, updatedAt);
   }
 
-  async recordVerification(input: { workOrderId: string; organizationId: string; actorId?: string; changeSetId?: string; changeSetDigest?: string; verificationRunId: string; verdict: "PASS" | "FAIL" | "UNKNOWN"; now: string }): Promise<FactoryProjection | null> {
-    const order = await this.getWorkOrder(input.workOrderId);
-    if (!order || order.organizationId !== input.organizationId) return null;
-    const current = await this.reconstructFactoryGraph(input.workOrderId, input.organizationId);
-    const changeSetId = input.changeSetId ?? current.currentChangeSetId ?? input.workOrderId;
-    const changeSetDigest = input.changeSetDigest ?? current.currentChangeSetDigest ?? order.definitionDigest;
-    await this.commandBoundary.dispatch({
-      organizationId: input.organizationId,
-      factoryId: order.factoryId,
-      workOrderId: input.workOrderId,
-      actorId: input.actorId ?? "deterministic-verifier",
-      actorType: "system",
-      idempotencyKey: `verification:${input.verificationRunId}:${changeSetDigest}`,
-      payload: { changeSetId, changeSetDigest, verificationRunId: input.verificationRunId, verdict: input.verdict },
-      now: input.now,
-      buildEvents: ({ commandId }) => [createVerificationRecordedEvent({ eventId: `verification_${input.workOrderId}_${commandId}`, aggregateId: input.workOrderId, aggregateType: "work_order", organizationId: input.organizationId, factoryId: order.factoryId, actorId: input.actorId ?? "deterministic-verifier", actorType: "system", occurredAt: input.now, correlationId: input.verificationRunId, policyVersion: order.policyVersion, workOrderId: input.workOrderId, changeSetId, changeSetDigest, verificationRunId: input.verificationRunId, verdict: input.verdict })],
-    });
-    return this.refreshLifecycleProjection(input.workOrderId, input.organizationId);
+  async recordVerification(input: { workOrderId: string; organizationId: string; actorId?: string; changeSetId?: string; changeSetDigest?: string; verificationRunId: string; verdict: "PASS" | "FAIL" | "UNKNOWN"; now: string }) {
+    return this.projectionStore.recordVerification(input);
   }
 
   async recordTypedDecision(input: { workOrderId: string; organizationId: string; actor: string; type: "review" | "release"; decision: "approved" | "rejected" | "changes_requested" | "hold"; now: string }): Promise<void> {
-    const order = await this.getWorkOrder(input.workOrderId);
-    if (!order || order.organizationId !== input.organizationId) return;
-    const current = await this.reconstructFactoryGraph(input.workOrderId, input.organizationId);
-    const changeSetId = current.currentChangeSetId ?? input.workOrderId;
-    const changeSetDigest = current.currentChangeSetDigest ?? order.definitionDigest;
-    if (input.type === "review") {
-      if (input.decision === "hold") throw new Error("invalid_review_decision");
-      const outcome = input.decision === "approved" ? "NO_FINDINGS" : input.decision === "changes_requested" ? "FINDINGS" : "ESCALATE";
-      await this.commandBoundary.dispatch({
-        organizationId: input.organizationId, factoryId: order.factoryId, workOrderId: input.workOrderId, actorId: input.actor, actorType: "human", idempotencyKey: `review:${changeSetDigest}:${input.decision}`, payload: { changeSetId, changeSetDigest, outcome }, now: input.now,
-        buildEvents: ({ commandId }) => [createReviewRecordedEvent({ eventId: `review_${input.workOrderId}_${commandId}`, aggregateId: input.workOrderId, aggregateType: "work_order", organizationId: input.organizationId, factoryId: order.factoryId, actorId: input.actor, actorType: "human", occurredAt: input.now, correlationId: input.workOrderId, policyVersion: order.policyVersion, workOrderId: input.workOrderId, changeSetId, changeSetDigest, reviewId: `review_${input.workOrderId}_${commandId}`, outcome, reviewerId: input.actor, independence: "SECOND_HUMAN" })],
-      });
-      await this.refreshLifecycleProjection(input.workOrderId, input.organizationId);
-      return;
-    }
-    if (input.decision === "changes_requested") throw new Error("invalid_release_decision");
-    const approvalOutcome = input.decision === "rejected" ? "DENIED" : "GRANTED";
-    const targetOutcome = input.decision === "hold" ? "HOLD" : "RELEASE";
-    await this.commandBoundary.dispatch({
-      organizationId: input.organizationId, factoryId: order.factoryId, workOrderId: input.workOrderId, actorId: input.actor, actorType: "human", idempotencyKey: `release:${changeSetDigest}:${input.decision}`, payload: { changeSetId, changeSetDigest, decision: input.decision, targetOutcome }, now: input.now,
-      buildEvents: ({ commandId }) => {
-        const approvalEventId = `approval_${input.workOrderId}_${commandId}`;
-        const approval = createApprovalRecordedEvent({ eventId: approvalEventId, aggregateId: input.workOrderId, aggregateType: "work_order", organizationId: input.organizationId, factoryId: order.factoryId, actorId: input.actor, actorType: "human", occurredAt: input.now, correlationId: input.workOrderId, policyVersion: order.policyVersion, workOrderId: input.workOrderId, changeSetId, changeSetDigest, scope: "RELEASE", outcome: approvalOutcome, targetOutcome, approverId: input.actor, rationale: input.decision });
-        if (approvalOutcome === "DENIED") return [approval];
-        return [approval, createReleaseDecisionEvent({ eventId: `release_decision_${input.workOrderId}_${commandId}`, aggregateId: input.workOrderId, aggregateType: "work_order", organizationId: input.organizationId, factoryId: order.factoryId, actorId: input.actor, actorType: "human", occurredAt: input.now, correlationId: input.workOrderId, policyVersion: order.policyVersion, workOrderId: input.workOrderId, releaseId: `release_${input.workOrderId}`, outcome: targetOutcome, approvalRef: { kind: "release_approval", eventId: asApprovalEventId(approvalEventId), scope: "RELEASE", targetOutcome, changeSetDigest }, changeSetId, changeSetDigest })];
-      },
-    });
-    await this.refreshLifecycleProjection(input.workOrderId, input.organizationId);
+    return this.projectionStore.recordTypedDecision(input);
   }
 
   async upsertWorkCell(cell: { cellId: string; factoryId: string; workOrderId?: string; kind: string; repository: string; branch: string; status: string; leasedBy?: string; heldBy?: string; credentialScope: string; cleanupAt: string; now: string; productionAccess?: string; observability?: string; allowedTools?: string[] }): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_work_cells (cell_id, factory_id, work_order_id, kind, repository, branch, status, leased_by, held_by, credential_scope, cleanup_at, created_at, updated_at, production_access, observability, allowed_tools_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14, ?15) ON CONFLICT(cell_id) DO UPDATE SET work_order_id = excluded.work_order_id, status = excluded.status, leased_by = excluded.leased_by, held_by = excluded.held_by, cleanup_at = excluded.cleanup_at, updated_at = excluded.updated_at, production_access = excluded.production_access, observability = excluded.observability, allowed_tools_json = excluded.allowed_tools_json").bind(cell.cellId, cell.factoryId, cell.workOrderId ?? null, cell.kind, cell.repository, cell.branch, cell.status, cell.leasedBy ?? null, cell.heldBy ?? null, cell.credentialScope, cell.cleanupAt, cell.now, cell.productionAccess ?? "denied", cell.observability ?? "read-only", JSON.stringify(cell.allowedTools ?? [])).run();
+    return this.operationsStore.upsertWorkCell(cell);
   }
 
   async listWorkCells(factoryId?: string): Promise<Array<Record<string, string | null>>> {
-    const statement = this.database.prepare("SELECT cell_id, factory_id, work_order_id, kind, repository, branch, status, leased_by, held_by, credential_scope, cleanup_at, created_at FROM tinkerbot_work_cells WHERE (?1 = '' OR factory_id = ?1) ORDER BY created_at DESC").bind(factoryId ?? "");
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<Record<string, string | null>>();
-    return result.results ?? [];
+    return this.operationsStore.listWorkCells(factoryId);
   }
 
   async listExpiredCells(now: string): Promise<Array<Record<string, string | null>>> {
-    const statement = this.database.prepare("SELECT cell_id, factory_id, work_order_id, kind, repository, branch, status, leased_by, held_by, credential_scope, cleanup_at, created_at FROM tinkerbot_work_cells WHERE cleanup_at <= ?1 AND status IN ('leased', 'held')").bind(now);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<Record<string, string | null>>();
-    return result.results ?? [];
+    return this.operationsStore.listExpiredCells(now);
   }
 
   async listProducts(organizationId: string): Promise<Array<Record<string, string | null>>> {
-    const statement = this.database.prepare("SELECT product_id, organization_id, factory_id, name, risk_class, updated_at FROM tinkerbot_products WHERE organization_id = ?1 ORDER BY updated_at DESC").bind(organizationId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<Record<string, string | null>>();
-    return result.results ?? [];
+    return this.operationsStore.listProducts(organizationId);
   }
 
   async upsertProduct(input: { productId: string; organizationId: string; factoryId?: string; name: string; riskClass?: string; now: string }): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_products (product_id, organization_id, factory_id, name, risk_class, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(product_id) DO UPDATE SET name = excluded.name, factory_id = excluded.factory_id, risk_class = excluded.risk_class, updated_at = excluded.updated_at").bind(input.productId, input.organizationId, input.factoryId ?? null, input.name, input.riskClass ?? "medium", input.now).run();
+    return this.operationsStore.upsertProduct(input);
   }
 
   async listSkills(factoryId: string): Promise<Array<Record<string, string | null>>> {
-    const statement = this.database.prepare("SELECT s.skill_id, s.factory_id, s.name, s.purpose, s.owner, v.version, v.rollout FROM tinkerbot_skills s LEFT JOIN tinkerbot_skill_versions v ON v.skill_id = s.skill_id WHERE s.factory_id = ?1 ORDER BY s.updated_at DESC").bind(factoryId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<Record<string, string | null>>();
-    return result.results ?? [];
+    return this.operationsStore.listSkills(factoryId);
   }
 
   async upsertSkill(input: { skillId: string; factoryId: string; name: string; purpose: string; owner: string; version: string; yaml: string; rollout: string; allowedTools: string[]; permissions: string[]; now: string }): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_skills (skill_id, factory_id, name, purpose, owner, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(skill_id) DO UPDATE SET name = excluded.name, purpose = excluded.purpose, owner = excluded.owner, updated_at = excluded.updated_at").bind(input.skillId, input.factoryId, input.name, input.purpose, input.owner, input.now).run();
-    await this.database.prepare("INSERT INTO tinkerbot_skill_versions (version_id, skill_id, version, yaml, rollout, allowed_tools_json, permission_scope_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(skill_id, version) DO UPDATE SET yaml = excluded.yaml, rollout = excluded.rollout").bind(crypto.randomUUID(), input.skillId, input.version, input.yaml, input.rollout, JSON.stringify(input.allowedTools), JSON.stringify(input.permissions), input.now).run();
+    return this.operationsStore.upsertSkill(input);
   }
 
   async listProposals(factoryId: string): Promise<Array<Record<string, unknown>>> {
-    const statement = this.database.prepare("SELECT proposal_id, factory_id, title, evidence_json, proposed_changes_json, expected_effect, kind, status, benchmark_json, human_approved, steward_actor, auto_merge, created_at FROM tinkerbot_improvement_proposals WHERE factory_id = ?1 ORDER BY created_at DESC").bind(factoryId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<Record<string, unknown>>();
-    return result.results ?? [];
+    return this.operationsStore.listProposals(factoryId);
   }
 
   async insertProposal(input: { proposalId: string; factoryId: string; title: string; evidence: string[]; proposedChanges: string[]; expectedEffect: string; kind: string; stewardActor?: string; now: string }): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_improvement_proposals (proposal_id, factory_id, title, evidence_json, proposed_changes_json, expected_effect, kind, status, benchmark_json, human_approved, steward_actor, auto_merge, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'draft', '[]', 0, ?8, 0, ?9, ?9)").bind(input.proposalId, input.factoryId, input.title, JSON.stringify(input.evidence), JSON.stringify(input.proposedChanges), input.expectedEffect, input.kind, input.stewardActor ?? null, input.now).run();
+    return this.operationsStore.insertProposal(input);
   }
 
   async approveProposal(proposalId: string, actor: string, now: string, organizationId?: string): Promise<{ ok: true } | { ok: false; reason: string }> {
-    const row = await this.database.prepare("SELECT proposal_id, factory_id, steward_actor, auto_merge, status FROM tinkerbot_improvement_proposals WHERE proposal_id = ?1").bind(proposalId).first<{ proposal_id: string; factory_id: string; steward_actor?: string | null; auto_merge: number; status: string }>();
-    if (!row) return { ok: false, reason: "not_found" };
-    if (organizationId) {
-      const factory = await this.getFactory(row.factory_id);
-      if (!factory || factory.organizationId !== organizationId) return { ok: false, reason: "not_found" };
-    }
-    if (row.auto_merge) return { ok: false, reason: "auto_merge_forbidden" };
-    if (row.steward_actor && row.steward_actor === actor) return { ok: false, reason: "steward_cannot_self_approve" };
-    await this.database.prepare("UPDATE tinkerbot_improvement_proposals SET human_approved = 1, status = 'approved', updated_at = ?1 WHERE proposal_id = ?2").bind(now, proposalId).run();
-    await this.database.prepare("INSERT INTO tinkerbot_human_decisions (decision_id, subject_id, actor, role, decision, reason, created_at) VALUES (?1, ?2, ?3, 'release-approver', 'approved', 'Activate factory improvement', ?4)").bind(crypto.randomUUID(), proposalId, actor, now).run();
-    return { ok: true };
+    return this.operationsStore.approveProposal(proposalId, actor, now, organizationId);
   }
 
   async insertReleaseCandidate(input: { releaseId: string; workOrderId: string; factoryId: string; commitSha: string; receiptIds: string[]; rollbackRefs: string[]; status: string; blocking: string[]; now: string }): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_release_candidates (release_id, work_order_id, factory_id, commit_sha, receipt_ids_json, rollback_refs_json, status, blocking_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)").bind(input.releaseId, input.workOrderId, input.factoryId, input.commitSha, JSON.stringify(input.receiptIds), JSON.stringify(input.rollbackRefs), input.status, JSON.stringify(input.blocking), input.now).run();
+    return this.operationsStore.insertReleaseCandidate(input);
   }
 
   async listReleaseCandidates(factoryId: string): Promise<Array<Record<string, unknown>>> {
-    const statement = this.database.prepare("SELECT release_id, work_order_id, commit_sha, status, blocking_json, created_at FROM tinkerbot_release_candidates WHERE factory_id = ?1 ORDER BY created_at DESC").bind(factoryId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<Record<string, unknown>>();
-    return result.results ?? [];
+    return this.operationsStore.listReleaseCandidates(factoryId);
   }
 
   async insertDeployment(input: { deploymentId: string; releaseId: string; environment: string; status: string; workflow?: string; now: string }): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_deployments (deployment_id, release_id, environment, status, workflow, executed_on_customer_cluster, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)").bind(input.deploymentId, input.releaseId, input.environment, input.status, input.workflow ?? null, input.now).run();
+    return this.operationsStore.insertDeployment(input);
   }
 
   async insertOutcome(input: { outcomeId: string; workOrderId?: string; releaseId?: string; kind: string; association: string; now: string }): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_outcomes (outcome_id, work_order_id, release_id, kind, association, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").bind(input.outcomeId, input.workOrderId ?? null, input.releaseId ?? null, input.kind, input.association, input.now).run();
+    return this.operationsStore.insertOutcome(input);
   }
 
   async insertFactoryCommand(command: import("../../../packages/factory/src").FactoryCommand): Promise<void> {
@@ -781,26 +483,19 @@ export class D1FactoryStore {
   }
 
   async putExecutionPlan(plan: import("../../../packages/factory/src/runtime").ExecutionPlan): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_execution_plans (plan_id, work_order_id, run_id, origin, profile_json, plan_json, selected_pipeline, escalation_reason, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(plan_id) DO UPDATE SET plan_json = excluded.plan_json, escalation_reason = excluded.escalation_reason").bind(plan.planId, plan.workOrderId ?? null, null, plan.origin, JSON.stringify(plan.profile), JSON.stringify(plan), plan.selectedPipeline, plan.escalationReason ?? null, plan.createdAt).run();
+    return this.artifactStore.putExecutionPlan(plan);
   }
 
   async getExecutionPlanForWorkOrder(workOrderId: string): Promise<import("../../../packages/factory/src/runtime").ExecutionPlan | null> {
-    const row = await this.database.prepare("SELECT plan_json FROM tinkerbot_execution_plans WHERE work_order_id = ?1 ORDER BY created_at DESC LIMIT 1").bind(workOrderId).first<{ plan_json?: string | null }>();
-    if (!row?.plan_json) return null;
-    try {
-      const plan = JSON.parse(row.plan_json) as import("../../../packages/factory/src/runtime").ExecutionPlan;
-      return plan && typeof plan === "object" && typeof plan.planId === "string" && plan.workOrderId === workOrderId ? plan : null;
-    } catch {
-      return null;
-    }
+    return this.artifactStore.getExecutionPlanForWorkOrder(workOrderId);
   }
 
   async putCostEstimate(planId: string, estimate: import("../../../packages/factory/src/runtime").CostEstimate): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_cost_estimates (plan_id, catalog_version, estimate_json, created_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(plan_id) DO UPDATE SET estimate_json = excluded.estimate_json").bind(planId, estimate.catalogVersion, JSON.stringify(estimate), new Date().toISOString()).run();
+    return this.artifactStore.putCostEstimate(planId, estimate);
   }
 
   async putCostActual(input: { planId: string; runId: string; usage: import("../../../packages/factory/src/runtime").ProviderUsage; now: string }): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_cost_actuals (actual_id, plan_id, run_id, stage, provider, model, input_tokens, output_tokens, cached_tokens, retries, latency_ms, managed, catalog_version, runner_origin, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)").bind(crypto.randomUUID(), input.planId, input.runId, input.usage.stage ?? null, input.usage.provider, input.usage.model, input.usage.inputTokens, input.usage.outputTokens, input.usage.cachedTokens, input.usage.retries, input.usage.latencyMs, input.usage.managed ? 1 : 0, input.usage.catalogVersion, input.usage.runnerOrigin, input.now).run();
+    return this.artifactStore.putCostActual(input);
   }
 
   async ingestLocalRuntimePayload(input: { organizationId: string; kind: string; payload: Record<string, unknown>; now: string }): Promise<{ accepted: true; organizationId: string; kind: string }> {
@@ -841,148 +536,63 @@ export class D1FactoryStore {
   }
 
   async putEvalSuite(suite: import("../../../packages/factory/src/evals").EvalSuite): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_eval_suites (suite_id, name, yaml, baseline_digest, created_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(suite_id) DO UPDATE SET baseline_digest = excluded.baseline_digest").bind(suite.suiteId, suite.name, JSON.stringify(suite), suite.baselineDigest ?? null, suite.createdAt).run();
+    return this.artifactStore.putEvalSuite(suite);
   }
 
   async insertEvalAttempt(attempt: import("../../../packages/factory/src/evals").EvalAttempt): Promise<void> {
-    await this.database.prepare("INSERT INTO tinkerbot_eval_attempts (attempt_id, suite_id, task_id, output, metrics_json, passed, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)").bind(attempt.attemptId, attempt.suiteId, attempt.taskId, attempt.output, JSON.stringify(attempt.metrics), attempt.passed ? 1 : 0, attempt.createdAt).run();
+    return this.artifactStore.insertEvalAttempt(attempt);
   }
 
   async listOutcomes(organizationId: string): Promise<Array<Record<string, unknown>>> {
-    const statement = this.database.prepare("SELECT o.outcome_id, o.work_order_id, o.release_id, o.kind, o.association, o.created_at FROM tinkerbot_outcomes o JOIN tinkerbot_work_orders w ON w.work_order_id = o.work_order_id WHERE w.organization_id = ?1 ORDER BY o.created_at DESC").bind(organizationId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<Record<string, unknown>>();
-    return result.results ?? [];
+    return this.operationsStore.listOutcomes(organizationId);
   }
 
-  private async persistFactoryEvent(event: FactoryEvent, options: { commandBoundary?: boolean } = {}): Promise<boolean> {
-    if (!options.commandBoundary && isFactoryCommandBoundaryEventType(event.type)) throw new Error("factory_command_boundary_required");
-    assertFactoryEventAuthority(event);
-    if (["release.decided", "release.executed", "release.rolled_back"].includes(event.type)) assertFactoryEventOrdering(event, await this.listFactoryEvents(event.aggregateId, event.organizationId));
-    if (containsRawCredentials({ payload: event.payload, externalReferences: event.externalReferences })) throw new Error("Factory graph events must not contain raw credentials.");
-    const result = await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, schema_version, policy_version, provenance, external_references_json, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)").bind(
-      event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.schemaVersion, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
-    ).run() as { meta?: { changes?: number } };
-    if (result.meta?.changes !== 0 && (event.aggregateSequence !== undefined || event.commandId || event.idempotencyKey || event.payloadFingerprint)) {
-      await this.database.prepare("UPDATE tinkerbot_factory_graph_events SET aggregate_sequence = ?1, command_id = ?2, idempotency_key = ?3, payload_fingerprint = ?4 WHERE event_id = ?5").bind(event.aggregateSequence ?? null, event.commandId ?? null, event.idempotencyKey ?? null, event.payloadFingerprint ?? null, event.eventId).run();
-    }
-    if (result.meta?.changes !== 0) await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_sync_outbox (event_id, kind, payload_json, created_at, synced_at) VALUES (?1, ?2, ?3, ?4, NULL)").bind(event.eventId, "factory-graph-event", JSON.stringify({ event }), event.occurredAt).run();
-    return result.meta?.changes !== 0;
+  async appendFactoryEvents(events: readonly FactoryEvent[], options: { commandBoundary?: boolean; admission?: WorkOrder } = {}): Promise<void> {
+    return this.graphStore.appendFactoryEvents(events, options);
   }
 
-  async appendFactoryEvents(events: readonly FactoryEvent[], options: { commandBoundary?: boolean } = {}): Promise<void> {
-    if (!events.length) return;
-    const priorByAggregate = new Map<string, FactoryEvent[]>();
-    for (const event of events) {
-      const prior = priorByAggregate.get(event.aggregateId) ?? await this.listFactoryEvents(event.aggregateId, event.organizationId);
-      if (!options.commandBoundary && isFactoryCommandBoundaryEventType(event.type)) throw new Error("factory_command_boundary_required");
-      assertFactoryEventAuthority(event);
-      if (containsRawCredentials({ payload: event.payload, externalReferences: event.externalReferences })) throw new Error("Factory graph events must not contain raw credentials.");
-      assertFactoryEventOrdering(event, prior);
-      priorByAggregate.set(event.aggregateId, [...prior, event]);
-    }
-    if (!this.database.batch) {
-      for (const event of events) await this.persistFactoryEvent(event, { commandBoundary: true });
-    } else {
-      const statements = events.flatMap((event) => [
-        this.database.prepare("INSERT OR IGNORE INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, schema_version, aggregate_sequence, command_id, idempotency_key, payload_fingerprint, policy_version, provenance, external_references_json, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)").bind(
-          event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.schemaVersion, event.aggregateSequence ?? null, event.commandId ?? null, event.idempotencyKey ?? null, event.payloadFingerprint ?? null, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
-        ),
-        this.database.prepare("INSERT OR IGNORE INTO tinkerbot_sync_outbox (event_id, kind, payload_json, created_at, synced_at) VALUES (?1, ?2, ?3, ?4, NULL)").bind(event.eventId, "factory-graph-event", JSON.stringify({ event }), event.occurredAt),
-      ]);
-      await this.database.batch(statements);
-    }
-    for (const aggregateId of new Set(events.map((event) => event.aggregateId))) {
-      const organizationId = events.find((event) => event.aggregateId === aggregateId)?.organizationId;
-      if (organizationId) await this.refreshLifecycleProjection(aggregateId, organizationId);
-    }
-  }
-
-  /**
-   * D1 batch persistence for the command boundary. The receipt is inserted
-   * first without IGNORE so a concurrent retry loses the batch atomically;
-   * graph events and the receipt therefore cannot diverge when D1 supports
-   * its transactional batch API.
-   */
-  async appendFactoryCommand(events: readonly FactoryEvent[], receipt: FactoryCommandReceipt): Promise<void> {
-    if (!events.length) throw new Error("factory_command_produced_no_events");
-    for (const event of events) {
-      assertFactoryEventAuthority(event);
-      if (containsRawCredentials({ payload: event.payload, externalReferences: event.externalReferences })) throw new Error("Factory graph events must not contain raw credentials.");
-    }
-    if (!this.database.batch) {
-      await this.appendFactoryEvents(events, { commandBoundary: true });
-      await this.putFactoryCommandReceipt(receipt);
-      return;
-    }
-    const receiptStatement = this.database.prepare("INSERT INTO tinkerbot_factory_command_receipts (organization_id, work_order_id, idempotency_key, payload_fingerprint, command_id, event_ids_json, result_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)").bind(
-      receipt.organizationId, receipt.workOrderId, receipt.idempotencyKey, receipt.payloadFingerprint, receipt.commandId, JSON.stringify(receipt.eventIds), receipt.resultJson ?? null, receipt.createdAt,
-    );
-    const eventStatements = events.flatMap((event) => [
-      this.database.prepare("INSERT INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, schema_version, aggregate_sequence, command_id, idempotency_key, payload_fingerprint, policy_version, provenance, external_references_json, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)").bind(
-        event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.schemaVersion, event.aggregateSequence ?? null, event.commandId ?? null, event.idempotencyKey ?? null, event.payloadFingerprint ?? null, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
-      ),
-      this.database.prepare("INSERT OR IGNORE INTO tinkerbot_sync_outbox (event_id, kind, payload_json, created_at, synced_at) VALUES (?1, ?2, ?3, ?4, NULL)").bind(event.eventId, "factory-graph-event", JSON.stringify({ event }), event.occurredAt),
-    ]);
-    await this.database.batch([receiptStatement, ...eventStatements]);
-    for (const aggregateId of new Set(events.map((event) => event.aggregateId))) {
-      const organizationId = events.find((event) => event.aggregateId === aggregateId)?.organizationId;
-      if (organizationId) await this.refreshLifecycleProjection(aggregateId, organizationId);
-    }
+  async appendFactoryCommand(events: readonly FactoryEvent[], receipt: FactoryCommandReceipt, options: { admission?: WorkOrder } = {}): Promise<void> {
+    return this.graphStore.appendFactoryCommand(events, receipt, options);
   }
 
   async getFactoryCommandReceipt(organizationId: string, workOrderId: string, idempotencyKey: string): Promise<FactoryCommandReceipt | null> {
-    const row = await this.database.prepare("SELECT organization_id, work_order_id, idempotency_key, payload_fingerprint, command_id, event_ids_json, result_json, created_at FROM tinkerbot_factory_command_receipts WHERE organization_id = ?1 AND work_order_id = ?2 AND idempotency_key = ?3").bind(organizationId, workOrderId, idempotencyKey).first<Record<string, unknown>>();
-    if (!row) return null;
-    let eventIds: string[] = [];
-    try { const parsed = JSON.parse(String(row.event_ids_json)); if (Array.isArray(parsed)) eventIds = parsed.filter((item): item is string => typeof item === "string"); } catch { /* malformed receipt is treated as absent and will be rebuilt from events */ }
-    return { organizationId: String(row.organization_id), workOrderId: String(row.work_order_id), idempotencyKey: String(row.idempotency_key), payloadFingerprint: String(row.payload_fingerprint), commandId: String(row.command_id), eventIds, resultJson: row.result_json ? String(row.result_json) : undefined, createdAt: String(row.created_at) };
+    return this.graphStore.getFactoryCommandReceipt(organizationId, workOrderId, idempotencyKey);
   }
 
   async putFactoryCommandReceipt(receipt: FactoryCommandReceipt): Promise<void> {
-    const existing = await this.getFactoryCommandReceipt(receipt.organizationId, receipt.workOrderId, receipt.idempotencyKey);
-    if (existing && existing.payloadFingerprint !== receipt.payloadFingerprint) throw new Error("idempotency_conflict");
-    await this.database.prepare("INSERT OR IGNORE INTO tinkerbot_factory_command_receipts (organization_id, work_order_id, idempotency_key, payload_fingerprint, command_id, event_ids_json, result_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)").bind(receipt.organizationId, receipt.workOrderId, receipt.idempotencyKey, receipt.payloadFingerprint, receipt.commandId, JSON.stringify(receipt.eventIds), receipt.resultJson ?? null, receipt.createdAt).run();
+    return this.graphStore.putFactoryCommandReceipt(receipt);
   }
 
   async dispatchFactoryCommand<T>(input: FactoryCommandInput<T>): Promise<FactoryCommandResult> {
     return this.commandBoundary.dispatch(input);
   }
 
-  async appendFactoryEvent(event: FactoryEvent, options: { commandBoundary?: boolean } = {}): Promise<void> {
-    const inserted = await this.persistFactoryEvent(event, options);
-    if (inserted && event.aggregateType === "work_order") await this.refreshLifecycleProjection(event.aggregateId, event.organizationId);
+  async appendFactoryEvent(event: FactoryEvent, options: { commandBoundary?: boolean; admission?: WorkOrder } = {}): Promise<void> {
+    return this.graphStore.appendFactoryEvent(event, options);
   }
 
-  /** Insert an event and report whether this request won the idempotency race. */
   async appendFactoryEventOnce(event: FactoryEvent): Promise<boolean> {
-    const inserted = await this.persistFactoryEvent(event);
-    if (inserted && event.aggregateType === "work_order") await this.refreshLifecycleProjection(event.aggregateId, event.organizationId);
-    return inserted;
+    return this.graphStore.appendFactoryEventOnce(event);
   }
 
   async listFactoryEvents(aggregateId: string, organizationId?: string): Promise<FactoryEvent[]> {
-    const statement = organizationId
-      ? this.database.prepare("SELECT * FROM tinkerbot_factory_graph_events WHERE aggregate_id = ?1 AND organization_id = ?2 ORDER BY COALESCE(aggregate_sequence, 9223372036854775807), occurred_at, event_id").bind(aggregateId, organizationId)
-      : this.database.prepare("SELECT * FROM tinkerbot_factory_graph_events WHERE aggregate_id = ?1 ORDER BY COALESCE(aggregate_sequence, 9223372036854775807), occurred_at, event_id").bind(aggregateId);
-    if (typeof statement.all !== "function") return [];
-    const result = await statement.all<Record<string, unknown>>();
-    return (result.results ?? []).map((row) => ({ eventId: String(row.event_id), aggregateId: String(row.aggregate_id), aggregateType: String(row.aggregate_type), organizationId: String(row.organization_id), factoryId: String(row.factory_id), type: String(row.event_type) as FactoryEvent["type"], actorId: String(row.actor_id), actorType: String(row.actor_type) as FactoryEvent["actorType"], occurredAt: String(row.occurred_at), correlationId: String(row.correlation_id), causationId: row.causation_id ? String(row.causation_id) : undefined, aggregateSequence: row.aggregate_sequence === null || row.aggregate_sequence === undefined ? undefined : Number(row.aggregate_sequence), commandId: row.command_id ? String(row.command_id) : undefined, idempotencyKey: row.idempotency_key ? String(row.idempotency_key) : undefined, payloadFingerprint: row.payload_fingerprint ? String(row.payload_fingerprint) : undefined, schemaVersion: Number(row.schema_version ?? 1) as 1, policyVersion: row.policy_version ? String(row.policy_version) : undefined, provenance: String(row.provenance) as FactoryEvent["provenance"], externalReferences: row.external_references_json ? JSON.parse(String(row.external_references_json)) : undefined, payload: JSON.parse(String(row.payload_json)) })).sort((left, right) => (left.aggregateSequence !== undefined && right.aggregateSequence !== undefined && left.aggregateSequence !== right.aggregateSequence ? left.aggregateSequence - right.aggregateSequence : left.occurredAt.localeCompare(right.occurredAt) || left.eventId.localeCompare(right.eventId)));
+    return this.graphStore.listFactoryEvents(aggregateId, organizationId);
   }
 
   async reconstructFactoryGraph(aggregateId: string, organizationId: string): Promise<FactoryProjection> {
-    return projectFactoryEvents(await this.listFactoryEvents(aggregateId, organizationId));
+    return this.graphStore.reconstructFactoryGraph(aggregateId, organizationId);
   }
 
-  async shadowReadWorkOrder(workOrderId: string, organizationId: string): Promise<ReturnType<typeof shadowReadFactoryProjection> | null> {
-    const order = await this.getWorkOrder(workOrderId);
-    if (!order || order.organizationId !== organizationId) return null;
-    const projection = await this.reconstructFactoryGraph(workOrderId, organizationId);
-    return shadowReadFactoryProjection(projection, { verificationVerdict: order.verificationVerdict, reviewAssessment: order.reviewAssessment, releaseDecision: order.releaseDecision });
+  async shadowReadWorkOrder(workOrderId: string, organizationId: string, checkedAt = new Date().toISOString()) {
+    return this.projectionStore.shadowReadWorkOrder(workOrderId, organizationId, checkedAt);
   }
 
-  async listFactoryAuditEvents(workOrderId: string, organizationId: string): Promise<ReturnType<typeof projectFactoryAuditEvents>> {
-    return projectFactoryAuditEvents(await this.listFactoryEvents(workOrderId, organizationId));
+  async shadowReadOrganization(organizationId: string, options: { limit?: number; checkedAt?: string } = {}): Promise<FactoryShadowReadSummary> {
+    return this.projectionStore.shadowReadOrganization(organizationId, options);
+  }
+
+  async listFactoryAuditEvents(workOrderId: string, organizationId: string) {
+    return this.projectionStore.listFactoryAuditEvents(workOrderId, organizationId);
   }
 }
 

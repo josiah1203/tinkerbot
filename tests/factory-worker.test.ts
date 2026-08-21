@@ -159,7 +159,7 @@ function memoryFactoryDb(seed: {
             decisions.push({ decision_id: args[0], work_order_id: args[1], subject_id: args[2], actor: args[3], decision: args[4] ?? args[5], reason: args[5] ?? args[6] });
             return { meta: { changes: 1 } };
           }
-          if (query.startsWith("INSERT INTO tinkerbot_work_orders")) {
+          if (query.startsWith("INSERT INTO tinkerbot_work_orders") || query.startsWith("INSERT OR IGNORE INTO tinkerbot_work_orders")) {
             workOrders.set(String(args[0]), {
               work_order_id: args[0], factory_id: args[1], organization_id: args[2], source_type: args[3], source_id: args[4], repository_id: args[5],
               issue_or_pull_request: args[6], intent: args[7], acceptance_criteria: args[8], policy_version: args[9], definition_version: args[10],
@@ -593,8 +593,46 @@ test("scheduled sweep marks expired work cells abandoned", async () => {
   const result = await sweepFactoryOs({ DB: database });
   expect(result.abandonedCells).toBe(1);
   expect(database._state.cells[0]?.status).toBe("abandoned");
-  await worker.scheduled({ cron: "0 * * * *" }, { DB: database });
+  const logs: string[] = [];
+  const originalLog = console.log;
+  console.log = (...args: unknown[]) => logs.push(args.map(String).join(" "));
+  try {
+    await worker.scheduled({ cron: "0 * * * *" }, { DB: database, FACTORY_SHADOW_READ_ORGANIZATION_ID: "org_1", FACTORY_TELEMETRY_RETENTION_DAYS: "30" });
+  } finally {
+    console.log = originalLog;
+  }
+  expect(logs.some((line) => line.includes("factory_projection_shadow_read"))).toBe(true);
+  expect(logs.some((line) => line.includes('"signal":"telemetry_retention"') && line.includes('"outcome":"completed"'))).toBe(true);
   expect(database._state.cells[0]?.status).toBe("abandoned");
+});
+
+test("hosted projection shadow reads are bounded, read-only, and divergence-visible", async () => {
+  const database = memoryFactoryDb({ workOrders: [{
+    work_order_id: "wo_shadow",
+    factory_id: "fac_1",
+    organization_id: "org_1",
+    source_type: "manual",
+    source_id: "shadow",
+    repository_id: "acme/payments",
+    policy_version: "default",
+    definition_version: "1",
+    definition_digest: "sha256:shadow",
+    current_stage: "intake",
+    status: "intake",
+    actor: "operator",
+    created_at: "2030-01-01T00:00:00.000Z",
+    updated_at: "2030-01-01T00:00:00.000Z",
+    verification_verdict: "UNKNOWN",
+    review_assessment: "NEEDS_HUMAN_REVIEW",
+    release_decision: "BLOCKED",
+  }] });
+  const store = new D1FactoryStore(database);
+  await expect(store.shadowReadOrganization("org_1", { limit: 1, checkedAt: "2030-01-02T00:00:00.000Z" })).resolves.toMatchObject({ status: "clean", checked: 1, skipped: 0, divergences: [] });
+  const shadowOrder = database._state.workOrders.get("wo_shadow");
+  expect(shadowOrder).toBeDefined();
+  shadowOrder!.verification_verdict = "PASS";
+  await expect(store.shadowReadOrganization("org_1", { limit: 1, checkedAt: "2030-01-02T00:00:00.000Z" })).resolves.toMatchObject({ status: "diverged", divergentWorkOrders: 1, divergences: [{ workOrderId: "wo_shadow", divergence: "verification_verdict:PASS!=UNKNOWN" }] });
+  expect(shadowOrder!.verification_verdict).toBe("PASS");
 });
 
 test("control-tower work orders expose group, take/return write human decisions, and evolution rejects steward self-approve and auto-merge", async () => {
@@ -799,6 +837,26 @@ agents:
   const wrongBranchResponse = await worker.fetch(new Request("https://control.example/self-hosted/complete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(wrongBranch) }), { DB: database, SELF_HOSTED_WORK_SECRET: "self-hosted-test-secret" });
   expect(wrongBranchResponse.status).toBe(409);
   expect(await wrongBranchResponse.json()).toMatchObject({ code: "branch_scope_mismatch" });
+});
+
+test("runFactoryTurn fails closed when the hosted Sandbox executor is unavailable", async () => {
+  const database = factorySeed();
+  const result = await runFactoryTurn({ DB: database, SESSION_ENCRYPTION_KEY: "factory-dev-key" }, {
+    deliveryId: "sandbox-unavailable",
+    organizationId: "org_1",
+    factoryId: "fac_1",
+    repository: "acme/payments",
+    sourceType: "github_issue",
+    sourceId: "sandbox-unavailable",
+    issueOrPullRequest: "implement refunds",
+    actor: "factory-agent",
+    specApproved: true,
+  });
+  expect(result).toMatchObject({ terminal: "blocked", wait: "sandbox", code: "executor_unavailable", executor: "cloudflare_sandbox", reason: "cloudflare_sandbox_unsupported" });
+  const order = await new D1FactoryStore(database).getWorkOrderForOrganization(result.workOrderId, "org_1");
+  expect(order?.status).toBe("blocked");
+  const events = await new D1FactoryStore(database).listFactoryEvents(result.workOrderId, "org_1");
+  expect(events.some((event) => event.type === "task.blocked" && (event.payload as { reason?: string }).reason === "cloudflare_sandbox_unsupported")).toBe(true);
 });
 
 test("runFactoryTurn can bridge self-hosted work to an external HTTPS worker endpoint", async () => {

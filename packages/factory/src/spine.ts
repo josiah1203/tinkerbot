@@ -7,6 +7,8 @@ import {
   type FactoryEvent,
   type FactoryProjection,
 } from "./graph";
+import type { WorkOrder } from "./index";
+import type { FactoryCommandTelemetry, FactoryCommandTelemetrySink } from "./telemetry";
 
 /** Stable JSON used for idempotency and definition-independent command identity. */
 export function canonicalCommandJson(value: unknown): string {
@@ -33,10 +35,10 @@ export interface FactoryCommandReceipt {
 
 export interface FactoryCommandStore {
   listFactoryEvents(aggregateId: string, organizationId?: string): Promise<FactoryEvent[]>;
-  appendFactoryEvent(event: FactoryEvent, options?: { commandBoundary?: boolean }): Promise<void>;
-  appendFactoryEvents?(events: readonly FactoryEvent[], options?: { commandBoundary?: boolean }): Promise<void>;
+  appendFactoryEvent(event: FactoryEvent, options?: { commandBoundary?: boolean; admission?: WorkOrder }): Promise<void>;
+  appendFactoryEvents?(events: readonly FactoryEvent[], options?: { commandBoundary?: boolean; admission?: WorkOrder }): Promise<void>;
   /** Persist the event batch and its receipt as one adapter-level unit when supported. */
-  appendFactoryCommand?(events: readonly FactoryEvent[], receipt: FactoryCommandReceipt): Promise<void>;
+  appendFactoryCommand?(events: readonly FactoryEvent[], receipt: FactoryCommandReceipt, options?: { admission?: WorkOrder }): Promise<void>;
   getFactoryCommandReceipt?(organizationId: string, workOrderId: string, idempotencyKey: string): Promise<FactoryCommandReceipt | null>;
   putFactoryCommandReceipt?(receipt: FactoryCommandReceipt): Promise<void>;
 }
@@ -50,6 +52,8 @@ export interface FactoryCommandInput<T = unknown> {
   commandId?: string;
   idempotencyKey: string;
   payload: T;
+  /** Full WorkOrder metadata used only by the atomic admission adapter hook. */
+  admission?: WorkOrder;
   now?: string;
   /** Build canonical events from the ordered aggregate history. */
   buildEvents: (input: { priorEvents: readonly FactoryEvent[]; nextSequence: number; commandId: string; payloadFingerprint: string }) => FactoryEvent[];
@@ -155,8 +159,42 @@ export function validateReleaseApprovalReference(event: FactoryEvent, priorEvent
 export class FactoryCommandBoundary {
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly receipts = new Map<string, FactoryCommandReceipt>();
+  readonly telemetry: FactoryCommandTelemetry[] = [];
 
-  constructor(private readonly store: FactoryCommandStore) {}
+  constructor(private readonly store: FactoryCommandStore, private telemetrySink?: FactoryCommandTelemetrySink) {}
+
+  /** Attach an adapter-local sink after construction (for example, SQLite
+   * cannot open its database until after the base store constructor returns). */
+  setTelemetrySink(sink: FactoryCommandTelemetrySink | undefined): void {
+    this.telemetrySink = sink;
+  }
+
+  private pushTelemetry(telemetry: FactoryCommandTelemetry): void {
+    if (this.telemetry.length >= 1_000) this.telemetry.shift();
+    this.telemetry.push(telemetry);
+  }
+
+  recordTelemetry(telemetry: FactoryCommandTelemetry): void {
+    this.pushTelemetry(telemetry);
+    if (!this.telemetrySink) return;
+    try {
+      void Promise.resolve(this.telemetrySink(telemetry)).catch(() => {
+        // Observability must never change command authority or retry semantics.
+      });
+    } catch {
+      // A synchronous adapter sink is also non-authoritative.
+    }
+  }
+
+  private async emitTelemetry(telemetry: FactoryCommandTelemetry): Promise<void> {
+    this.pushTelemetry(telemetry);
+    if (!this.telemetrySink) return;
+    try {
+      await this.telemetrySink(telemetry);
+    } catch {
+      // Observability must never change command authority or retry semantics.
+    }
+  }
 
   async dispatch<T>(input: FactoryCommandInput<T>): Promise<FactoryCommandResult> {
     if (!input.organizationId || !input.factoryId || !input.workOrderId || !input.idempotencyKey) throw new Error("invalid_factory_command_identity");
@@ -168,6 +206,9 @@ export class FactoryCommandBoundary {
     const current = new Promise<void>((resolve) => { release = resolve; });
     const queued = prior.then(() => current);
     this.locks.set(lockKey, queued);
+    const startedAt = Date.now();
+    let observedEvents: readonly FactoryEvent[] = [];
+    const recordTelemetry = async (telemetry: Omit<FactoryCommandTelemetry, "durationMs">): Promise<void> => this.emitTelemetry({ ...telemetry, durationMs: Math.max(0, Date.now() - startedAt) });
     await prior;
     try {
       const receiptKey = `${input.organizationId}:${input.workOrderId}:${input.idempotencyKey}`;
@@ -176,16 +217,20 @@ export class FactoryCommandBoundary {
       if (known) {
         if (known.payloadFingerprint !== payloadFingerprint) throw new Error("idempotency_conflict");
         const events = await this.store.listFactoryEvents(input.workOrderId, input.organizationId);
+        observedEvents = events;
+        await recordTelemetry({ kind: "factory_command", commandId: known.commandId, organizationId: input.organizationId, factoryId: input.factoryId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, correlationId: events[0]?.correlationId ?? input.workOrderId, outcome: "replayed", eventCount: known.eventIds.length, projectionEventCount: events.length, projectionStatus: "available", aggregateSequence: events.at(-1)?.aggregateSequence });
         return { replayed: true, commandId: known.commandId, payloadFingerprint, eventIds: known.eventIds, events: events.filter((event) => known.eventIds.includes(event.eventId)), projection: projectFactoryEvents(events) };
       }
 
       const priorEvents = await this.store.listFactoryEvents(input.workOrderId, input.organizationId);
+      observedEvents = priorEvents;
       const matchingEvents = priorEvents.filter((event) => event.idempotencyKey === input.idempotencyKey);
       if (matchingEvents.length) {
         if (matchingEvents.some((event) => event.payloadFingerprint !== payloadFingerprint)) throw new Error("idempotency_conflict");
         const recovered: FactoryCommandReceipt = { organizationId: input.organizationId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, commandId: matchingEvents[0]!.commandId ?? commandId, eventIds: matchingEvents.map((event) => event.eventId), createdAt: input.now ?? new Date().toISOString() };
         this.receipts.set(receiptKey, recovered);
         await this.store.putFactoryCommandReceipt?.(recovered);
+        await recordTelemetry({ kind: "factory_command", commandId: recovered.commandId, organizationId: input.organizationId, factoryId: input.factoryId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, correlationId: matchingEvents[0]?.correlationId ?? input.workOrderId, outcome: "replayed", eventCount: matchingEvents.length, projectionEventCount: priorEvents.length, projectionStatus: "available", aggregateSequence: priorEvents.at(-1)?.aggregateSequence });
         return { replayed: true, commandId: recovered.commandId, payloadFingerprint, eventIds: recovered.eventIds, events: matchingEvents, projection: projectFactoryEvents(priorEvents) };
       }
 
@@ -202,15 +247,21 @@ export class FactoryCommandBoundary {
         events.push(event);
       }
       const receipt: FactoryCommandReceipt = { organizationId: input.organizationId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, commandId, eventIds: events.map((event) => event.eventId), resultJson: JSON.stringify({ eventIds: events.map((event) => event.eventId) }), createdAt: input.now ?? new Date().toISOString() };
-      if (this.store.appendFactoryCommand) await this.store.appendFactoryCommand(events, receipt);
+      if (input.admission && (input.admission.workOrderId !== input.workOrderId || input.admission.organizationId !== input.organizationId || input.admission.factoryId !== input.factoryId)) throw new Error("factory_admission_scope_mismatch");
+      if (this.store.appendFactoryCommand) await this.store.appendFactoryCommand(events, receipt, { admission: input.admission });
       else {
-        if (this.store.appendFactoryEvents) await this.store.appendFactoryEvents(events, { commandBoundary: true });
+        if (this.store.appendFactoryEvents) await this.store.appendFactoryEvents(events, { commandBoundary: true, admission: input.admission });
         else for (const event of events) await this.store.appendFactoryEvent(event, { commandBoundary: true });
         await this.store.putFactoryCommandReceipt?.(receipt);
       }
       this.receipts.set(receiptKey, receipt);
       const allEvents = [...priorEvents, ...events];
+      observedEvents = allEvents;
+      await recordTelemetry({ kind: "factory_command", commandId, organizationId: input.organizationId, factoryId: input.factoryId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, correlationId: events[0]?.correlationId ?? input.workOrderId, outcome: "committed", eventCount: events.length, projectionEventCount: allEvents.length, projectionStatus: "available", aggregateSequence: events.at(-1)?.aggregateSequence });
       return { replayed: false, commandId, payloadFingerprint, eventIds: receipt.eventIds, events, projection: projectFactoryEvents(allEvents) };
+    } catch (error) {
+      await recordTelemetry({ kind: "factory_command", commandId, organizationId: input.organizationId, factoryId: input.factoryId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, correlationId: observedEvents[0]?.correlationId ?? input.workOrderId, outcome: "failed", eventCount: 0, projectionEventCount: observedEvents.length, projectionStatus: "unavailable", aggregateSequence: observedEvents.at(-1)?.aggregateSequence, errorCode: error instanceof Error ? error.message : "factory_command_failed" });
+      throw error;
     } finally {
       release();
       if (this.locks.get(lockKey) === queued) this.locks.delete(lockKey);

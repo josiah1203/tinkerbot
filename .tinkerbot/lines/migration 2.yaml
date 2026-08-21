@@ -1,6 +1,0 @@
-id: migration
-stages: [foreman, triage, specification, architecture, implementation, review, verification, release]
-agents: [foreman, architect, specification, implementer, reviewer, verification]
-autonomy: restricted
-requiredEvidence: [verification-receipt, rollback]
-approvalRoles: [admin, owner]

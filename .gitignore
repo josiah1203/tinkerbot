@@ -1,10 +1,16 @@
 node_modules/
 dist/
 /coverage/
+
+# Local proof output is intentionally retained only as bounded evidence files.
 .pr-proof/*
 !.pr-proof/
 !.pr-proof/baseline.json
 !.pr-proof/history.jsonl
+
+# Factory-as-code is source. Only the documented source tree is re-included;
+# generated runs, receipts, caches, artifacts, and imported worktrees remain
+# ignored unless a reviewed rule explicitly promotes them to source.
 .tinkerbot/*
 !.tinkerbot/
 !.tinkerbot/config.yml
@@ -30,22 +36,17 @@ dist/
 !.tinkerbot/skills/**
 !.tinkerbot/evals/
 !.tinkerbot/evals/**
-!.tinkerbot/product.yaml
-!.tinkerbot/autonomy.yaml
-!.tinkerbot/evolution.yaml
 !.tinkerbot/change-contract.yml
-!.tinkerbot/agents/
-!.tinkerbot/agents/**
-!.tinkerbot/automations/
-!.tinkerbot/automations/**
-!.tinkerbot/runners/
-!.tinkerbot/runners/**
-!.tinkerbot/lines/
-!.tinkerbot/lines/**
-!.tinkerbot/skills/
-!.tinkerbot/skills/**
-!.tinkerbot/evals/
-!.tinkerbot/evals/**
+
+# Never import managed worktree state or local execution output into the
+# source tree by accident.
+.tinkerbot/cache/
+.tinkerbot/runs/
+.tinkerbot/receipts/
+.tinkerbot/artifacts/
+.tinkerbot/worktrees/
+.worktrees/
+
 .DS_Store
 *.log
 *.tsbuildinfo

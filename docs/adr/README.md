@@ -12,3 +12,4 @@
 - [0008 Portable personal evals](./0008-portable-evals.md)
 - [0009 Factory authority planes](./0009-factory-authority-planes.md)
 - [0010 Durable Factory Spine before differentiation](./0010-durable-factory-spine.md)
+- [0011 Hosted production closure and differentiation sequencing](./0011-hosted-production-closure-and-differentiation-sequencing.md)

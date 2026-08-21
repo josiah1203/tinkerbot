@@ -2,11 +2,13 @@ import type { AftercareRecord, FactoryCommand } from "./authority";
 import type { WorkOrder, WorkOrderEvent, WorkOrderState } from "./index";
 import type { CostEstimate, ExecutionPlan, ProviderUsage } from "./runtime";
 import type { EvalAttempt, EvalSuite } from "./evals";
-import { assertFactoryEventAuthority, assertFactoryEventOrdering, isFactoryCommandBoundaryEventType, graphEventForWorkOrderTransition, projectFactoryEvents, type FactoryEvent, type FactoryProjection } from "./graph";
+import { assertFactoryEventAuthority, assertFactoryEventOrdering, createWorkOrderCreatedEvent, isFactoryCommandBoundaryEventType, graphEventForWorkOrderTransition, projectFactoryEvents, type FactoryEvent, type FactoryProjection } from "./graph";
 import { FactoryCommandBoundary, type FactoryCommandInput, type FactoryCommandReceipt, type FactoryCommandResult } from "./spine";
 
 export interface FactoryStore {
-  insertWorkOrder(order: WorkOrder): Promise<void>;
+  /** Test/migration fixture insertion. Production admission uses admitWorkOrder. */
+  seedWorkOrder(order: WorkOrder): Promise<void>;
+  admitWorkOrder(order: WorkOrder): Promise<FactoryCommandResult>;
   getWorkOrder(workOrderId: string): Promise<WorkOrder | null>;
   listWorkOrders(organizationId: string): Promise<WorkOrder[]>;
   applyTransition(workOrderId: string, toState: WorkOrderState, causeId: string, actor: string, now?: string): Promise<{ ok: true; order: WorkOrder; event?: WorkOrderEvent } | { ok: false; code: "not_found" | "invalid_transition" | "idempotent" }>;
@@ -91,8 +93,38 @@ export class MemoryFactoryStore implements FactoryStore {
   readonly commandReceipts = new Map<string, FactoryCommandReceipt>();
   readonly commandBoundary = new FactoryCommandBoundary(this);
 
-  async insertWorkOrder(order: WorkOrder): Promise<void> {
+  async seedWorkOrder(order: WorkOrder): Promise<void> {
     this.orders.set(order.workOrderId, order);
+  }
+
+  /** @deprecated Test/migration compatibility only. Use admitWorkOrder in application paths. */
+  async insertWorkOrder(order: WorkOrder): Promise<void> {
+    return this.seedWorkOrder(order);
+  }
+
+  async admitWorkOrder(order: WorkOrder): Promise<FactoryCommandResult> {
+    const prior = this.orders.get(order.workOrderId);
+    this.orders.set(order.workOrderId, order);
+    const actorType: FactoryEvent["actorType"] = order.sourceType === "manual" ? "human" : order.sourceType.startsWith("github") || order.sourceType.startsWith("gitlab") ? "integration" : "system";
+    const event = createWorkOrderCreatedEvent(order, actorType);
+    try {
+      return await this.commandBoundary.dispatch({
+        organizationId: order.organizationId,
+        factoryId: order.factoryId,
+        workOrderId: order.workOrderId,
+        actorId: order.actor,
+        actorType,
+        idempotencyKey: `admission:${order.workOrderId}`,
+        payload: { kind: "work_order_admission", order },
+        admission: order,
+        now: order.createdAt,
+        buildEvents: () => [event],
+      });
+    } catch (error) {
+      if (prior) this.orders.set(order.workOrderId, prior);
+      else this.orders.delete(order.workOrderId);
+      throw error;
+    }
   }
 
   async getWorkOrder(workOrderId: string): Promise<WorkOrder | null> {
@@ -204,7 +236,7 @@ export class MemoryFactoryStore implements FactoryStore {
     if (event) event.syncedAt = now;
   }
 
-  async appendFactoryEvent(event: FactoryEvent, options: { commandBoundary?: boolean } = {}): Promise<void> {
+  async appendFactoryEvent(event: FactoryEvent, options: { commandBoundary?: boolean; admission?: WorkOrder } = {}): Promise<void> {
     if (!options.commandBoundary && isFactoryCommandBoundaryEventType(event.type)) throw new Error("factory_command_boundary_required");
     assertFactoryEventAuthority(event);
     assertFactoryEventOrdering(event, this.factoryEvents.filter((item) => item.aggregateId === event.aggregateId));
@@ -217,7 +249,7 @@ export class MemoryFactoryStore implements FactoryStore {
     }
   }
 
-  async appendFactoryEvents(events: readonly FactoryEvent[], options: { commandBoundary?: boolean } = {}): Promise<void> {
+  async appendFactoryEvents(events: readonly FactoryEvent[], options: { commandBoundary?: boolean; admission?: WorkOrder } = {}): Promise<void> {
     const pending: FactoryEvent[] = [];
     const ids = new Set(this.factoryEvents.map((event) => event.eventId));
     for (const event of events) {

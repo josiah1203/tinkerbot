@@ -1,6 +1,0 @@
-id: refactor
-stages: [foreman, triage, specification, architecture, implementation, review, verification, release]
-agents: [foreman, architect, specification, implementer, reviewer, verification]
-autonomy: approval_gated
-requiredEvidence: [verification-receipt, architecture]
-approvalRoles: [maintainer, admin, owner]

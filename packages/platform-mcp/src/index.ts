@@ -23,7 +23,7 @@ import {
   localOutcomePayload,
   localWorkApprovalPayload,
   localWorkNewPayload,
-} from "../../cli/src/factory-os";
+} from "../../local-runtime/src/factory-operations";
 
 /** MCP protocol version spoken by the local platform server. */
 export const PLATFORM_MCP_PROTOCOL_VERSION = "2025-06-18";

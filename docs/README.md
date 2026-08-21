@@ -13,7 +13,8 @@ This directory distinguishes the current hosted-product contract from historical
 - [Billing](./billing.md), [authentication](./authentication.md), [security](./security.md), and [Cloudflare runtime](./cloudflare.md): hosted control-plane contracts.
 - [Distribution](./distribution.md): Bun, npm, Homebrew, and curl release artifacts.
 - [Release runbook](./release-runbook.md), [release readiness](./release-readiness.md), and [hosted provisioning](./hosted-provisioning.md): authorized-release gates and operator checklist.
-- [ADRs](./adr/README.md): binding architecture decisions.
+- [Branch/source inventory](./repo-hygiene/branch-source-inventory.md): canonical `main`, parallel refs, worktrees, and reconciliation policy.
+- [ADRs](./adr/README.md): binding architecture decisions, including [ADR-0011 hosted production closure and differentiation sequencing](./adr/0011-hosted-production-closure-and-differentiation-sequencing.md).
 
 ## Historical records
 

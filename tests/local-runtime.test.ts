@@ -4,6 +4,9 @@ import {
   compareEvalAttempts,
   executeFactoryRun,
   hostedRuntimeDefaults,
+  normalizeInferenceProvider,
+  normalizeRunnerKind,
+  runtimeCapabilityDecision,
   mayUseInlineSelfReview,
   MemoryFactoryStore,
   parseEvalSuite,
@@ -51,6 +54,19 @@ describe("runtime contracts", () => {
     expect(validateFactoryDefinition(hostedExternal).some((error) => /self_hosted|local control plane/.test(error))).toBe(true);
     expect(() => parseFactoryDefinition(`schemaVersion: v1alpha2\nname: pay\nrepositories: [acme/pay]\nruntime:\n  controlPlane: hosted\n  runner:\n    type: docker\n`)).toThrow(/Hosted control planes cannot run/);
     expect(() => parseFactoryDefinition(`schemaVersion: v1alpha2\nname: pay\nrepositories: [acme/pay]\nharnesses:\n  default:\n    command: evil\n`)).toThrow(/cannot be redefined/);
+  });
+
+  test("runtime identifiers normalize to one capability vocabulary", () => {
+    expect(normalizeRunnerKind("github-actions", "docker")).toBe("github_actions");
+    expect(normalizeRunnerKind("self-hosted", "docker")).toBe("self_hosted");
+    expect(normalizeInferenceProvider("Cloudflare Workers AI")).toBe("workers-ai");
+    expect(normalizeInferenceProvider("claude")).toBe("anthropic");
+    expect(() => normalizeInferenceProvider("provider with spaces!")).toThrow(/provider identifier/);
+    const sandbox = runtimeCapabilityDecision(hostedRuntimeDefaults("tinkerbot-sandbox"));
+    expect(sandbox).toMatchObject({ ok: false, code: "cloudflare_sandbox_unsupported", boundary: "cloudflare_sandbox" });
+    const selfHosted = hostedRuntimeDefaults("self_hosted");
+    selfHosted.workerHost = "self_hosted:runner-1";
+    expect(runtimeCapabilityDecision(selfHosted)).toMatchObject({ ok: true, code: "supported", boundary: "self_hosted" });
   });
 
   test("planner is deterministic and never skips verification", () => {

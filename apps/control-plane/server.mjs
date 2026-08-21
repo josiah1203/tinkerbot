@@ -6,6 +6,11 @@ import { fileURLToPath } from "node:url";
 const root = realpathSync(fileURLToPath(new URL(".", import.meta.url)));
 const port = Number(process.env.PORT ?? 4173);
 const host = process.env.HOST ?? "127.0.0.1";
+// The in-memory backend is a local design-preview fixture only. A production
+// static server may still serve the dashboard shell, but it must obtain
+// lifecycle state from the hosted Worker rather than this hardcoded dataset.
+const controlPlaneMode = String(process.env.CONTROL_PLANE_MODE ?? "preview").trim().toLowerCase();
+const previewBackendEnabled = controlPlaneMode === "preview";
 const types = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".json": "application/json; charset=utf-8", ".svg": "image/svg+xml", ".woff": "font/woff", ".woff2": "font/woff2" };
 
 function within(candidate) {
@@ -439,7 +444,12 @@ createServer(async (request, response) => {
     response.end();
     return;
   }
-  const mocked = previewApi(request, await requestBody(request));
+  const apiLikePath = String(request.headers.accept ?? "").includes("application/json") || !["GET", "HEAD"].includes(request.method ?? "GET");
+  if (!previewBackendEnabled && apiLikePath) {
+    sendJson(response, { error: "The local preview backend is disabled; configure the hosted control-plane API.", code: "preview_backend_disabled" }, 503);
+    return;
+  }
+  const mocked = previewBackendEnabled ? previewApi(request, await requestBody(request)) : null;
   if (mocked?.redirect) {
     response.writeHead(302, { ...headers, location: mocked.redirect });
     response.end();

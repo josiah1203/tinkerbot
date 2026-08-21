@@ -65,7 +65,7 @@ import {
 } from "../../assurance/src";
 import { runDoctor, renderDoctor } from "./doctor";
 import { clearStoredCredentials, hostedSession, saveStoredCredentials } from "./credentials";
-import { loadFactoryDefinition, validateAgentReceipt, buildFactoryStarter } from "../../factory/src";
+import { loadFactoryDefinition, validateAgentReceipt, buildFactoryStarter, parseWorkOrderDetailRouteResponse, parseWorkOrderGraphRouteResponse, parseWorkOrderListRouteResponse, parseWorkOrderMutationRouteResponse } from "../../factory/src";
 import { evalCli, evalCliAsync, executeLocalRun, factoryPlanPayload, localDashboardPayload } from "./runtime-cli";
 import { cellCheckPayload, factoryCheckPayload, factoryInitPayload, localFactoryGraphStatusPayload, localIntentPayload, localOutcomePayload, localWorkApprovalPayload, localWorkNewPayload, outcomeCheckPayload } from "./factory-os";
 import { createLocalDashboardServer, localDashboardUrl } from "./local-dashboard";
@@ -1275,6 +1275,19 @@ async function hostedRequest(pathname: string, method = "GET", payload?: Record<
   return { status: response.status, body };
 }
 
+function typedHostedWorkOrderBody(pathname: string, response: HostedResponse): Record<string, unknown> {
+  if (response.status < 200 || response.status >= 300) return response.body;
+  try {
+    if (pathname === "/work-orders") return parseWorkOrderListRouteResponse(response.body) as unknown as Record<string, unknown>;
+    if (/^\/work-orders\/[^/]+\/graph$/.test(pathname)) return parseWorkOrderGraphRouteResponse(response.body) as unknown as Record<string, unknown>;
+    if (/^\/work-orders\/[^/]+$/.test(pathname)) return parseWorkOrderDetailRouteResponse(response.body) as unknown as Record<string, unknown>;
+    if (/^\/work-orders\/[^/]+\/(retry|approve|cancel|steer|take|return)$/.test(pathname)) return parseWorkOrderMutationRouteResponse(response.body) as unknown as Record<string, unknown>;
+  } catch (error) {
+    throw new CliFailure(EXIT_CODES.EXECUTION_ERROR, `The control plane returned an invalid WorkOrder response: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return response.body;
+}
+
 async function runHostedCli(argv: string[]): Promise<number | undefined> {
   const command = argv[0];
   if (!command) return undefined;
@@ -1307,7 +1320,7 @@ async function runHostedCli(argv: string[]): Promise<number | undefined> {
       process.stderr.write(`Tinkerbot hosted request failed: ${String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`)}\n`);
       return response.status === 401 || response.status === 403 ? EXIT_CODES.UNKNOWN : EXIT_CODES.EXECUTION_ERROR;
     }
-    process.stdout.write(`${JSON.stringify(response.body, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify(typedHostedWorkOrderBody(pathname, response), null, 2)}\n`);
     return EXIT_CODES.PASS;
   }
     if (command === "cell" || command === "product" || command === "skill" || command === "evolution") {
@@ -1436,11 +1449,14 @@ export async function mainAsync(argv = process.argv.slice(2)): Promise<number> {
           const response = await hostedRequest(`/work-orders/${id}`);
           if (response.status < 200 || response.status >= 300) return {};
           const graph = await hostedRequest(`/work-orders/${id}/graph`).catch(() => ({ status: 0, body: {} as Record<string, unknown> }));
-          return { ...response.body, ...(graph.status >= 200 && graph.status < 300 ? { graph: graph.body.graph, economics: graph.body.economics, events: graph.body.events, sourceOfTruth: graph.body.sourceOfTruth } : {}) } as { workOrder?: { workOrderId?: string; status?: string; currentStage?: string; verificationVerdict?: string; verificationIngested?: boolean }; run?: { run_id?: string; status?: string }; stages?: Array<{ stage?: string; status?: string; summary?: string }>; graph?: { verificationVerdict?: string; reviewDecision?: string; releaseDecision?: string; outcomeStatus?: string; outcomeMaturity?: string; eventCount?: number }; economics?: { cogsCents?: number; copqCents?: number; acceptedChanges?: number }; events?: Array<{ type?: string; actorType?: string; occurredAt?: string }>; sourceOfTruth?: string };
+          const detail = typedHostedWorkOrderBody(`/work-orders/${id}`, response);
+          const graphBody = graph.status >= 200 && graph.status < 300 ? typedHostedWorkOrderBody(`/work-orders/${id}/graph`, graph) : {};
+          return { ...detail, ...graphBody } as { workOrder?: { workOrderId?: string; status?: string; currentStage?: string; verificationVerdict?: string; verificationIngested?: boolean }; run?: { run_id?: string; status?: string }; stages?: Array<{ stage?: string; status?: string; summary?: string }>; graph?: { verificationVerdict?: string; reviewDecision?: string; releaseDecision?: string; outcomeStatus?: string; outcomeMaturity?: string; eventCount?: number }; economics?: { cogsCents?: number; copqCents?: number; acceptedChanges?: number }; events?: Array<{ type?: string; actorType?: string; occurredAt?: string }>; sourceOfTruth?: string };
         },
         workActionAsync: async (id, action, note) => {
           const response = await hostedRequest(`/work-orders/${id}/${action}`, "POST", action === "steer" ? { note } : undefined);
           if (response.status < 200 || response.status >= 300) return { ok: false, message: String(response.body.error ?? response.body.code ?? `HTTP ${response.status}`) };
+          typedHostedWorkOrderBody(`/work-orders/${id}/${action}`, response);
           return { ok: true, message: action === "approve" ? "Specification approval recorded. Humans still merge." : `${action} recorded.` };
         },
       };

@@ -1,5 +1,4 @@
 import { createAgentExecutionReceipt } from "../../../packages/assurance/src";
-import { createImplementPullRequest, mintInstallationToken } from "../../../packages/github/src";
 import {
   createWorkOrder,
   factoryDefinitionDigest,
@@ -9,18 +8,13 @@ import {
   validateFactoryDefinition,
   signRecord,
   canonicalize,
-  createSelfHostedDispatch,
-  selfHostedSecretReady,
   classifyWorkOrderGroup,
   conversationTranscript,
-  createPullRequestBody,
   exhaustObjectKey,
   handleMcpJsonRpc,
   implementBranchName,
   jiraIntake,
   linearIntake,
-  runImplementSandbox,
-  sandboxImplementPlan,
   scoreConversation,
   selfImprovementTask,
   slackIntake,
@@ -31,11 +25,9 @@ import {
   draftImprovementProposal,
   factoryAnalystReport,
   isExternalHarness,
-  sanitizeUntrustedPromptInput,
   incidentIntake,
   supportIntake,
   githubSecurityIntake,
-  scheduledMaintenanceTask,
   createReleaseCandidate,
   recordDeployment,
   evaluateMergeReadiness,
@@ -43,10 +35,11 @@ import {
   factoryAiFromProvider,
   defaultAftercare,
   classifyAiInvocation,
+  runtimeCapabilityDecision,
+  RuntimeCapabilityError,
   INTELLIGENCE_STAGES,
   IN_PROGRESS_STATES,
   isFactoryCommandBoundaryEventType,
-  isWorkOrderState,
   type ConversationMessage,
   type FactoryCommandResult,
   type FactoryAi,
@@ -64,6 +57,10 @@ import { modelForCostClass, type AiCostClass } from "../../../packages/control-p
 import { evidenceStoreFromEnv, HttpEvidenceReplica } from "../../../packages/hosted-integrations/src";
 import { D1FactoryStore } from "./factory-store";
 import { entitlementsForOrganization } from "./billing";
+import { dispatchSandboxIfBound, dispatchSelfHostedWork, Sandbox } from "./factory-executor";
+import { boundedJsonObject } from "./factory-request";
+
+export { Sandbox };
 
 export interface FactoryEnv {
   ENVIRONMENT?: string;
@@ -107,70 +104,6 @@ function gatewayAi(env: FactoryEnv): FactoryAi | undefined {
   };
 }
 
-interface SelfHostedDispatchInput {
-  organizationId: string;
-  factoryId: string;
-  workOrderId: string;
-  runId: string;
-  repository: string;
-  sourceType: FactorySourceType;
-  sourceId: string;
-  definitionDigest: string;
-  prompt?: string;
-  definition: FactoryDefinition;
-}
-
-/**
- * Hand off implementation to a customer-owned worker without putting a
- * credential, session token, or provider secret on the queue. The worker can
- * fetch the repository itself and must return through the existing verification
- * / OIDC path; this message is only a dispatch claim, never a merge authority.
- */
-async function dispatchSelfHostedWork(env: FactoryEnv, input: SelfHostedDispatchInput): Promise<{ ok: true; dispatchId: string } | { ok: false; dispatchId: string; reason: string }> {
-  const dispatchId = `selfhost:${input.workOrderId}:${input.runId}`;
-  if (!env.SELF_HOSTED_WORK && !env.SELF_HOSTED_WORK_ENDPOINT) return { ok: false, dispatchId, reason: "self_hosted_queue_not_configured" };
-  // Do not reuse the session-encryption key in production. Development and
-  // tests retain the fallback so the adapter stays easy to exercise, but a
-  // deployed customer-worker boundary gets an independently rotatable HMAC
-  // trust domain.
-  const signingSecret = env.SELF_HOSTED_WORK_SECRET ?? (env.ENVIRONMENT === "production" ? undefined : env.SESSION_ENCRYPTION_KEY);
-  if (!signingSecret || (env.ENVIRONMENT === "production" && !selfHostedSecretReady(signingSecret))) return { ok: false, dispatchId, reason: "self_hosted_signing_secret_not_configured" };
-  const implementation = input.definition.agents.find((agent) => agent.agentType === "IMPLEMENT" || agent.id === "implement" || agent.id === "implementation");
-  const externalHarness = implementation && isExternalHarness(implementation.harness) ? input.definition.harnesses[implementation.harness] : undefined;
-  try {
-    const envelope = createSelfHostedDispatch({
-      dispatchId,
-      executionBoundary: "self_hosted",
-      organizationId: input.organizationId,
-      factoryId: input.factoryId,
-      workOrderId: input.workOrderId,
-      runId: input.runId,
-      repository: input.repository,
-      sourceType: input.sourceType,
-      sourceId: input.sourceId,
-      definitionDigest: input.definitionDigest,
-      harness: externalHarness?.id ?? implementation?.harness ?? "default",
-      workerHost: input.definition.runtime.workerHost,
-      model: implementation?.model,
-      prompt: sanitizeUntrustedPromptInput(input.prompt ?? "Implement the approved change.", 16_000),
-      secret: signingSecret,
-    });
-    if (env.SELF_HOSTED_WORK) {
-      await env.SELF_HOSTED_WORK.send(envelope);
-    } else {
-      const endpoint = new URL(env.SELF_HOSTED_WORK_ENDPOINT!);
-      const localEndpoint = endpoint.protocol === "http:" && ["localhost", "127.0.0.1", "::1"].includes(endpoint.hostname);
-      if (endpoint.protocol !== "https:" && !localEndpoint) throw new Error("Self-hosted worker endpoint must use HTTPS (HTTP is allowed only for localhost development).");
-      if (endpoint.username || endpoint.password) throw new Error("Self-hosted worker endpoint must not embed credentials.");
-      const response = await fetch(endpoint, { method: "POST", redirect: "error", headers: { "content-type": "application/json", "x-tinkerbot-self-hosted-protocol": "1" }, body: JSON.stringify(envelope), signal: AbortSignal.timeout(10_000) });
-      if (!response.ok) throw new Error(`Self-hosted worker endpoint returned HTTP ${response.status}.`);
-    }
-    return { ok: true, dispatchId };
-  } catch {
-    return { ok: false, dispatchId, reason: "self_hosted_queue_send_failed" };
-  }
-}
-
 export async function persistTranscript(env: FactoryEnv, organizationId: string, workOrderId: string, messages: ConversationMessage[]): Promise<void> {
   if (!env.EVIDENCE_BUCKET || !env.DB) return;
   const key = exhaustObjectKey(organizationId, workOrderId, "transcript");
@@ -182,7 +115,17 @@ export async function persistTranscript(env: FactoryEnv, organizationId: string,
   await new D1FactoryStore(env.DB).putConversation({ workOrderId, agentId: "foreman", r2Key: key, now: new Date().toISOString() });
 }
 
-export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessage & { factoryId?: string; specApproved?: boolean; sandboxComplete?: boolean; pullRequestSha?: string; verificationVerdict?: string; verificationIngested?: boolean; workOrderId?: string }): Promise<{ workOrderId: string; runId: string; wait?: string; terminal: string }> {
+export interface FactoryTurnResult {
+  workOrderId: string;
+  runId: string;
+  wait?: string;
+  terminal: string;
+  code?: string;
+  executor?: string;
+  reason?: string;
+}
+
+export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessage & { factoryId?: string; specApproved?: boolean; sandboxComplete?: boolean; pullRequestSha?: string; verificationVerdict?: string; verificationIngested?: boolean; workOrderId?: string }): Promise<FactoryTurnResult> {
   if (!env.DB) return { workOrderId: message.sourceId, runId: "none", terminal: "unknown" };
   const factories = new D1FactoryStore(env.DB);
   const installation = message.installationId ? await env.DB.prepare("SELECT organization_id, status FROM tinkerbot_github_installations WHERE installation_id = ?1").bind(message.installationId).first<{ organization_id?: string | null; status?: string }>() : null;
@@ -210,7 +153,7 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
   let order = existingOrder;
   if (!order) {
     order = createWorkOrder({ factoryId: factory.factoryId, organizationId, sourceType: message.sourceType as FactorySourceType, sourceId: message.sourceId, repositoryId: repository, issueOrPullRequest: message.issueOrPullRequest, policyVersion: "default", definitionVersion: record?.definitionDigest ?? "unknown", definitionDigest: record?.definitionDigest ?? "unknown", actor: message.actor, now });
-    await factories.insertWorkOrder(order);
+    await factories.admitWorkOrder(order);
   }
   const persistedOrder = order;
   const existingRun = await factories.getRunByWorkOrder(persistedOrder.workOrderId);
@@ -256,11 +199,12 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
       await updateRunStatus("blocked");
       return { workOrderId: order.workOrderId, runId, wait: "factory_definition", terminal: "blocked" };
     }
-  } catch {
-    await appendRunGraphEvent("task.blocked", { reason: "invalid_factory_definition" }, "factory-policy", "system");
+  } catch (error) {
+    const reason = error instanceof RuntimeCapabilityError ? error.code : "invalid_factory_definition";
+    await appendRunGraphEvent("task.blocked", { reason, ...(error instanceof RuntimeCapabilityError ? { message: error.message } : {}) }, "factory-policy", "system");
     await factories.applyTransition(order.workOrderId, "blocked", `definition-parse:${message.deliveryId}`, "factory-policy");
     await updateRunStatus("blocked");
-    return { workOrderId: order.workOrderId, runId, wait: "factory_definition", terminal: "blocked" };
+    return { workOrderId: order.workOrderId, runId, wait: "factory_definition", terminal: "blocked", code: reason, reason };
   }
   const effectiveDefinitionDigest = factoryDefinitionDigest(definition);
   if (existingRun?.definition_digest !== effectiveDefinitionDigest) await factories.updateRunDefinition(runId, effectiveDefinitionDigest, now);
@@ -280,6 +224,13 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
   const priorStageIds = new Set(priorStages.map((stage) => stage.stage));
   const priorPlan = priorStages.length ? await factories.getExecutionPlanForWorkOrder(order.workOrderId) : null;
   const managed = definition.runtime.inference.mode === "managed";
+  const runtimeCapability = runtimeCapabilityDecision(definition.runtime, { sandboxAvailable: Boolean(env.Sandbox && typeof (env.Sandbox as { exec?: unknown }).exec === "function") });
+  if (!runtimeCapability.ok && runtimeCapability.code !== "cloudflare_sandbox_unsupported") {
+    await appendRunGraphEvent("task.blocked", { reason: runtimeCapability.code, executor: runtimeCapability.boundary }, "factory-policy", "system");
+    await factories.applyTransition(order.workOrderId, "blocked", `runtime:${runtimeCapability.code}:${message.deliveryId}`, "factory-policy");
+    await updateRunStatus("blocked");
+    return { workOrderId: order.workOrderId, runId, wait: "factory_definition", terminal: "blocked", code: runtimeCapability.code, reason: runtimeCapability.code, executor: runtimeCapability.boundary };
+  }
   const implementationAgent = definition.agents.find((agent) => agent.agentType === "IMPLEMENT" || agent.id === "implement" || agent.id === "implementation");
   const externalImplementation = implementationAgent && isExternalHarness(implementationAgent.harness) ? definition.harnesses[implementationAgent.harness] : undefined;
   const requiresSelfHostedExecution = definition.runtime.runner.type === "self_hosted" || Boolean(externalImplementation);
@@ -380,6 +331,14 @@ export async function runFactoryTurn(env: FactoryEnv, message: FactoryQueueMessa
   const messages: ConversationMessage[] = result.stages.map((stage) => ({ role: "assistant", agentId: stage.stage, content: stage.summary, at: now }));
   await persistTranscript(env, organizationId, order.workOrderId, messages);
   if (result.wait === "sandbox") {
+    const sandboxExecutorAvailable = Boolean(env.Sandbox && typeof (env.Sandbox as { exec?: unknown }).exec === "function");
+    if (!requiresSelfHostedExecution && !sandboxExecutorAvailable) {
+      const reason = runtimeCapability.code === "supported" ? "cloudflare_sandbox_unsupported" : runtimeCapability.code;
+      await appendRunGraphEvent("task.blocked", { executor: "cloudflare_sandbox", reason, workOrderId: order.workOrderId }, "factory-policy", "system");
+      await factories.applyTransition(order.workOrderId, "blocked", `executor:${reason}:${message.deliveryId}`, "factory-policy");
+      await updateRunStatus("blocked");
+      return { workOrderId: order.workOrderId, runId, wait: "sandbox", terminal: "blocked", code: "executor_unavailable", executor: "cloudflare_sandbox", reason };
+    }
     if (repository === "unknown/unknown") {
       await appendRunGraphEvent("task.blocked", { reason: "repository_required" }, "factory-policy", "system");
       await factories.applyTransition(order.workOrderId, "blocked", `repository:${message.deliveryId}`, "factory-policy");
@@ -614,233 +573,7 @@ export async function routeFactoryVerification(env: FactoryEnv, input: { workOrd
   return result.projection ?? null;
 }
 
-export async function runForemanWorkDecision(env: FactoryEnv, input: { workOrderId: string; organizationId: string; actor: string; type: "review" | "release"; decision: "approved" | "rejected" | "changes_requested" | "hold"; now: string }): Promise<{ workOrder: Awaited<ReturnType<D1FactoryStore["getWorkOrderView"]>>; availableActions: unknown[] }> {
-  if (!env.DB) throw new Error("foreman_database_not_configured");
-  const factories = new D1FactoryStore(env.DB);
-  const order = await factories.getWorkOrderForOrganization(input.workOrderId, input.organizationId);
-  if (!order) throw new Error("work_order_not_found");
-  if (input.type === "release" && input.decision !== "approved" && input.decision !== "hold") throw new Error("invalid_release_decision");
-  await factories.recordTypedDecision({ workOrderId: order.workOrderId, organizationId: input.organizationId, actor: input.actor, type: input.type, decision: input.decision, now: input.now });
-  if (input.type === "release" && input.decision === "approved") {
-    const transition = order.status === "ready" ? await factories.applyTransition(order.workOrderId, "merged", `release-merge:${crypto.randomUUID()}`, input.actor) : { ok: true as const, order };
-    if (!transition.ok) throw new Error(`release_candidate_${transition.code}`);
-    const released = transition.order.status === "merged" ? await factories.applyTransition(order.workOrderId, "released", `release:${crypto.randomUUID()}`, input.actor) : transition;
-    if (!released.ok) throw new Error(`release_transition_${released.code}`);
-  }
-  const workOrder = await factories.getWorkOrderView(order.workOrderId, input.organizationId);
-  return { workOrder, availableActions: workOrder?.availableActions ?? [] };
-}
-
-async function dispatchSandboxIfBound(env: FactoryEnv, input: { workOrderId: string; repository: string; intent?: string; installationId?: number; organizationId: string; runId: string }): Promise<{ complete: boolean; sha?: string }> {
-  const plan = sandboxImplementPlan({ repository: input.repository, workOrderId: input.workOrderId, intent: input.intent });
-  if (!env.Sandbox || typeof env.Sandbox !== "object") return { complete: false };
-  try {
-    const token = env.GITHUB_APP_ID && env.GITHUB_APP_PRIVATE_KEY && input.installationId
-      ? await mintInstallationToken({ appId: env.GITHUB_APP_ID, privateKeyPem: env.GITHUB_APP_PRIVATE_KEY, installationId: input.installationId })
-      : undefined;
-    const sandbox = env.Sandbox as { exec?(argv: string[], options?: { cwd?: string; env?: Record<string, string>; timeout?: number }): Promise<{ output(): Promise<{ stdout: string; exitCode: number }> }> };
-    if (typeof sandbox.exec !== "function") return { complete: false };
-    const result = await runImplementSandbox({
-      exec: async (argv, options) => {
-        const handle = await sandbox.exec!(Array.from(argv), { cwd: options?.cwd, env: token ? { GIT_ASKPASS: "echo", GITHUB_TOKEN: token, ...options?.env } : options?.env, timeout: options?.timeout });
-        const output = await handle.output();
-        return { stdout: output.stdout, exitCode: output.exitCode };
-      },
-    }, plan, token ? { GITHUB_TOKEN: token } : {});
-    if (result.status !== "ok" || !token) return { complete: false };
-    const number = await createImplementPullRequest({ token, repository: input.repository }, {
-      title: `tinkerbot: ${input.workOrderId.slice(0, 8)}`,
-      head: plan.branch,
-      body: createPullRequestBody({ workOrderId: input.workOrderId, dashboardUrl: `${env.CONTROL_PLANE_URL ?? ""}/app/work/${input.workOrderId}` }),
-    });
-    if (env.EVIDENCE_BUCKET) await env.EVIDENCE_BUCKET.put(exhaustObjectKey(input.organizationId, input.workOrderId, "sandbox-log"), JSON.stringify({ logs: result.logs, pull: number, branch: result.branch }), { httpMetadata: { contentType: "application/json" } });
-    return { complete: result.status === "ok", sha: undefined };
-  } catch {
-    return { complete: false };
-  }
-}
-
-export class Sandbox {
-  async fetch(): Promise<Response> {
-    return new Response(JSON.stringify({ error: "Attach the Cloudflare Sandbox implementation in this account." }), { status: 501, headers: { "content-type": "application/json" } });
-  }
-}
-
-type BoundedJsonResult = { value: Record<string, unknown> } | { tooLarge: true };
-
-async function boundedJsonObject(request: Request, maxBytes = 1_500_000): Promise<BoundedJsonResult> {
-  const declaredLength = Number(request.headers.get("content-length"));
-  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) return { tooLarge: true };
-  if (!request.body) return { value: {} };
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const next = await reader.read();
-      if (next.done) break;
-      total += next.value.byteLength;
-      if (total > maxBytes) {
-        try { await reader.cancel(); } catch { /* bounded request is already rejected */ }
-        return { tooLarge: true };
-      }
-      chunks.push(next.value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  try {
-    const parsed = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? { value: parsed as Record<string, unknown> } : { value: {} };
-  } catch {
-    return { value: {} };
-  }
-}
-
-export class ForemanDurableObject {
-  constructor(private readonly state: { id: { toString(): string } }, private readonly env: FactoryEnv) {}
-
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const parsed = request.method === "POST" ? await boundedJsonObject(request) : { value: {} };
-    if ("tooLarge" in parsed) return Response.json({ error: "Request body is too large.", code: "payload_too_large" }, { status: 413 });
-    const body = parsed.value;
-    // Queue/workflow deliveries enter through the Foreman object so one work
-    // order has a serialized coordinator even when Cloudflare retries or
-    // parallel producers deliver messages at the same time. Keep the legacy
-    // steer shape below for local/operator callers that only send a note.
-    if (request.method === "POST"
-      && request.headers.get("x-tinkerbot-internal") === "foreman-v1"
-      && typeof body.deliveryId === "string"
-      && typeof body.sourceType === "string"
-      && typeof body.sourceId === "string"
-      && typeof body.actor === "string") {
-      const result = await runFactoryTurn(this.env, body as unknown as Parameters<typeof runFactoryTurn>[1]);
-      return Response.json(result);
-    }
-    if (request.method === "POST"
-      && request.headers.get("x-tinkerbot-internal") === "foreman-v1"
-      && body.command === "work_decision"
-      && typeof body.workOrderId === "string"
-      && typeof body.organizationId === "string"
-      && typeof body.actor === "string"
-      && (body.type === "review" || body.type === "release")
-      && (body.decision === "approved" || body.decision === "rejected" || body.decision === "changes_requested" || body.decision === "hold")) {
-      const result = await runForemanWorkDecision(this.env, { workOrderId: body.workOrderId, organizationId: body.organizationId, actor: body.actor, type: body.type, decision: body.decision, now: typeof body.now === "string" ? body.now : new Date().toISOString() });
-      return Response.json(result);
-    }
-    if (request.method === "POST"
-      && request.headers.get("x-tinkerbot-internal") === "foreman-v1"
-      && body.command === "graph_command"
-      && typeof body.organizationId === "string"
-      && typeof body.factoryId === "string"
-      && typeof body.workOrderId === "string"
-      && typeof body.actorId === "string"
-      && (body.actorType === "human" || body.actorType === "agent" || body.actorType === "system" || body.actorType === "integration")
-      && typeof body.idempotencyKey === "string"
-      && body.payload !== null
-      && typeof body.payload === "object"
-      && !Array.isArray(body.payload)
-      && body.event !== null
-      && typeof body.event === "object"
-      && !Array.isArray(body.event)) {
-      if (!this.env.DB) return Response.json({ error: "Foreman database is not configured.", code: "foreman_database_not_configured" }, { status: 503 });
-      const factories = new D1FactoryStore(this.env.DB);
-      const result = await factories.dispatchFactoryCommand({
-        organizationId: body.organizationId,
-        factoryId: body.factoryId,
-        workOrderId: body.workOrderId,
-        actorId: body.actorId,
-        actorType: body.actorType,
-        idempotencyKey: body.idempotencyKey,
-        payload: body.payload as Record<string, unknown>,
-        now: typeof body.now === "string" ? body.now : new Date().toISOString(),
-        buildEvents: () => [body.event as FactoryEvent],
-      });
-      return Response.json(result);
-    }
-    if (request.method === "POST"
-      && request.headers.get("x-tinkerbot-internal") === "foreman-v1"
-      && body.command === "transition"
-      && typeof body.organizationId === "string"
-      && typeof body.workOrderId === "string"
-      && typeof body.toState === "string"
-      && isWorkOrderState(body.toState)
-      && typeof body.causeId === "string"
-      && typeof body.actor === "string") {
-      if (!this.env.DB) return Response.json({ error: "Foreman database is not configured.", code: "foreman_database_not_configured" }, { status: 503 });
-      const result = await new D1FactoryStore(this.env.DB).applyTransition(body.workOrderId, body.toState, body.causeId, body.actor, typeof body.now === "string" ? body.now : undefined);
-      return Response.json(result, { status: result.ok ? 200 : result.code === "not_found" ? 404 : 409 });
-    }
-    if (request.method === "POST"
-      && request.headers.get("x-tinkerbot-internal") === "foreman-v1"
-      && body.command === "spec_approval"
-      && typeof body.workOrderId === "string"
-      && typeof body.organizationId === "string"
-      && typeof body.actor === "string"
-      && (body.decision === "approved" || body.decision === "rejected")
-      && typeof body.signature === "string") {
-      if (!this.env.DB) return Response.json({ error: "Foreman database is not configured.", code: "foreman_database_not_configured" }, { status: 503 });
-      await new D1FactoryStore(this.env.DB).insertApproval(body.workOrderId, body.actor, body.decision, body.signature, typeof body.now === "string" ? body.now : new Date().toISOString());
-      return Response.json({ accepted: true });
-    }
-    if (request.method === "POST"
-      && request.headers.get("x-tinkerbot-internal") === "foreman-v1"
-      && body.command === "cell_hold"
-      && typeof body.workOrderId === "string"
-      && typeof body.organizationId === "string"
-      && typeof body.actor === "string"
-      && (body.action === "take" || body.action === "return")) {
-      if (!this.env.DB) return Response.json({ error: "Foreman database is not configured.", code: "foreman_database_not_configured" }, { status: 503 });
-      const workOrder = await new D1FactoryStore(this.env.DB).setWorkOrderCellHold({ workOrderId: body.workOrderId, organizationId: body.organizationId, actor: body.actor, action: body.action, now: typeof body.now === "string" ? body.now : new Date().toISOString() });
-      if (!workOrder) return Response.json({ error: "Work order not found.", code: "not_found" }, { status: 404 });
-      return Response.json({ ok: true, workOrder, held: body.action === "take" });
-    }
-    if (request.method === "POST"
-      && request.headers.get("x-tinkerbot-internal") === "foreman-v1"
-      && body.command === "record_verification"
-      && typeof body.workOrderId === "string"
-      && typeof body.organizationId === "string"
-      && typeof body.verificationRunId === "string"
-      && (body.verdict === "PASS" || body.verdict === "FAIL" || body.verdict === "UNKNOWN")) {
-      if (!this.env.DB) return Response.json({ error: "Foreman database is not configured.", code: "foreman_database_not_configured" }, { status: 503 });
-      const result = await new D1FactoryStore(this.env.DB).recordVerification({
-        workOrderId: body.workOrderId,
-        organizationId: body.organizationId,
-        actorId: typeof body.actorId === "string" ? body.actorId : undefined,
-        changeSetId: typeof body.changeSetId === "string" ? body.changeSetId : undefined,
-        changeSetDigest: typeof body.changeSetDigest === "string" ? body.changeSetDigest : undefined,
-        verificationRunId: body.verificationRunId,
-        verdict: body.verdict,
-        now: typeof body.now === "string" ? body.now : new Date().toISOString(),
-      });
-      return Response.json({ projection: result });
-    }
-    if (url.pathname.endsWith("/steer") || request.method === "POST") {
-      const workOrderId = typeof body.workOrderId === "string" ? body.workOrderId : this.state.id.toString();
-      const note = typeof body.note === "string" ? body.note : "";
-      const repository = typeof body.repository === "string" ? body.repository : undefined;
-      const result = await runFactoryTurn(this.env, {
-        deliveryId: `steer:${crypto.randomUUID()}`,
-        sourceType: "manual",
-        sourceId: workOrderId,
-        actor: "steer",
-        workOrderId,
-        repository,
-        issueOrPullRequest: note,
-        organizationId: typeof body.organizationId === "string" ? body.organizationId : undefined,
-      });
-      return Response.json({ steered: true, ...result });
-    }
-    return Response.json({ workOrderId: this.state.id.toString(), group: classifyWorkOrderGroup("intake") });
-  }
-}
+export { ForemanDurableObject, runForemanWorkDecision } from "./foreman-routes";
 
 export async function handleFactoryMcpRequest(request: Request, env: FactoryEnv, actor: string, organizationId: string): Promise<Response> {
   const parsed = await boundedJsonObject(request);
@@ -918,50 +651,5 @@ export function intakeFromIntegration(kind: "slack" | "linear" | "jira" | "incid
   return jiraIntake(payload);
 }
 
-export async function sweepFactoryOs(env: FactoryEnv): Promise<{ abandonedCells: number; maintenance: number }> {
-  if (!env.DB) return { abandonedCells: 0, maintenance: 0 };
-  const factories = new D1FactoryStore(env.DB);
-  const now = new Date().toISOString();
-  const expired = await factories.listExpiredCells(now);
-  for (const cell of expired) {
-    await factories.upsertWorkCell({
-      cellId: String(cell.cell_id),
-      factoryId: String(cell.factory_id),
-      workOrderId: cell.work_order_id ?? undefined,
-      kind: String(cell.kind ?? "sandbox"),
-      repository: String(cell.repository),
-      branch: String(cell.branch),
-      status: "abandoned",
-      credentialScope: String(cell.credential_scope ?? ""),
-      cleanupAt: now,
-      now,
-    });
-  }
-  let maintenance = 0;
-  const listed = await factories.listFactories("system").catch(() => []);
-  for (const factory of listed) {
-    const task = scheduledMaintenanceTask(factory.factoryId, now);
-    const record = await factories.getFactory(factory.factoryId);
-    await handleFactoryQueueMessageLike(env, factory.factoryId, record?.organizationId ?? "system", task);
-    maintenance += 1;
-  }
-  return { abandonedCells: expired.length, maintenance };
-}
-
-async function handleFactoryQueueMessageLike(env: FactoryEnv, factoryId: string, organizationId: string, task: ReturnType<typeof scheduledMaintenanceTask>): Promise<void> {
-  // Scheduled maintenance is another queue-shaped delivery. Route it through
-  // the same Foreman adapter as external queue/workflow messages so a cron
-  // tick cannot race an operator/MCP delivery for the same factory aggregate.
-  await routeFactoryQueueMessage(env, {
-    deliveryId: task.sourceId,
-    factoryId,
-    organizationId,
-    sourceType: "scheduled",
-    sourceId: task.sourceId,
-    issueOrPullRequest: `${task.title}\n${task.body}`,
-    actor: task.actor,
-    repository: "unknown/unknown",
-  });
-}
-
+export { sweepFactoryOs } from "./factory-maintenance";
 export { classifyWorkOrderGroup, githubSecurityIntake, recordDeployment, createReleaseCandidate };

@@ -32,6 +32,7 @@ class GraphD1Database implements D1DatabaseLike {
   readonly events = new Map<string, Row>();
   readonly receipts = new Map<string, Row>();
   readonly checkpoints = new Map<string, Row>();
+  readonly telemetry: Row[] = [];
   failProjectionUpdate = false;
 
   seedWorkOrder(order: WorkOrder): void {
@@ -179,6 +180,10 @@ class GraphD1Database implements D1DatabaseLike {
       });
       return { meta: { changes: 1 } };
     }
+    if (query.includes("tinkerbot_factory_command_telemetry") && query.includes("INSERT")) {
+      this.telemetry.push({ telemetry_id: args[0], command_id: args[1], organization_id: args[2], factory_id: args[3], work_order_id: args[4], idempotency_key: args[5], payload_fingerprint: args[6], correlation_id: args[7], outcome: args[8], event_count: args[9], projection_event_count: args[10], projection_status: args[11], aggregate_sequence: args[12], duration_ms: args[13], error_code: args[14], created_at: args[15] });
+      return { meta: { changes: 1 } };
+    }
     if (query.includes("UPDATE tinkerbot_work_orders SET status = COALESCE")) {
       if (this.failProjectionUpdate) throw new Error("projection_write_failed");
       const row = this.workOrders.get(String(args[7]));
@@ -294,6 +299,8 @@ test("Memory, SQLite, and D1 produce the same Factory Spine projection", async (
   expect(sqliteCheckpoint).toMatchObject({ status: "APPLIED", lastEventId: "outcome-observed", projection: projections[0] });
   expect(d1Checkpoint).toMatchObject({ status: "APPLIED", lastEventId: "outcome-observed", projection: projections[0] });
   expect(d1Checkpoint?.projectionFingerprint).toBe(sqliteCheckpoint?.projectionFingerprint);
+  expect(d1Database.telemetry.length).toBeGreaterThan(0);
+  expect(d1Database.telemetry.every((row) => !("payload" in row))).toBe(true);
   expect(await sqlite.retryFactoryProjection(context.aggregateId, context.organizationId, timestamp(17))).toEqual(projections[0]);
   expect(await d1.rebuildFactoryProjection(context.aggregateId, context.organizationId, timestamp(17))).toEqual(projections[0]);
 });

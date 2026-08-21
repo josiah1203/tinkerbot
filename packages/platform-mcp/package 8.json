@@ -1,9 +1,0 @@
-{
-  "name": "@tinkerbot/platform-mcp",
-  "version": "0.1.0",
-  "private": true,
-  "description": "Local stdio MCP server for the Tinkerbot software factory platform.",
-  "type": "commonjs",
-  "main": "../../dist/packages/platform-mcp/src/cli.js",
-  "types": "../../dist/packages/platform-mcp/src/index.d.ts"
-}

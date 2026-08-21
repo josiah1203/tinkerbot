@@ -79,6 +79,8 @@ export * from "./outcomes";
 export * from "./lifecycle";
 export * from "./spine";
 export * from "./control-plane-view";
+export * from "./route-contract";
+export * from "./telemetry";
 export * from "./harness";
 export * from "./self-hosted";
 export { executeFactoryRun } from "./execute";

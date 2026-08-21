@@ -22,7 +22,7 @@ The former GitHub App template is deprecated and retained for historical migrati
 .tinkerbot/factory.yaml
 .tinkerbot/agents/<name>.md          # or agents/<name>/agent.md
 .tinkerbot/automations/<name>/automation.md
-.tinkerbot/runners/*.yaml            # linux Cloudflare sandbox; sandbox.toml still loads
+    .tinkerbot/runners/*.yaml            # runner definitions; hosted Sandbox is feature-gated
 .tinkerbot/lines/*.yaml
 .tinkerbot/skills/*.yaml
 .tinkerbot/autonomy.yaml
@@ -74,7 +74,7 @@ Automations declare `triggers` (`github`, `gitlab`, `slack`, `linear`, `jira`, `
 
 ## Lifecycle
 
-Intake → Foreman → Triage → optional Spec (human approval by default) → Implement (Sandbox branch/PR) → Review (advisory; may request revision) → `tb check` on GitHub Actions (OIDC ingest; missing ingest is UNKNOWN) → human merge.
+Intake → Foreman → Triage → optional Spec (human approval by default) → Implement (customer-owned/self-hosted branch or PR) → Review (advisory; may request revision) → `tb check` on GitHub Actions (OIDC ingest; missing ingest is UNKNOWN) → human merge.
 
 The org Inbox stays exception-first (`/exceptions` on the local dashboard) and is not a kanban. Aftercare/warranty records attach to every release; the maintenance line scans decay (stale deps, secret expiry, API/config drift, test decay, unowned services, stale waivers).
 

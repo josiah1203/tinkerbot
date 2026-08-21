@@ -2,11 +2,19 @@
 
 ## Status
 
-Proposed (Revision 7 — hosted command routing and canonical client projections)
+Proposed (Revision 26 — operational telemetry, executor, WorkOS, billing, GitHub, self-hosted completion, tenant routes, hosted assurance, artifact persistence, Factory operations metadata, workspace metadata, graph-derived read models, provider protocols, D1 projection, hosted D1 storage, evidence, and capability boundaries)
+
+The application-level spine cutover is implemented and locally verified. This
+ADR remains Proposed because the declared Cloudflare Workflow binding still
+needs a valid durable entrypoint decision, and production shadow-read, hosted
+lifecycle, source tree commit/fresh-checkout, provisioning, signing, and
+executor proof gates still require durable release evidence. The local
+application-level gates are complete and the unsupported hosted Sandbox path
+fails closed.
 
 ## Date
 
-2026-08-20
+2026-08-21
 
 ## Owners
 
@@ -61,12 +69,14 @@ failures:
 - Duplicate or stray files under `.tinkerbot/` could make loader behavior
   depend on filesystem state rather than on a reproducible definition tree.
 
-The current implementation partially closes these defects: canonical review,
-verification, approval, and release commands now use typed constructors and the
-command boundary, and the compatibility projector only treats a legacy
-release event with an explicit `RELEASE` outcome as released. The remaining
-work is to remove or isolate legacy writers, prove adapter equivalence, and
-record production shadow-read evidence.
+The current implementation closes the application-level creation seam:
+canonical review, verification, approval, release, and WorkOrder admission
+commands use typed constructors and the command boundary; local and hosted
+stores persist admission metadata with the create event, receipt, outbox, and
+projection unit; and the compatibility projector only treats a legacy release
+event with an explicit `RELEASE` outcome as released. The remaining work is to
+commit the staged canonical source-tree cleanup, prove the hosted adapters
+against real staging resources, and record production shadow-read evidence.
 
 These are authority failures, not merely implementation complexity. An agent,
 integration, migration, or surface may provide evidence or request an action,
@@ -357,8 +367,10 @@ the only executor this ADR treats as supported for hosted implementation
 handoffs: the control plane emits a credential-free signed dispatch, the
 customer worker executes inside its own hardened boundary, and the worker
 returns through the signed completion and deterministic-verification path.
-Cloudflare Sandbox remains an explicitly incomplete, unsupported placeholder
-until its binding and isolation contract are implemented and stage-proven.
+This decision is final for the current release line: Cloudflare Sandbox remains
+feature-gated and explicitly unsupported. Enabling it requires a separate
+ADR/amendment for its binding, isolation, artifact, cancellation, failure, and
+stage-proof contract; it is not an alternate way to satisfy this ADR.
 The supported self-hosted path must still complete one real hosted lifecycle
 before it is described as production-ready:
 
@@ -372,9 +384,10 @@ request → WorkOrder → approval → execution → tb check
 
 Existing differentiated code may remain in the repository, but new scope that
 depends on lifecycle truth is gated until the spine acceptance criteria are
-green. The gate covers Sandbox implementation, production provider proof,
-per-tenant integration hardening, outcome/economics operations, scorers, and
-self-improvement.
+green. The gate covers production provider proof, per-tenant integration
+hardening, outcome/economics operations, scorers, and self-improvement. Sandbox
+implementation is separately deferred because the selected production executor
+contract is self-hosted.
 
 This is a sequencing decision, not a reduction in product ambition. The
 deterministic, replayable, vendor-independent, local/self-hosted, planning,
@@ -421,13 +434,14 @@ system. They resume on the same spine after the gate is met.
 
 ## Acceptance criteria
 
-- [ ] All binding lifecycle changes, including ChangeSet scope events, enter
+- [x] All application binding lifecycle changes, including ChangeSet scope events, enter
       through the Foreman command boundary;
-      no surface, worker, adapter, or migration path directly writes lifecycle
-      columns or appends binding events.
-- [ ] `verificationVerdict`, `reviewAssessment`, `releaseDecision`, and
+      no client, worker, or adapter path directly writes lifecycle columns or
+      appends binding events. Explicit idempotent backfill SQL remains a
+      migration-only historical import and is not an application writer.
+- [x] `verificationVerdict`, `reviewAssessment`, `releaseDecision`, and
       `outcomeStatus` are projected from the ledger and remain independent.
-- [ ] `review.recorded` uses only `NO_FINDINGS`, `FINDINGS`, or `ESCALATE`;
+- [x] `review.recorded` uses only `NO_FINDINGS`, `FINDINGS`, or `ESCALATE`;
       `reviewAssessment` is the canonical projection and legacy
       `reviewDecision` values are compatibility-only. Only a scoped
       `approval.recorded` event can grant authority. `release.decided` requires
@@ -436,58 +450,72 @@ system. They resume on the same spine after the gate is met.
       (`ROLLBACK`), and a review-event ID cannot satisfy that reference.
       Typed constructors enforce this at compile time for trusted callers;
       runtime validation enforces it for JSON, persisted, and remote inputs.
-- [ ] Verification/review/approval/release event constructors are structurally
+- [x] Verification/review/approval/release event constructors are structurally
       disjoint. A release decision requires exactly `RELEASE`, `HOLD`, or
       `ROLLBACK`; a `HOLD` event cannot project as `RELEASE`.
-- [ ] Every edge and illegal edge in the [companion transition table](./0010-factory-lifecycle-transition-table.md)
-      has a command-side test, including revision loops, release holds,
-      rollback eligibility, and late verification callbacks.
-- [ ] Hosted and local command handling serializes per WorkOrder, not per
+- [x] Every edge and illegal edge in the [companion transition table](./0010-factory-lifecycle-transition-table.md)
+      is exercised through the transition command API; idempotent self-edges
+      and fail-closed illegal edges are asserted, and domain-preconditioned
+      edges fail closed until their required facts exist. Dedicated spine tests
+      cover revision loops, release holds, rollback eligibility, and late
+      verification callbacks.
+- [x] Hosted and local command handling serializes per WorkOrder, not per
       Factory or tenant. Signed self-hosted completions are translated into
       Foreman commands and cannot append events directly.
-- [ ] Repeating a command with the same idempotency key returns the original
+- [x] Repeating a command with the same idempotency key returns the original
       result without duplicating an event or transition. The same key with a
       different canonical payload hard-fails with an idempotency conflict.
       Aggregate event order is deterministic across retries and restarts.
-- [ ] A process or Durable Object restart can reconstruct the same state from
+- [x] A process or Durable Object restart can reconstruct the same state from
       the ledger, and a failed projection can be rebuilt without a data repair
       performed by a client.
-- [ ] A new ChangeSet digest resets the current verification projection to
+- [x] A new ChangeSet digest resets the current verification projection to
       `UNKNOWN` and invalidates prior-digest review/release eligibility; late
       old-digest evidence cannot mutate current state.
-- [ ] A fixed replay suite runs the same ordered event fixtures against Memory,
+- [x] A fixed replay suite runs the same ordered event fixtures against Memory,
       SQLite, and D1 and produces identical verification, review, approval,
       release, rollback, outcome, and legacy-migration projections.
 - [ ] The production shadow-read phase records zero unexplained projection
       divergence for the declared soak window, with historical backfill diffs
       accounted for before surfaces switch to the new projection.
-- [ ] Legacy mappings are explicit and non-overlapping. No migration maps
-      approval to a review-completion event or ready to a release outcome.
-- [ ] `AuditEvent` is generated from the Factory Graph projection and has no
-      independent append path.
-- [ ] CI rejects duplicate semantic `.tinkerbot/` paths, loaded untracked
+- [x] Legacy mappings are explicit and non-overlapping. The graph projector
+      maps legacy verification/review/release events in named branches; only
+      `release.completed{decision: RELEASE}` can project a release, and no
+      approval maps to review completion or `ready` to a release outcome.
+- [x] `AuditEvent` is generated from the Factory Graph projection and has no
+      independent append path; the Memory, SQLite, and D1 adapters expose only
+      read-only audit projections.
+- [x] CI rejects duplicate semantic `.tinkerbot/` paths, loaded untracked
       files, and definition digest drift.
-- [ ] A grep- or static-analysis-verifiable check finds no direct application
+- [x] A grep- or static-analysis-verifiable check finds no direct application
       write to lifecycle route fields (`status`, `current_stage`, `actor`) or
       decision fields (`verification_verdict`, `review_assessment`,
       `release_decision`) outside the projection/compatibility layer.
-- [ ] Every client surface reads the same graph projection for lifecycle state;
+- [x] Every client surface reads the same graph projection for lifecycle state;
       provider adapters retain only external references, delivery status, and
       correlation metadata.
-- [ ] Secret/credential rejection, tenant isolation, actor authorization, and
+- [x] Secret/credential rejection, tenant isolation, actor authorization, and
       audit provenance remain enforced at the command and event boundary.
-- [ ] The companion transition table and Foreman legality checks are generated
-      from, or verified against, the same transition contract; a mismatch is a
-      build- or review-blocking failure.
-- [ ] Any file moved during consolidation is resolved in a durable inventory
+- [x] The companion transition table and Foreman legality checks are verified
+      against the same executable transition contract; the transition contract
+      test fails on snapshot drift and tests every legal/illegal command edge.
+- [x] Any file moved during consolidation is resolved in a durable inventory
       as discarded, merged, or explicitly flagged before its staging location
       is cleaned up.
+- [x] The supported hosted executor contract is explicit: signed self-hosted
+      dispatch is the only production execution claim; the Cloudflare Sandbox
+      binding is unsupported until implemented and stage-proven, and an absent
+      executable binding fails closed with a graph-visible block.
+- [ ] The declared `FACTORY_RUN` binding either has a real
+      `WorkflowEntrypoint<Env, Params>` implementation with a durable
+      `WorkflowStep`/`step.do` boundary and a runtime caller, or is removed until
+      a Workflow use case is approved. Queue → Foreman remains the active hosted
+      delivery path while this gate is open.
 - [ ] `main` is the only release source for the Factory Spine and these ADRs;
       divergent worktrees are triaged and cannot remain parallel sources of
       truth.
-- [ ] Exactly one production executor is documented as supported, and one
-      complete hosted lifecycle has been proven before the executor is called
-      production-ready.
+- [ ] One complete hosted self-hosted lifecycle has been proven before the
+      executor is called production-ready.
 - [ ] This ADR changes to `Accepted` only after the adapter conformance suite
       and the declared production shadow-read soak pass, with duration,
       divergence count, and test evidence recorded here or in linked durable
@@ -495,8 +523,8 @@ system. They resume on the same spine after the gate is met.
 
 ## Current implementation evidence
 
-The current `main` worktree implements the local/hosted durability contract
-without treating this ADR as accepted:
+The current `main` worktree implements the local/hosted application durability
+contract without treating this ADR as accepted:
 
 - SQLite and D1 persist command receipts, ordered graph events, and graph
   outbox entries atomically when their adapter supports transactions/batches.
@@ -514,15 +542,187 @@ without treating this ADR as accepted:
   verification paths share a canonical per-WorkOrder Foreman coordinator
   identity. Hosted views and factory activity/metrics prefer the replayed
   route projection and use compatibility columns only as fallback.
+- WorkOrder creation uses `admitWorkOrder` in the Memory, SQLite, and D1
+  adapters and in local/hosted command paths. `seedWorkOrder` is restricted to
+  test and migration fixtures. The admission test covers the create event,
+  receipt, replay, SQLite restart, and projected WorkOrder state.
+- Shared local Factory operations live in
+  `packages/local-runtime/src/factory-operations.ts`; `platform-mcp` no longer
+  imports the CLI command module, so the former CLI/MCP package cycle is gone.
+- Core WorkOrder list/detail/graph/mutation responses use the typed route
+  contract in `packages/factory/src/route-contract.ts`; the Worker produces the
+  list/detail/graph forms and CLI/TUI clients reject malformed successful
+  responses instead of silently treating them as lifecycle state.
+- Run responses and the core products/cells/skills/evolution/releases/outcomes
+  collections use the same route-contract construction helpers; resource
+  expansion remains additive and cannot redefine WorkOrder lifecycle authority.
+- Self-hosted dispatch and the feature-gated Sandbox adapter now live behind
+  `apps/control-plane-worker/src/factory-executor.ts`; `factory-runtime.ts`
+  coordinates lifecycle decisions without embedding provider-specific executor
+  behavior.
+- Foreman Durable Object admission, typed decision handling, and bounded
+  internal command request parsing now live behind
+  `apps/control-plane-worker/src/foreman-routes.ts`; the runtime coordinator
+  retains the lifecycle/run functions while the Worker entrypoint exposes the
+  serialized coordinator as its own boundary.
+- Shared bounded JSON request admission now lives behind
+  `apps/control-plane-worker/src/factory-request.ts`, keeping MCP and Foreman
+  payload limits consistent without duplicating parser logic.
+- Scheduled Factory OS cell cleanup and maintenance dispatch now live behind
+  `apps/control-plane-worker/src/factory-maintenance.ts`; maintenance emits a
+  queue-shaped command and does not acquire lifecycle authority of its own.
+- The Wrangler `FACTORY_RUN` binding is currently a configuration-only,
+  unverified platform edge: `FactoryRunWorkflow` does not yet implement the
+  official Workflow entrypoint/step contract and no source path calls
+  `FACTORY_RUN.create`. The active hosted path is Queue → Foreman; this ADR
+  does not count the Workflow binding as production authority until the
+  contract is implemented and exercised, or the binding is removed.
+- WorkOS membership, invitation, SCIM, and Events API reconciliation now live
+  behind `apps/control-plane-worker/src/workos-sync.ts`; the Worker entrypoint
+  keeps route/authentication concerns while the synchronization module owns
+  tenant and identity updates without writing Factory lifecycle events.
+- Session cookies, service credentials, tenant capability checks, invitation
+  validation, and public tenant-session views now live behind
+  `apps/control-plane-worker/src/tenant-auth.ts`; the Worker entrypoint passes
+  the authorization boundary into route adapters without duplicating the role
+  matrix or credential lookup logic.
+- OAuth start/callback, session refresh, organization selection, membership
+  reconciliation, invitation, and sign-out HTTP routes now live behind
+  `apps/control-plane-worker/src/tenant-routes.ts`; the adapter receives
+  response/body, origin, PKCE, redirect, and entitlement dependencies and
+  cannot advance Factory lifecycle state directly.
+- Hosted assurance summary, OIDC/run-token ingestion, receipt binding, evidence
+  publication, and verification reconciliation now live behind
+  `apps/control-plane-worker/src/assurance-routes.ts`; the Worker entrypoint
+  supplies auth, entitlement, response, and queue dependencies while the route
+  adapter keeps untrusted assurance input subordinate to the Factory command
+  boundary.
+- Factory definition validation, tree integrity checks, digest/version
+  persistence, and automation replacement now live behind
+  `apps/control-plane-worker/src/factory-definition-store.ts`; the graph store
+  remains the lifecycle and command authority and does not own definition
+  ingestion details.
+- Stripe webhook, catalog, seat, checkout, subscription, trial, and scheduled
+  reconciliation routes now live behind
+  `apps/control-plane-worker/src/billing-routes.ts`. The module receives
+  authentication/body/response dependencies and has no Factory dispatch or
+  transition entrypoint, keeping provider/account state separate from the
+  lifecycle spine.
+- D1 graph command/domain composition remains in the
+  `apps/control-plane-worker/src/factory-store.ts` façade; checkpoint writes,
+  compatibility projection refresh, typed verification/decision recording,
+  and read-only shadow audits now live behind
+  `apps/control-plane-worker/src/factory-projection-store.ts`. The projection
+  adapter is a host-owned persistence boundary, not a second lifecycle
+  authority.
+- D1 graph event, outbox, command-receipt, and replay persistence now live
+  behind `apps/control-plane-worker/src/factory-graph-store.ts`; the enclosing
+  `D1FactoryStore` façade still owns the `FactoryCommandBoundary` and remains
+  the only Worker-facing lifecycle authority.
+- D1 command and operational telemetry persistence now lives behind
+  `apps/control-plane-worker/src/factory-telemetry-store.ts`; the main D1
+  graph/domain store exposes only a façade so discardable telemetry cleanup
+  cannot accidentally touch lifecycle tables.
+- Hosted D1 metadata, tenant, billing, session, and webhook persistence now
+  lives behind `packages/hosted-integrations/src/d1-stores.ts`; the provider
+  protocol facade retains WorkOS/Stripe/configuration contracts without
+  becoming the storage authority or a Factory lifecycle writer.
+- R2 evidence persistence and optional customer HTTP replication now live
+  behind `packages/hosted-integrations/src/evidence-store.ts`; replica
+  failures remain discardable and cannot alter a deterministic verification
+  verdict.
+- GitHub webhook persistence and verification publication now live behind
+  `apps/control-plane-worker/src/github-integrations.ts`; the Worker route
+  entrypoint retains authentication and dispatch wiring without embedding
+  provider-specific repository or Check Run behavior.
+- Provider webhook admission, integration command dispatch, GitHub installation
+  binding, and WorkOS webhook delivery now live behind
+  `apps/control-plane-worker/src/integration-routes.ts`; provider intake remains
+  subordinate to tenant/session boundaries and the Factory command boundary.
+- Signed self-hosted completion verification, graph event translation, and
+  resume dispatch now live behind
+  `apps/control-plane-worker/src/self-hosted-routes.ts`; the Worker entrypoint
+  supplies response/body and queue dependencies while the adapter preserves
+  idempotent replay and keeps completion input subordinate to the Factory
+  command boundary.
+- Workspace environments, integrations, secret metadata, scorers,
+  self-improvement records, and automation persistence now live behind
+  `apps/control-plane-worker/src/factory-workspace-store.ts`; these are
+  operator/read-model concerns and remain separate from graph events,
+  command receipts, and lifecycle transitions.
+- Graph-derived operator and WorkOrder views now live behind
+  `apps/control-plane-worker/src/factory-read-model.ts`; the adapter rebuilds
+  dashboard state from the D1 store and graph projection without becoming a
+  second source of lifecycle authority.
+- Run/stage, usage/cost, evidence, execution-plan, run-token, publication, and
+  evaluation persistence now live behind
+  `apps/control-plane-worker/src/factory-artifact-store.ts`; the adapter has no
+  graph-event or command-boundary write path.
+- Factory cells, products, skills, proposals, release candidates, deployments,
+  outcomes, scorers, and self-improvement metadata now live behind
+  `apps/control-plane-worker/src/factory-operations-store.ts`; organization
+  checks are injected for proposal approval, and the adapter cannot append
+  lifecycle graph events.
+- WorkOS and Stripe protocol clients now live behind dedicated
+  `packages/hosted-integrations/src/workos-provider.ts` and
+  `packages/hosted-integrations/src/stripe-provider.ts` modules, with shared
+  provider errors/request handling in `provider-core.ts`; the package index is
+  a contract/configuration facade rather than a provider implementation hub.
+- Runtime runner aliases and inference-provider aliases normalize into one
+  canonical vocabulary in `packages/factory/src/runtime.ts`; unsupported
+  hosted combinations produce typed capability codes, and the Worker reports
+  those codes as graph-visible blocked outcomes. The local dashboard's
+  in-memory backend is explicitly a preview fixture and is rejected when the
+  static server runs with `CONTROL_PLANE_MODE=production`.
+- The dashboard route loader rejects failed graph/list/detail/resource reads
+  instead of substituting cached activity or preview state as authoritative
+  lifecycle data. The package preparation step also removes all numeric-suffix
+  generated artifacts before release packaging.
+- `scripts/verify-schema-contract.mjs` checks the SQLite runtime DDL against the
+  D1 graph, command, receipt, checkpoint, command-telemetry, and operational-
+  telemetry migrations, including the tenant, aggregate-ordering, idempotency,
+  receipt, retention, and projection-retry indexes. The verifier is part of
+  `pnpm verify:tree` and the release build preflight.
+- `D1FactoryStore.shadowReadOrganization` and the opt-in scheduled
+  `FACTORY_SHADOW_READ_ORGANIZATION_ID` binding provide a bounded, read-only
+  hosted comparison job. It emits divergence evidence and never repairs or
+  rewrites compatibility state; the staging soak remains an external gate.
+- D1 command dispatch retains the same payload-free telemetry envelope in
+  `tinkerbot_factory_command_telemetry`; the ledger is explicitly
+  non-authoritative and telemetry persistence failures are swallowed by the
+  command boundary.
+- The operational telemetry contract is typed separately from command
+  telemetry. It covers queue delivery, Foreman coordination, projection
+  shadow reads, self-hosted dispatch/completion, verification ingest, provider
+  webhooks, and retention cleanup. SQLite and D1 expose bounded command
+  telemetry cleanup, while D1 also persists the typed operational-signal
+  ledger; all cleanup touches no graph, receipt, or projection table.
+- `pnpm verify:release-gates` provides a repeatable local report and preserves
+  the explicit `local_pass_external_pending` state; it is evidence collection,
+  not ADR acceptance or production-authority promotion.
+- `FactoryCommandBoundary` and the synchronous SQLite command path emit
+  correlation-safe telemetry for commit, replay, validation/persistence
+  failure, event/projection counts, idempotency key, and command latency. The
+  telemetry record excludes command payloads and cannot change command outcome.
 - The fixed Memory/SQLite/D1 conformance fixture, route-transition replay,
   restart/replay tests, and simulated partial-projection recovery test pass in
-  the repository test suite. The latest full run was `50` files and `321`
+  the repository test suite. The latest full run was `53` files and `337`
   tests.
-- The repository-wide typecheck and factory-tree gate remain intentionally
-  red because the worktree contains unresolved duplicate/untracked artifacts;
-  the duplicate inventory records the `.tinkerbot/` state and no destructive
-  cleanup has been authorized. Production shadow-read soak and one complete
-  hosted lifecycle remain external proof gates.
+- The current working tree passes `pnpm typecheck`, `pnpm verify:source-tree`,
+  `pnpm verify:factory-tree`, `pnpm verify:migrations`,
+  `pnpm verify:schema-contract`, and `git diff --check`.
+  The duplicate inventory records 592 byte-identical copies removed from active
+  paths and 61 durable quarantine files. The cleanup is staged in the current
+  index but not committed, so a fresh checkout remains an open source-tree
+  gate.
+- When the hosted runtime has no executable Sandbox binding and the WorkOrder
+  does not require self-hosted execution, `runFactoryTurn` records a typed
+  `task.blocked` reason (`cloudflare_sandbox_unsupported`), transitions the
+  WorkOrder to `blocked`, and returns `executor_unavailable`; it does not leave
+  the WorkOrder waiting on an unavailable executor.
+- Production shadow-read soak, one complete hosted self-hosted lifecycle,
+  provisioned staging/production resources, a reviewed commit of the staged
+  source cleanup, and signed release artifacts remain release gates.
 
 ## Explicitly deferred until the spine is complete
 

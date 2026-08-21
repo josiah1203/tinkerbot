@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import { MemoryFactoryStore, type FactoryStore, type OutboxEvent, type InlineApprovalRecord } from "../../factory/src/store";
 import type { CostEstimate, ExecutionPlan, ProviderUsage } from "../../factory/src/runtime";
 import type { EvalAttempt, EvalSuite } from "../../factory/src/evals";
-import { assertCanonicalFactoryEvent, assertFactoryEventAuthority, assertFactoryEventOrdering, commandPayloadFingerprint, createApprovalRecordedEvent, createFactoryProjectionCheckpoint, graphEventForWorkOrderTransition, isFactoryCommandBoundaryEventType, projectFactoryAuditEvents, projectFactoryEvents, shadowReadFactoryProjection, validateReleaseApprovalReference, type AftercareRecord, type FactoryCommand, type FactoryCommandInput, type FactoryCommandReceipt, type FactoryCommandResult, type FactoryEvent, type FactoryProjection, type FactoryProjectionCheckpoint, type WorkOrder, type WorkOrderState } from "../../factory/src";
+import { assertCanonicalFactoryEvent, assertFactoryEventAuthority, assertFactoryEventOrdering, commandPayloadFingerprint, createApprovalRecordedEvent, createFactoryProjectionCheckpoint, createWorkOrderCreatedEvent, graphEventForWorkOrderTransition, isFactoryCommandBoundaryEventType, parseFactoryTelemetryRetentionDays, projectFactoryAuditEvents, projectFactoryEvents, shadowReadFactoryProjection, validateReleaseApprovalReference, type AftercareRecord, type FactoryCommand, type FactoryCommandInput, type FactoryCommandReceipt, type FactoryCommandResult, type FactoryCommandTelemetry, type FactoryEvent, type FactoryProjection, type FactoryProjectionCheckpoint, type WorkOrder, type WorkOrderState } from "../../factory/src";
 import { openSqliteDatabase, SQLITE_MAGIC, type SqliteDatabase } from "./sqlite-engine";
 import { assertNoSecretInPayload } from "./credentials";
 
@@ -211,6 +211,7 @@ CREATE TABLE IF NOT EXISTS tinkerbot_factory_commands (
   payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tinkerbot_factory_commands_idempotency ON tinkerbot_factory_commands (organization_id, idempotency_key);
 CREATE TABLE IF NOT EXISTS tinkerbot_factory_command_receipts (
   organization_id TEXT NOT NULL,
   work_order_id TEXT NOT NULL,
@@ -252,7 +253,9 @@ CREATE TABLE IF NOT EXISTS tinkerbot_factory_graph_events (
   payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tinkerbot_factory_graph_aggregate ON tinkerbot_factory_graph_events (aggregate_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_tinkerbot_factory_graph_tenant ON tinkerbot_factory_graph_events (organization_id, factory_id, occurred_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tinkerbot_factory_graph_sequence ON tinkerbot_factory_graph_events (aggregate_id, aggregate_sequence);
+CREATE INDEX IF NOT EXISTS idx_tinkerbot_factory_command_receipts_work_order ON tinkerbot_factory_command_receipts (organization_id, work_order_id, created_at);
 CREATE TABLE IF NOT EXISTS tinkerbot_factory_projection_checkpoints (
   organization_id TEXT NOT NULL,
   aggregate_id TEXT NOT NULL,
@@ -269,6 +272,27 @@ CREATE TABLE IF NOT EXISTS tinkerbot_factory_projection_checkpoints (
 );
 CREATE INDEX IF NOT EXISTS idx_tinkerbot_factory_projection_retry
   ON tinkerbot_factory_projection_checkpoints (status, updated_at);
+CREATE TABLE IF NOT EXISTS tinkerbot_factory_command_telemetry (
+  telemetry_id TEXT PRIMARY KEY,
+  command_id TEXT NOT NULL,
+  organization_id TEXT NOT NULL,
+  factory_id TEXT NOT NULL,
+  work_order_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  payload_fingerprint TEXT NOT NULL,
+  correlation_id TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  event_count INTEGER NOT NULL,
+  projection_event_count INTEGER NOT NULL,
+  projection_status TEXT NOT NULL,
+  aggregate_sequence INTEGER,
+  duration_ms INTEGER NOT NULL,
+  error_code TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tinkerbot_factory_command_telemetry_org ON tinkerbot_factory_command_telemetry (organization_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_tinkerbot_factory_command_telemetry_work_order ON tinkerbot_factory_command_telemetry (work_order_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_tinkerbot_factory_command_telemetry_created ON tinkerbot_factory_command_telemetry (created_at);
 `;
 
 function isSqliteFile(filePath: string): boolean {
@@ -305,6 +329,7 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
     this.database = openSqliteDatabase(filePath);
     this.database.exec(LOCAL_DDL);
     ensureSqliteColumns(this.database);
+    this.commandBoundary.setTelemetrySink((telemetry) => this.persistCommandTelemetry(telemetry));
     this.migratedFromJson = Boolean(jsonPending);
     if (jsonPending) this.importJson(jsonPending);
     else this.loadSql();
@@ -315,6 +340,18 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
   schemaVersion(): number {
     const row = this.database.prepare("SELECT value FROM tinkerbot_metadata WHERE key = ?").get("schema_version");
     return Number(row?.value ?? LOCAL_DB_SCHEMA_VERSION);
+  }
+
+  private persistCommandTelemetry(telemetry: FactoryCommandTelemetry): void {
+    this.database.prepare("INSERT INTO tinkerbot_factory_command_telemetry (telemetry_id, command_id, organization_id, factory_id, work_order_id, idempotency_key, payload_fingerprint, correlation_id, outcome, event_count, projection_event_count, projection_status, aggregate_sequence, duration_ms, error_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+      crypto.randomUUID(), telemetry.commandId, telemetry.organizationId, telemetry.factoryId, telemetry.workOrderId, telemetry.idempotencyKey, telemetry.payloadFingerprint, telemetry.correlationId, telemetry.outcome, telemetry.eventCount, telemetry.projectionEventCount, telemetry.projectionStatus, telemetry.aggregateSequence ?? null, telemetry.durationMs, telemetry.errorCode ?? null, new Date().toISOString(),
+    );
+  }
+
+  /** Operational visibility only; command telemetry is never lifecycle state. */
+  commandTelemetryCount(): number {
+    const row = this.database.prepare("SELECT COUNT(*) AS count FROM tinkerbot_factory_command_telemetry").get();
+    return Math.max(0, Number(row?.count ?? 0));
   }
 
   /**
@@ -340,36 +377,64 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
 
   dispatchFactoryCommandSync<T>(input: FactoryCommandInput<T>): FactoryCommandResult {
     if (!input.organizationId || !input.factoryId || !input.workOrderId || !input.idempotencyKey) throw new Error("invalid_factory_command_identity");
+    const startedAt = Date.now();
     const commandId = input.commandId ?? `cmd_${crypto.randomUUID().replace(/-/g, "")}`;
     const payloadFingerprint = commandPayloadFingerprint(input.payload);
     const receiptKey = `${input.organizationId}:${input.workOrderId}:${input.idempotencyKey}`;
     const durable = this.readFactoryCommandReceiptSync(input.organizationId, input.workOrderId, input.idempotencyKey);
     const known = durable ?? this.commandReceipts.get(receiptKey);
     const priorEvents = this.readFactoryEvents(input.workOrderId);
+    const recordTelemetry = (telemetry: Omit<FactoryCommandTelemetry, "durationMs">): void => this.commandBoundary.recordTelemetry({ ...telemetry, durationMs: Math.max(0, Date.now() - startedAt) });
     if (known) {
-      if (known.payloadFingerprint !== payloadFingerprint) throw new Error("idempotency_conflict");
+      if (known.payloadFingerprint !== payloadFingerprint) {
+        recordTelemetry({ kind: "factory_command", commandId, organizationId: input.organizationId, factoryId: input.factoryId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, correlationId: priorEvents[0]?.correlationId ?? input.workOrderId, outcome: "failed", eventCount: 0, projectionEventCount: priorEvents.length, projectionStatus: "unavailable", aggregateSequence: priorEvents.at(-1)?.aggregateSequence, errorCode: "idempotency_conflict" });
+        throw new Error("idempotency_conflict");
+      }
+      recordTelemetry({ kind: "factory_command", commandId: known.commandId, organizationId: input.organizationId, factoryId: input.factoryId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, correlationId: priorEvents[0]?.correlationId ?? input.workOrderId, outcome: "replayed", eventCount: known.eventIds.length, projectionEventCount: priorEvents.length, projectionStatus: "available", aggregateSequence: priorEvents.at(-1)?.aggregateSequence });
       return { replayed: true, commandId: known.commandId, payloadFingerprint, eventIds: known.eventIds, events: priorEvents.filter((event) => known.eventIds.includes(event.eventId)), projection: projectFactoryEvents(priorEvents) };
     }
     const matching = priorEvents.filter((event) => event.idempotencyKey === input.idempotencyKey);
     if (matching.length) {
-      if (matching.some((event) => event.payloadFingerprint !== payloadFingerprint)) throw new Error("idempotency_conflict");
+      if (matching.some((event) => event.payloadFingerprint !== payloadFingerprint)) {
+        recordTelemetry({ kind: "factory_command", commandId, organizationId: input.organizationId, factoryId: input.factoryId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, correlationId: matching[0]?.correlationId ?? input.workOrderId, outcome: "failed", eventCount: 0, projectionEventCount: priorEvents.length, projectionStatus: "unavailable", aggregateSequence: priorEvents.at(-1)?.aggregateSequence, errorCode: "idempotency_conflict" });
+        throw new Error("idempotency_conflict");
+      }
       const recovered: FactoryCommandReceipt = { organizationId: input.organizationId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, commandId: matching[0]!.commandId ?? commandId, eventIds: matching.map((event) => event.eventId), createdAt: input.now ?? new Date().toISOString() };
       this.commandReceipts.set(receiptKey, recovered);
+      recordTelemetry({ kind: "factory_command", commandId: recovered.commandId, organizationId: input.organizationId, factoryId: input.factoryId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, correlationId: matching[0]?.correlationId ?? input.workOrderId, outcome: "replayed", eventCount: matching.length, projectionEventCount: priorEvents.length, projectionStatus: "available", aggregateSequence: priorEvents.at(-1)?.aggregateSequence });
       return { replayed: true, commandId: recovered.commandId, payloadFingerprint, eventIds: recovered.eventIds, events: matching, projection: projectFactoryEvents(priorEvents) };
     }
     const maxSequence = priorEvents.reduce((max, event) => Math.max(max, event.aggregateSequence ?? 0), 0);
-    const built = input.buildEvents({ priorEvents, nextSequence: maxSequence + 1, commandId, payloadFingerprint });
-    if (!built.length) throw new Error("factory_command_produced_no_events");
+    let built: FactoryEvent[];
+    try {
+      built = input.buildEvents({ priorEvents, nextSequence: maxSequence + 1, commandId, payloadFingerprint });
+    } catch (error) {
+      recordTelemetry({ kind: "factory_command", commandId, organizationId: input.organizationId, factoryId: input.factoryId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, correlationId: priorEvents[0]?.correlationId ?? input.workOrderId, outcome: "failed", eventCount: 0, projectionEventCount: priorEvents.length, projectionStatus: "unavailable", aggregateSequence: priorEvents.at(-1)?.aggregateSequence, errorCode: error instanceof Error ? error.message : "factory_command_build_failed" });
+      throw error;
+    }
+    if (!built.length) {
+      recordTelemetry({ kind: "factory_command", commandId, organizationId: input.organizationId, factoryId: input.factoryId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, correlationId: priorEvents[0]?.correlationId ?? input.workOrderId, outcome: "failed", eventCount: 0, projectionEventCount: priorEvents.length, projectionStatus: "unavailable", aggregateSequence: priorEvents.at(-1)?.aggregateSequence, errorCode: "factory_command_produced_no_events" });
+      throw new Error("factory_command_produced_no_events");
+    }
     const events = built.map((builtEvent, index) => ({ ...builtEvent, aggregateId: input.workOrderId, organizationId: input.organizationId, factoryId: input.factoryId, actorId: input.actorId, actorType: input.actorType, aggregateSequence: maxSequence + index + 1, commandId, idempotencyKey: input.idempotencyKey, payloadFingerprint }) as FactoryEvent);
-    for (let index = 0; index < events.length; index += 1) {
-      const event = events[index]!;
-      if (event.type === "release.decided") validateReleaseApprovalReference(event, priorEvents, events.slice(0, index));
-      assertFactoryEventOrdering(event, [...priorEvents, ...events.slice(0, index)]);
-      assertCanonicalFactoryEvent(event);
+    try {
+      for (let index = 0; index < events.length; index += 1) {
+        const event = events[index]!;
+        if (event.type === "release.decided") validateReleaseApprovalReference(event, priorEvents, events.slice(0, index));
+        assertFactoryEventOrdering(event, [...priorEvents, ...events.slice(0, index)]);
+        assertCanonicalFactoryEvent(event);
+      }
+    } catch (error) {
+      recordTelemetry({ kind: "factory_command", commandId, organizationId: input.organizationId, factoryId: input.factoryId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, correlationId: events[0]?.correlationId ?? input.workOrderId, outcome: "failed", eventCount: 0, projectionEventCount: priorEvents.length, projectionStatus: "unavailable", aggregateSequence: priorEvents.at(-1)?.aggregateSequence, errorCode: error instanceof Error ? error.message : "factory_command_validation_failed" });
+      throw error;
     }
     const receipt: FactoryCommandReceipt = { organizationId: input.organizationId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, commandId, eventIds: events.map((event) => event.eventId), resultJson: JSON.stringify({ eventIds: events.map((event) => event.eventId) }), createdAt: input.now ?? new Date().toISOString() };
     try {
       this.database.exec("BEGIN");
+      if (input.admission) {
+        this.persistWorkOrderRowSync(input.admission, true);
+        this.orders.set(input.admission.workOrderId, input.admission);
+      }
       for (const event of events) {
         this.database.prepare("INSERT INTO tinkerbot_factory_graph_events (event_id, aggregate_id, aggregate_type, organization_id, factory_id, event_type, actor_id, actor_type, occurred_at, correlation_id, causation_id, aggregate_sequence, command_id, idempotency_key, payload_fingerprint, policy_version, provenance, external_references_json, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
           event.eventId, event.aggregateId, event.aggregateType, event.organizationId, event.factoryId, event.type, event.actorId, event.actorType, event.occurredAt, event.correlationId, event.causationId ?? null, event.aggregateSequence ?? null, event.commandId ?? null, event.idempotencyKey ?? null, event.payloadFingerprint ?? null, event.policyVersion ?? null, event.provenance, event.externalReferences ? JSON.stringify(event.externalReferences) : null, JSON.stringify(event.payload),
@@ -380,35 +445,42 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
       this.database.exec("COMMIT");
     } catch (error) {
       try { this.database.exec("ROLLBACK"); } catch { /* preserve the original persistence failure */ }
+      recordTelemetry({ kind: "factory_command", commandId, organizationId: input.organizationId, factoryId: input.factoryId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, correlationId: events[0]?.correlationId ?? input.workOrderId, outcome: "failed", eventCount: 0, projectionEventCount: priorEvents.length, projectionStatus: "unavailable", aggregateSequence: priorEvents.at(-1)?.aggregateSequence, errorCode: error instanceof Error ? error.message : "factory_command_persistence_failed" });
       throw error;
     }
     for (const event of events) this.factoryEvents.push(Object.freeze(event));
     this.commandReceipts.set(receiptKey, receipt);
     this.refreshLifecycleProjectionSync(input.workOrderId);
-    return { replayed: false, commandId, payloadFingerprint, eventIds: receipt.eventIds, events, projection: projectFactoryEvents([...priorEvents, ...events]) };
+    const projection = projectFactoryEvents([...priorEvents, ...events]);
+    recordTelemetry({ kind: "factory_command", commandId, organizationId: input.organizationId, factoryId: input.factoryId, workOrderId: input.workOrderId, idempotencyKey: input.idempotencyKey, payloadFingerprint, correlationId: events[0]?.correlationId ?? input.workOrderId, outcome: "committed", eventCount: events.length, projectionEventCount: priorEvents.length + events.length, projectionStatus: "available", aggregateSequence: events.at(-1)?.aggregateSequence });
+    return { replayed: false, commandId, payloadFingerprint, eventIds: receipt.eventIds, events, projection };
   }
 
-  /** Persist a work order and its creation event atomically from the CLI. */
-  insertWorkOrderSync(order: WorkOrder, event: FactoryEvent): void {
+  private persistWorkOrderRowSync(order: WorkOrder, ignoreConflict = false): void {
     this.database.prepare(`INSERT INTO tinkerbot_work_orders (
       work_order_id, factory_id, organization_id, source_type, source_id, repository_id, issue_or_pull_request, intent, acceptance_criteria,
       policy_version, definition_version, definition_digest, current_stage, status, actor, created_at, updated_at, product_id, line_id, cell_id,
       owner, risk, autonomy_mode, output_kind, policy_json, dependencies_json, held_by, origin, execution_plan_id,
       verification_verdict, review_assessment, release_decision, waiver_json
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(work_order_id) DO UPDATE SET status = excluded.status, current_stage = excluded.current_stage, updated_at = excluded.updated_at`).run(
+    ${ignoreConflict ? "ON CONFLICT(work_order_id) DO NOTHING" : "ON CONFLICT(work_order_id) DO UPDATE SET status = excluded.status, current_stage = excluded.current_stage, updated_at = excluded.updated_at"}`).run(
       order.workOrderId, order.factoryId, order.organizationId, order.sourceType, order.sourceId, order.repositoryId, order.issueOrPullRequest ?? null, order.intent ?? null, order.acceptanceCriteria ?? null,
       order.policyVersion, order.definitionVersion, order.definitionDigest, order.currentStage, order.status, order.actor, order.createdAt, order.updatedAt, order.productId ?? null, order.lineId ?? null, order.cellId ?? null,
       order.owner ?? null, order.risk ?? null, order.autonomyMode ?? null, order.outputKind ?? null, order.policyJson ?? null, order.dependenciesJson ?? null, order.heldBy ?? null, order.origin ?? "local", order.executionPlanId ?? null,
       order.verificationVerdict ?? "UNKNOWN", order.reviewAssessment ?? "NEEDS_HUMAN_REVIEW", order.releaseDecision ?? "BLOCKED", order.waiver ? JSON.stringify(order.waiver) : null,
     );
+  }
+
+  /** Seed-only compatibility path for tests and legacy migration fixtures. */
+  seedWorkOrderSync(order: WorkOrder, event: FactoryEvent = createWorkOrderCreatedEvent(order)): void {
+    this.persistWorkOrderRowSync(order);
     this.orders.set(order.workOrderId, order);
-    this.appendFactoryEventSync(event);
+    this.appendFactoryEventSync(event, { migration: true });
   }
 
   private importJson(raw: string): void {
     const parsed = JSON.parse(raw) as JsonPersistedState;
-    for (const order of parsed.orders ?? []) this.insertWorkOrderSync(order, {
+    for (const order of parsed.orders ?? []) this.seedWorkOrderSync(order, {
       eventId: `evt_${order.workOrderId}`, type: "work_order.created", aggregateId: order.workOrderId, aggregateType: "work_order", organizationId: order.organizationId, factoryId: order.factoryId,
       actorId: order.actor, actorType: order.sourceType === "manual" ? "human" : "integration", occurredAt: order.createdAt, correlationId: order.workOrderId, schemaVersion: 1, policyVersion: order.policyVersion, provenance: "ATTESTED",
       payload: { workOrderId: order.workOrderId, intent: order.intent, sourceType: order.sourceType, sourceId: order.sourceId },
@@ -531,7 +603,7 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
         eventId: `evt_${workOrderId}`, type: "work_order.created", aggregateId: workOrderId, aggregateType: "work_order", organizationId: String(row.organization_id), factoryId: String(row.factory_id),
         actorId: String(row.actor), actorType: row.source_type === "manual" ? "human" : "integration", occurredAt: String(row.created_at), correlationId: workOrderId, schemaVersion: 1, policyVersion: String(row.policy_version), provenance: "ATTESTED",
         payload: { workOrderId, intent: row.intent ? String(row.intent) : undefined, sourceType: String(row.source_type), sourceId: String(row.source_id) },
-      });
+      }, { migration: true });
     }
     const transitions = this.database.prepare("SELECT e.event_id, e.work_order_id, e.from_state, e.to_state, e.cause_id, e.actor, e.created_at, w.factory_id, w.organization_id, w.policy_version FROM tinkerbot_work_order_events e JOIN tinkerbot_work_orders w ON w.work_order_id = e.work_order_id ORDER BY e.created_at, e.event_id").all() as Array<Record<string, unknown>>;
     for (const row of transitions) {
@@ -577,20 +649,38 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
     }
   }
 
-  override async insertWorkOrder(order: WorkOrder): Promise<void> {
-    await super.insertWorkOrder(order);
-    this.database.prepare(`INSERT INTO tinkerbot_work_orders (
-      work_order_id, factory_id, organization_id, source_type, source_id, repository_id, issue_or_pull_request, intent, acceptance_criteria,
-      policy_version, definition_version, definition_digest, current_stage, status, actor, created_at, updated_at, product_id, line_id, cell_id,
-      owner, risk, autonomy_mode, output_kind, policy_json, dependencies_json, held_by, origin, execution_plan_id,
-      verification_verdict, review_assessment, release_decision, waiver_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(work_order_id) DO UPDATE SET status = excluded.status, current_stage = excluded.current_stage, updated_at = excluded.updated_at`).run(
-      order.workOrderId, order.factoryId, order.organizationId, order.sourceType, order.sourceId, order.repositoryId, order.issueOrPullRequest ?? null, order.intent ?? null, order.acceptanceCriteria ?? null,
-      order.policyVersion, order.definitionVersion, order.definitionDigest, order.currentStage, order.status, order.actor, order.createdAt, order.updatedAt, order.productId ?? null, order.lineId ?? null, order.cellId ?? null,
-      order.owner ?? null, order.risk ?? null, order.autonomyMode ?? null, order.outputKind ?? null, order.policyJson ?? null, order.dependenciesJson ?? null, order.heldBy ?? null, order.origin ?? "local", order.executionPlanId ?? null,
-      order.verificationVerdict ?? "UNKNOWN", order.reviewAssessment ?? "NEEDS_HUMAN_REVIEW", order.releaseDecision ?? "BLOCKED", order.waiver ? JSON.stringify(order.waiver) : null,
-    );
+  override async seedWorkOrder(order: WorkOrder): Promise<void> {
+    await super.seedWorkOrder(order);
+    this.persistWorkOrderRowSync(order);
+  }
+
+  admitWorkOrderSync(order: WorkOrder): FactoryCommandResult {
+    const prior = this.orders.get(order.workOrderId);
+    this.orders.set(order.workOrderId, order);
+    const actorType: FactoryEvent["actorType"] = order.sourceType === "manual" ? "human" : order.sourceType.startsWith("github") || order.sourceType.startsWith("gitlab") ? "integration" : "system";
+    const event = createWorkOrderCreatedEvent(order, actorType);
+    try {
+      return this.dispatchFactoryCommandSync({
+        organizationId: order.organizationId,
+        factoryId: order.factoryId,
+        workOrderId: order.workOrderId,
+        actorId: order.actor,
+        actorType,
+        idempotencyKey: `admission:${order.workOrderId}`,
+        payload: { kind: "work_order_admission", order },
+        admission: order,
+        now: order.createdAt,
+        buildEvents: () => [event],
+      });
+    } catch (error) {
+      if (prior) this.orders.set(order.workOrderId, prior);
+      else this.orders.delete(order.workOrderId);
+      throw error;
+    }
+  }
+
+  override async admitWorkOrder(order: WorkOrder): Promise<FactoryCommandResult> {
+    return this.admitWorkOrderSync(order);
   }
 
   override async applyTransition(workOrderId: string, toState: WorkOrderState, causeId: string, actor: string, now?: string) {
@@ -717,8 +807,9 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
   }
 
   /** Persist a command's receipt, graph events, and graph outbox atomically. */
-  async appendFactoryCommand(events: readonly FactoryEvent[], receipt: FactoryCommandReceipt): Promise<void> {
+  async appendFactoryCommand(events: readonly FactoryEvent[], receipt: FactoryCommandReceipt, options: { admission?: WorkOrder } = {}): Promise<void> {
     if (!events.length) throw new Error("factory_command_produced_no_events");
+    if (options.admission && events[0]?.type !== "work_order.created") throw new Error("factory_admission_requires_creation_event");
     const priorByAggregate = new Map<string, FactoryEvent[]>();
     for (const event of events) {
       const prior = priorByAggregate.get(event.aggregateId) ?? this.readFactoryEvents(event.aggregateId);
@@ -729,6 +820,10 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
     }
     try {
       this.database.exec("BEGIN");
+      if (options.admission) {
+        this.persistWorkOrderRowSync(options.admission, true);
+        this.orders.set(options.admission.workOrderId, options.admission);
+      }
       this.database.prepare("INSERT INTO tinkerbot_factory_command_receipts (organization_id, work_order_id, idempotency_key, payload_fingerprint, command_id, event_ids_json, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(
         receipt.organizationId, receipt.workOrderId, receipt.idempotencyKey, receipt.payloadFingerprint, receipt.commandId, JSON.stringify(receipt.eventIds), receipt.resultJson ?? null, receipt.createdAt,
       );
@@ -904,6 +999,17 @@ export class SqliteFactoryStore extends MemoryFactoryStore implements FactorySto
     return shadowReadFactoryProjection(this.reconstructFactoryGraphSync(workOrderId), { verificationVerdict: order.verificationVerdict, reviewAssessment: order.reviewAssessment, releaseDecision: order.releaseDecision });
   }
 
+  /** Deletes only disposable command telemetry; lifecycle tables are untouched. */
+  pruneCommandTelemetry(retentionDays: number, now = new Date().toISOString()): number {
+    const days = parseFactoryTelemetryRetentionDays(retentionDays);
+    if (days === null) throw new Error("factory_telemetry_retention_invalid");
+    const timestamp = Date.parse(now);
+    if (!Number.isFinite(timestamp)) throw new Error("factory_telemetry_retention_timestamp_invalid");
+    const cutoff = new Date(timestamp - days * 86_400_000).toISOString();
+    const result = this.database.prepare("DELETE FROM tinkerbot_factory_command_telemetry WHERE created_at < ?").run(cutoff);
+    return Math.max(0, Number(result.changes ?? 0));
+  }
+
   listFactoryAuditEvents(workOrderId: string): ReturnType<typeof projectFactoryAuditEvents> {
     return projectFactoryAuditEvents(this.readFactoryEvents(workOrderId));
   }
@@ -930,6 +1036,7 @@ function ensureSqliteColumns(database: SqliteDatabase): void {
   database.exec("CREATE TABLE IF NOT EXISTS tinkerbot_factory_command_receipts (organization_id TEXT NOT NULL, work_order_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_fingerprint TEXT NOT NULL, command_id TEXT NOT NULL, event_ids_json TEXT NOT NULL, result_json TEXT, created_at TEXT NOT NULL, PRIMARY KEY (organization_id, work_order_id, idempotency_key))");
   database.exec("CREATE TABLE IF NOT EXISTS tinkerbot_factory_projection_checkpoints (organization_id TEXT NOT NULL, aggregate_id TEXT NOT NULL, aggregate_type TEXT NOT NULL, last_event_id TEXT, last_aggregate_sequence INTEGER, projection_json TEXT NOT NULL, projection_fingerprint TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('APPLIED', 'RETRY_PENDING')), attempt_count INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at TEXT NOT NULL, PRIMARY KEY (organization_id, aggregate_id))");
   database.exec("CREATE INDEX IF NOT EXISTS idx_tinkerbot_factory_projection_retry ON tinkerbot_factory_projection_checkpoints (status, updated_at)");
+  database.exec("CREATE INDEX IF NOT EXISTS idx_tinkerbot_factory_command_telemetry_created ON tinkerbot_factory_command_telemetry (created_at)");
 }
 
 function rowToWorkOrder(row: Record<string, unknown>): WorkOrder {

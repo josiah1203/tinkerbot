@@ -8,3 +8,4 @@ export { runSelfHostedDispatch, type SelfHostedWorkerInput, type SelfHostedWorke
 export { runLocalFactory } from "./orchestrator";
 export { replayOutbox } from "./outbox";
 export { localRuntimeView, formatPlanTab, formatCostTab, formatEvalTab, type LocalRuntimeView } from "./view";
+export { factoryInitPayload, factoryCheckPayload, localWorkNewPayload, localIntentPayload, localFactoryGraphStatusPayload, localWorkApprovalPayload, localOutcomePayload } from "./factory-operations";

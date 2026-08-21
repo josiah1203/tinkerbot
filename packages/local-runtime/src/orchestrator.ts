@@ -57,23 +57,7 @@ export async function runLocalFactory(input: LocalRunInput): Promise<{ workOrder
     origin: "local",
     now,
   });
-  await input.store.insertWorkOrder(order);
-  await input.store.appendFactoryEvent({
-    eventId: `evt_${order.workOrderId}`,
-    type: "work_order.created",
-    aggregateId: order.workOrderId,
-    aggregateType: "work_order",
-    organizationId: order.organizationId,
-    factoryId: order.factoryId,
-    actorId: order.actor,
-    actorType: order.sourceType === "manual" ? "human" : "system",
-    occurredAt: order.createdAt,
-    correlationId: order.workOrderId,
-    schemaVersion: 1,
-    policyVersion: order.policyVersion,
-    provenance: "ATTESTED",
-    payload: { workOrderId: order.workOrderId, intent: input.untrustedText ?? "local run" },
-  });
+  await input.store.admitWorkOrder(order);
   const runId = crypto.randomUUID();
   await input.store.insertRun({ runId, workOrderId: order.workOrderId, factoryId, definitionDigest: order.definitionDigest, status: "running", now });
   const appendRunGraphEvent = async (type: FactoryEvent["type"], payload: Record<string, unknown>, actorId: string, actorType: FactoryEvent["actorType"] = "system"): Promise<void> => {

@@ -1,6 +1,0 @@
-id: incident
-stages: [foreman, triage, implementation, verification, release]
-agents: [foreman, implementer, verification, release]
-autonomy: restricted
-requiredEvidence: [verification-receipt]
-approvalRoles: [admin, owner]

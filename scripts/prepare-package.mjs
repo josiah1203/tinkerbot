@@ -10,7 +10,7 @@ function visit(directory) {
       visit(target);
       continue;
     }
-    if (entry.name.endsWith(".map") || /(?:^|\.)test\.(?:js|d\.ts)$/.test(entry.name) || entry.name.includes(" 2.")) {
+    if (entry.name.endsWith(".map") || /(?:^|\.)test\.(?:js|d\.ts)$/.test(entry.name) || / \d+\./.test(entry.name)) {
       fs.unlinkSync(target);
     }
   }

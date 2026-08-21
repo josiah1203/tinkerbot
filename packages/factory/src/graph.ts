@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import type { FactoryStageId, WorkOrderState } from "./index";
+import type { FactoryStageId, WorkOrder, WorkOrderState } from "./index";
 import { isLegalWorkOrderTransition } from "./transition-contract";
 
 /** The provider-neutral, append-only source of truth for every Tinkerbot surface. */
@@ -16,7 +16,7 @@ export type LegacyFactoryEventType = (typeof LEGACY_FACTORY_EVENT_TYPES)[number]
 export const CANONICAL_FACTORY_EVENT_TYPES = ["verification.recorded", "review.recorded", "approval.requested", "approval.recorded", "release.requested", "release.decided", "release.executed", "release.rolled_back", "work_order.transitioned"] as const;
 export type CanonicalFactoryEventType = (typeof CANONICAL_FACTORY_EVENT_TYPES)[number];
 export const WORK_ORDER_TRANSITION_EVENT_TYPES = ["task.queued", "spec.created", "task.started", "review.requested", "verification.started", "task.blocked", "task.reworked", "integration_candidate.assembled"] as const;
-export const FACTORY_COMMAND_BOUNDARY_EVENT_TYPES = [...CANONICAL_FACTORY_EVENT_TYPES, ...WORK_ORDER_TRANSITION_EVENT_TYPES, "change.proposed", "change.updated"] as const;
+export const FACTORY_COMMAND_BOUNDARY_EVENT_TYPES = ["work_order.created", ...CANONICAL_FACTORY_EVENT_TYPES, ...WORK_ORDER_TRANSITION_EVENT_TYPES, "change.proposed", "change.updated"] as const;
 export function isFactoryCommandBoundaryEventType(type: FactoryEventType): boolean { return (FACTORY_COMMAND_BOUNDARY_EVENT_TYPES as readonly string[]).includes(type); }
 export type VerificationVerdictV2 = "PASS" | "FAIL" | "UNKNOWN";
 export type ReviewDecision = "NOT_REVIEWED" | "APPROVE" | "REQUEST_CHANGES" | "ESCALATE";
@@ -173,6 +173,7 @@ export interface ReleaseDecidedPayload {
 export interface ReleaseExecutedPayload { workOrderId: string; releaseId: string; changeSetDigest?: string; executionRef?: string; }
 export interface ReleaseRolledBackPayload { workOrderId: string; releaseId: string; rollbackId?: string; reason?: string; }
 export interface WorkOrderTransitionPayload { workOrderId: string; fromState: WorkOrderState; toState: WorkOrderState; causeId: string; currentStage: FactoryStageId | "complete"; }
+export interface WorkOrderCreatedPayload { workOrderId: string; intent?: string; acceptanceCriteria?: string; sourceType: WorkOrder["sourceType"]; sourceId: string; status: WorkOrderState; currentStage: WorkOrder["currentStage"]; }
 
 export interface FactoryEvent<T = unknown> {
   eventId: string;
@@ -195,6 +196,33 @@ export interface FactoryEvent<T = unknown> {
   provenance: ClaimStatus;
   externalReferences?: ExternalReference[];
   payload: T;
+}
+
+export function createWorkOrderCreatedEvent(order: WorkOrder, actorType: FactoryEvent["actorType"] = order.sourceType === "manual" ? "human" : "system"): FactoryEvent<WorkOrderCreatedPayload> & { type: "work_order.created" } {
+  return {
+    eventId: `evt_${order.workOrderId}`,
+    type: "work_order.created",
+    aggregateId: order.workOrderId,
+    aggregateType: "work_order",
+    organizationId: order.organizationId,
+    factoryId: order.factoryId,
+    actorId: order.actor,
+    actorType,
+    occurredAt: order.createdAt,
+    correlationId: order.workOrderId,
+    schemaVersion: 1,
+    policyVersion: order.policyVersion,
+    provenance: actorType === "human" ? "HUMAN_VERIFIED" : "ATTESTED",
+    payload: {
+      workOrderId: order.workOrderId,
+      intent: order.intent,
+      acceptanceCriteria: order.acceptanceCriteria,
+      sourceType: order.sourceType,
+      sourceId: order.sourceId,
+      status: order.status,
+      currentStage: order.currentStage,
+    },
+  };
 }
 
 /** Disjoint canonical event envelopes used by command handlers. Legacy
